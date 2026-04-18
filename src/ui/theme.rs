@@ -65,10 +65,8 @@ pub struct Theme {
     /// Borde de paneles no enfocados — gris oscuro sutil.
     pub border_unfocused: Color,
     /// Git: línea agregada — verde.
-    #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     pub diff_add: Color,
     /// Git: línea eliminada — rojo.
-    #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     pub diff_remove: Color,
     /// Coincidencia de búsqueda — fondo highlight.
     pub search_match: Color,

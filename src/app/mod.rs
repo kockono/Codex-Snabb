@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::command::CommandRegistry;
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
+use crate::git::GitState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::search::SearchState;
 use crate::terminal::TerminalState;
@@ -74,6 +75,8 @@ pub struct AppState {
     pub search: SearchState,
     /// Estado de la terminal integrada (PTY + scrollback).
     pub terminal: TerminalState,
+    /// Estado del panel de Git / source control.
+    pub git: GitState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -108,6 +111,12 @@ impl AppState {
             tracing::warn!(error = %e, "no se pudo construir índice de quick open");
         }
 
+        // Inicializar git state — verificar si es repo y refrescar
+        let mut git = GitState::new();
+        if let Some(ref cwd) = cwd {
+            git.refresh(cwd);
+        }
+
         Self {
             running: true,
             focused_panel: PanelId::Editor,
@@ -122,6 +131,7 @@ impl AppState {
             quick_open,
             search: SearchState::new(),
             terminal: TerminalState::new(),
+            git,
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
@@ -162,6 +172,12 @@ impl AppState {
             tracing::warn!(error = %e, "no se pudo construir índice de quick open");
         }
 
+        // Inicializar git state desde el directorio del explorer
+        let mut git = GitState::new();
+        if let Some(ref root) = explorer_root {
+            git.refresh(root);
+        }
+
         Ok(Self {
             running: true,
             focused_panel: PanelId::Editor,
@@ -176,6 +192,7 @@ impl AppState {
             quick_open,
             search: SearchState::new(),
             terminal: TerminalState::new(),
+            git,
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
@@ -229,6 +246,7 @@ impl AppState {
 /// - **Quick Open abierto**: captura TODO el input
 /// - **Palette abierta**: captura TODO el input
 /// - **Search panel activo**: captura input cuando sidebar tiene foco
+/// - **Git panel activo**: captura input cuando sidebar tiene foco
 /// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando overlays cerrados)
 /// - **Editor**: flechas mueven cursor, chars insertan texto
 /// - **Explorer**: flechas navegan el árbol, Enter abre/expande
@@ -238,6 +256,7 @@ fn keymap(
     palette_visible: bool,
     quick_open_visible: bool,
     search_visible: bool,
+    git_state: &GitState,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -343,6 +362,50 @@ fn keymap(
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 Action::SearchInsertChar(ch)
             }
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Git panel activo: captura input cuando foco en Git ──
+    if git_state.visible && focused_panel == PanelId::Git {
+        // Modo commit: capturar chars para el mensaje
+        if git_state.commit_mode {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => Action::GitCommitCancel,
+                (KeyCode::Enter, KeyModifiers::NONE) => Action::GitCommitConfirm,
+                (KeyCode::Backspace, _) => Action::GitCommitDeleteChar,
+                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    Action::GitCommitInput(ch)
+                }
+                _ => Action::Noop,
+            };
+        }
+
+        // Modo diff: navegación del diff
+        if git_state.show_diff {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                    Action::GitToggleDiff
+                }
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitDiffScrollUp,
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    Action::GitDiffScrollDown
+                }
+                _ => Action::Noop,
+            };
+        }
+
+        // Modo normal: navegación de lista de archivos
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::GitClose,
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitUp,
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::GitDown,
+            (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                Action::GitStageToggle
+            }
+            (KeyCode::Char('d'), KeyModifiers::NONE) => Action::GitToggleDiff,
+            (KeyCode::Char('c'), KeyModifiers::NONE) => Action::GitStartCommit,
+            (KeyCode::Char('r'), KeyModifiers::NONE) => Action::GitRefresh,
             _ => Action::Noop,
         };
     }
@@ -965,13 +1028,108 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de Git ──
+        Action::OpenGitPanel => {
+            // Abrir panel git en sidebar, foco en Git
+            state.sidebar_visible = true;
+            state.git.visible = true;
+            state.git.refresh(
+                &get_workspace_root(state),
+            );
+            state.focused_panel = PanelId::Git;
+            tracing::debug!("git panel abierto");
+            vec![]
+        }
+        Action::GitClose => {
+            state.git.visible = false;
+            state.git.show_diff = false;
+            state.git.commit_mode = false;
+            state.focused_panel = PanelId::Editor;
+            tracing::debug!("git panel cerrado");
+            vec![]
+        }
+        Action::GitRefresh => {
+            state.git.refresh(&get_workspace_root(state));
+            tracing::debug!("git status refrescado");
+            vec![]
+        }
+        Action::GitUp => {
+            state.git.move_up();
+            vec![]
+        }
+        Action::GitDown => {
+            state.git.move_down();
+            vec![]
+        }
+        Action::GitStageToggle => {
+            let root = get_workspace_root(state);
+            if let Err(e) = state.git.stage_toggle(&root) {
+                tracing::error!(error = %e, "error en stage/unstage");
+            }
+            vec![]
+        }
+        Action::GitToggleDiff => {
+            let root = get_workspace_root(state);
+            state.git.toggle_diff(&root);
+            vec![]
+        }
+        Action::GitDiffScrollUp => {
+            state.git.scroll_diff_up();
+            vec![]
+        }
+        Action::GitDiffScrollDown => {
+            state.git.scroll_diff_down();
+            vec![]
+        }
+        Action::GitStartCommit => {
+            state.git.commit_mode = true;
+            state.git.commit_input.clear();
+            tracing::debug!("modo commit activado");
+            vec![]
+        }
+        Action::GitCommitConfirm => {
+            let root = get_workspace_root(state);
+            match state.git.commit(&root) {
+                Ok(()) => {
+                    tracing::info!("commit exitoso");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "error al hacer commit");
+                }
+            }
+            vec![]
+        }
+        Action::GitCommitCancel => {
+            state.git.commit_mode = false;
+            state.git.commit_input.clear();
+            tracing::debug!("modo commit cancelado");
+            vec![]
+        }
+        Action::GitCommitInput(ch) => {
+            state.git.commit_input.push(*ch);
+            vec![]
+        }
+        Action::GitCommitDeleteChar => {
+            state.git.commit_input.pop();
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
         | Action::OpenFile(_)
-        | Action::CloseBuffer
-        | Action::OpenGitPanel => vec![],
+        | Action::CloseBuffer => vec![],
     }
+}
+
+/// Helper: obtiene el workspace root desde el explorer o cwd.
+fn get_workspace_root(state: &AppState) -> PathBuf {
+    state
+        .explorer
+        .as_ref()
+        .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut state
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 // ─── Search navigation helper ──────────────────────────────────────────────────
@@ -1083,9 +1241,11 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
         return; // Click en zona no interactiva (title bar, status bar)
     };
 
-    // Si la sidebar muestra el search panel, redirigir foco a Search
+    // Si la sidebar muestra search o git, redirigir foco al panel activo
     let panel = if panel == PanelId::Explorer && state.search.visible {
         PanelId::Search
+    } else if panel == PanelId::Explorer && state.git.visible {
+        PanelId::Git
     } else {
         panel
     };
@@ -1374,6 +1534,7 @@ async fn event_loop(
                     state.palette.visible,
                     state.quick_open.visible,
                     state.search.visible,
+                    &state.git,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -1396,14 +1557,25 @@ async fn event_loop(
         //      El visible_height se calcula con un estimado razonable —
         //      el layout real lo determina el render, pero esto es suficiente
         //      para mantener el scroll correcto entre frames.
-        if let Some(ref mut explorer) = state.explorer {
+        {
             // Estimado del alto visible de la sidebar (descontar bordes)
             let term_height = terminal.size()
                 .map(|s| s.height)
                 .unwrap_or(24);
             // Restar: title bar(1) + status bar(1) + bordes del panel(2)
-            let explorer_height = term_height.saturating_sub(4) as usize;
-            explorer.ensure_visible(explorer_height);
+            let sidebar_height = term_height.saturating_sub(4) as usize;
+
+            if let Some(ref mut explorer) = state.explorer {
+                explorer.ensure_visible(sidebar_height);
+            }
+
+            // Ajustar scroll del git panel
+            if state.git.visible {
+                // Descontar branch line(1) + commit input(2 si aplica)
+                let commit_lines = if state.git.commit_mode { 2 } else { 0 };
+                let git_list_height = sidebar_height.saturating_sub(1 + commit_lines);
+                state.git.ensure_visible(git_list_height);
+            }
         }
 
         // 7. Computar layout y almacenarlo para resolución de mouse.

@@ -189,6 +189,32 @@ pub enum Action {
     // ── Git ──
     /// Abrir el panel de Git / source control.
     OpenGitPanel,
+    /// Cerrar el panel de Git.
+    GitClose,
+    /// Refrescar status del repo git.
+    GitRefresh,
+    /// Mover selección arriba en la lista de archivos git.
+    GitUp,
+    /// Mover selección abajo en la lista de archivos git.
+    GitDown,
+    /// Toggle stage/unstage del archivo seleccionado.
+    GitStageToggle,
+    /// Toggle mostrar/ocultar diff del archivo seleccionado.
+    GitToggleDiff,
+    /// Scrollear diff hacia arriba.
+    GitDiffScrollUp,
+    /// Scrollear diff hacia abajo.
+    GitDiffScrollDown,
+    /// Entrar en modo commit (escribir mensaje).
+    GitStartCommit,
+    /// Ejecutar el commit con el mensaje actual.
+    GitCommitConfirm,
+    /// Cancelar el modo commit.
+    GitCommitCancel,
+    /// Insertar carácter en el mensaje de commit.
+    GitCommitInput(char),
+    /// Borrar último carácter del mensaje de commit.
+    GitCommitDeleteChar,
 
     // ── Command Palette ──
     /// Mover selección arriba en la palette.
@@ -336,7 +362,6 @@ pub enum PanelId {
     /// Panel de búsqueda global.
     Search,
     /// Panel de Git / source control.
-    #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     Git,
     /// Overlay del command palette.
     #[expect(

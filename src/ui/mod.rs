@@ -5,6 +5,7 @@
 //! Los widgets son stateless renderers — reciben datos pre-computados
 //! y dibujan. Nada de IO ni cómputo pesado en render.
 
+pub mod git_panel;
 pub mod layout;
 pub mod palette;
 pub mod panels;
@@ -44,6 +45,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     panels::render_title_bar(f, layout.title_bar, theme);
 
     // ── Sidebar ──
+    // Prioridad de paneles en sidebar: search > git > explorer
     if layout.sidebar_visible {
         let sidebar_focused = matches!(focused, PanelId::Explorer | PanelId::Git | PanelId::Search);
         if state.search.visible {
@@ -55,6 +57,9 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 theme,
                 sidebar_focused,
             );
+        } else if state.git.visible {
+            // Git activo: renderizar panel de git en la sidebar
+            git_panel::render_git_panel(f, layout.sidebar, &state.git, theme, sidebar_focused);
         } else {
             panels::render_sidebar(
                 f,
@@ -115,11 +120,19 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
 
     // ── Status bar ──
     // Datos pre-computados desde AppState — sin allocaciones acá
+    // Branch real del repo git (o fallback si no es repo)
+    let branch_display = if state.git.is_repo && !state.git.branch.is_empty() {
+        &state.git.branch
+    } else if state.git.is_repo {
+        "(detached)"
+    } else {
+        "no git"
+    };
     let status_data = StatusBarData {
         mode: "NORMAL",
         file_name: &state.status_file,
         cursor_pos: &state.status_line,
-        branch: " main",
+        branch: branch_display,
         encoding: "UTF-8",
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
