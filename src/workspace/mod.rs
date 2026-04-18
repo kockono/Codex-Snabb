@@ -6,6 +6,8 @@
 
 pub mod explorer;
 pub mod project;
+pub mod quick_open;
 pub mod tree;
 
 pub use explorer::ExplorerState;
+pub use quick_open::QuickOpenState;

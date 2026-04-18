@@ -8,6 +8,7 @@
 pub mod layout;
 pub mod palette;
 pub mod panels;
+pub mod quick_open;
 pub mod theme;
 
 pub use theme::Theme;
@@ -75,10 +76,12 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
 
-    // ── Command Palette (overlay) ──
-    // Se renderiza ENCIMA de todos los paneles si está visible.
+    // ── Overlays ──
+    // Solo un overlay a la vez. Quick open tiene prioridad visual sobre palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
-    if state.palette.visible {
+    if state.quick_open.visible {
+        quick_open::render_quick_open(f, area, &state.quick_open, theme);
+    } else if state.palette.visible {
         palette::render_palette(f, area, &state.palette, &state.commands, theme);
     }
 }
