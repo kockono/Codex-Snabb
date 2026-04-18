@@ -7,6 +7,7 @@
 //! Nada en este módulo ejecuta IO ni spawnea tareas. Es puro vocabulario tipado.
 
 pub mod budgets;
+pub mod command;
 pub mod ids;
 
 use std::path::PathBuf;
@@ -79,26 +80,33 @@ pub enum Action {
     /// Guardar el archivo del buffer activo.
     SaveFile,
     /// Cerrar el buffer activo.
-    #[expect(dead_code, reason = "se usará cuando se implemente cierre de buffers")]
     CloseBuffer,
 
     // ── Comandos ──
     /// Abrir el command palette (Ctrl+Shift+P).
-    #[expect(dead_code, reason = "se usará en épica 4 — command system")]
     OpenCommandPalette,
     /// Abrir quick open (Ctrl+P).
-    #[expect(dead_code, reason = "se usará en épica 5 — quick open")]
     OpenQuickOpen,
 
     // ── Search ──
     /// Abrir el panel de búsqueda global.
-    #[expect(dead_code, reason = "se usará en épica 6 — global search")]
     OpenGlobalSearch,
 
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.
-    #[expect(dead_code, reason = "se usará en épica 7 — terminal integrada")]
     ToggleTerminal,
+
+    // ── Explorer ──
+    /// Mover selección arriba en el explorer.
+    ExplorerUp,
+    /// Mover selección abajo en el explorer.
+    ExplorerDown,
+    /// Toggle expand/collapse de directorio, o abrir archivo.
+    ExplorerToggle,
+    /// Refrescar el árbol del explorer desde disco.
+    ExplorerRefresh,
+    /// Colapsar directorio seleccionado en el explorer.
+    ExplorerCollapse,
 
     // ── Paneles ──
     /// Alternar visibilidad de la sidebar (Ctrl+B).
@@ -108,8 +116,21 @@ pub enum Action {
 
     // ── Git ──
     /// Abrir el panel de Git / source control.
-    #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     OpenGitPanel,
+
+    // ── Command Palette ──
+    /// Mover selección arriba en la palette.
+    PaletteUp,
+    /// Mover selección abajo en la palette.
+    PaletteDown,
+    /// Insertar carácter en el input de la palette.
+    PaletteInsertChar(char),
+    /// Borrar carácter del input de la palette.
+    PaletteDeleteChar,
+    /// Confirmar y ejecutar el comando seleccionado en la palette.
+    PaletteConfirm,
+    /// Cerrar la command palette.
+    PaletteClose,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
@@ -233,7 +254,10 @@ pub enum PanelId {
     #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     Git,
     /// Overlay del command palette.
-    #[expect(dead_code, reason = "se usará en épica 4 — command system")]
+    #[expect(
+        dead_code,
+        reason = "definido para tracking de foco modal — no se construye directamente"
+    )]
     CommandPalette,
     /// Overlay del quick open.
     #[expect(dead_code, reason = "se usará en épica 5 — quick open")]

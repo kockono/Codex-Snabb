@@ -6,6 +6,7 @@
 //! y dibujan. Nada de IO ni cómputo pesado en render.
 
 pub mod layout;
+pub mod palette;
 pub mod panels;
 pub mod theme;
 
@@ -49,6 +50,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             theme,
             sidebar_focused,
             sidebar_active_panel(focused),
+            state.explorer.as_ref(),
         );
     }
 
@@ -63,15 +65,22 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Status bar ──
-    // Datos pre-computados — en el futuro vendrán del estado real
+    // Datos pre-computados desde AppState — sin allocaciones acá
     let status_data = StatusBarData {
         mode: "NORMAL",
-        file_name: "[no file]",
-        cursor_pos: "Ln 1, Col 1",
+        file_name: &state.status_file,
+        cursor_pos: &state.status_line,
         branch: " main",
         encoding: "UTF-8",
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
+
+    // ── Command Palette (overlay) ──
+    // Se renderiza ENCIMA de todos los paneles si está visible.
+    // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
+    if state.palette.visible {
+        palette::render_palette(f, area, &state.palette, &state.commands, theme);
+    }
 }
 
 /// Determina qué sub-panel de la sidebar está activo según el foco.
