@@ -123,6 +123,19 @@ pub enum Action {
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.
     ToggleTerminal,
+    /// Enviar un carácter al terminal.
+    TerminalInput(char),
+    /// Enviar Enter al terminal.
+    TerminalEnter,
+    /// Enviar Ctrl+C al terminal.
+    TerminalCtrlC,
+    /// Scrollear output del terminal hacia arriba.
+    TerminalScrollUp,
+    /// Scrollear output del terminal hacia abajo.
+    TerminalScrollDown,
+    /// Crear nueva sesión de terminal si no existe.
+    #[expect(dead_code, reason = "se dispara internamente via ToggleTerminal")]
+    TerminalSpawn,
 
     // ── Explorer ──
     /// Mover selección arriba en el explorer.

@@ -31,6 +31,7 @@ use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::search::SearchState;
+use crate::terminal::TerminalState;
 use crate::ui::layout::IdeLayout;
 use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
@@ -70,6 +71,8 @@ pub struct AppState {
     pub quick_open: QuickOpenState,
     /// Estado del panel de búsqueda global (Ctrl+Shift+F).
     pub search: SearchState,
+    /// Estado de la terminal integrada (PTY + scrollback).
+    pub terminal: TerminalState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -117,6 +120,7 @@ impl AppState {
             palette: PaletteState::new(),
             quick_open,
             search: SearchState::new(),
+            terminal: TerminalState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
@@ -170,6 +174,7 @@ impl AppState {
             palette: PaletteState::new(),
             quick_open,
             search: SearchState::new(),
+            terminal: TerminalState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
@@ -347,6 +352,8 @@ fn keymap(
         (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
         (KeyCode::Char('j'), KeyModifiers::CONTROL) => return Action::ToggleBottomPanel,
+        // Ctrl+` abre/cierra terminal (con spawn automático si no hay sesión)
+        (KeyCode::Char('`'), KeyModifiers::CONTROL) => return Action::ToggleTerminal,
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => return Action::SaveFile,
         (KeyCode::Char('z'), KeyModifiers::CONTROL) => return Action::Undo,
         (KeyCode::Char('y'), KeyModifiers::CONTROL) => return Action::Redo,
@@ -377,6 +384,28 @@ fn keymap(
 
     // ── Context-aware: match sobre (panel enfocado, tecla) ──
     match focused_panel {
+        PanelId::Terminal => match (key.code, key.modifiers) {
+            // Esc sale del foco del terminal
+            (KeyCode::Esc, _) => Action::FocusNext,
+            // Ctrl+C → enviar Ctrl+C al terminal
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::TerminalCtrlC,
+            // Enter → enviar Enter al terminal
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::TerminalEnter,
+            // Shift+Up / PageUp → scroll up del terminal
+            (KeyCode::Up, mods) if mods.contains(KeyModifiers::SHIFT) => Action::TerminalScrollUp,
+            (KeyCode::PageUp, _) => Action::TerminalScrollUp,
+            // Shift+Down / PageDown → scroll down del terminal
+            (KeyCode::Down, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::TerminalScrollDown
+            }
+            (KeyCode::PageDown, _) => Action::TerminalScrollDown,
+            // Caracteres → input al terminal
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::TerminalInput(ch)
+            }
+            _ => Action::Noop,
+        },
+
         PanelId::Editor => match (key.code, key.modifiers) {
             // Movimiento de cursor
             (KeyCode::Up, KeyModifiers::NONE) => Action::MoveCursor(Direction::Up),
@@ -805,12 +834,97 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de terminal ──
+        Action::ToggleTerminal => {
+            if !state.terminal.has_session() {
+                // Spawn shell si no hay sesión
+                let cwd = state
+                    .explorer
+                    .as_ref()
+                    .map(|e| e.root.clone()) // CLONE: necesario — root se usa después para spawn
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+                // Calcular tamaño del bottom panel (usar layout si disponible)
+                let size = state
+                    .last_layout
+                    .map(|l| (l.bottom_panel.width.saturating_sub(2), l.bottom_panel.height.saturating_sub(2)))
+                    .unwrap_or((80, 10));
+
+                if let Err(e) = state.terminal.spawn_shell(&cwd, size) {
+                    tracing::error!(error = %e, "error al crear sesión de terminal");
+                }
+            }
+            // Toggle visibilidad del bottom panel
+            state.bottom_panel_visible = !state.bottom_panel_visible;
+            if state.bottom_panel_visible {
+                state.focused_panel = PanelId::Terminal;
+            }
+            tracing::debug!(visible = state.bottom_panel_visible, "toggle terminal");
+            vec![]
+        }
+        Action::TerminalInput(ch) => {
+            if let Some(ref mut session) = state.terminal.session
+                && let Err(e) = session.send_key(*ch)
+            {
+                tracing::error!(error = %e, "error al enviar key al terminal");
+            }
+            vec![]
+        }
+        Action::TerminalEnter => {
+            if let Some(ref mut session) = state.terminal.session
+                && let Err(e) = session.send_enter()
+            {
+                tracing::error!(error = %e, "error al enviar Enter al terminal");
+            }
+            vec![]
+        }
+        Action::TerminalCtrlC => {
+            if let Some(ref mut session) = state.terminal.session
+                && let Err(e) = session.send_ctrl_c()
+            {
+                tracing::error!(error = %e, "error al enviar Ctrl+C al terminal");
+            }
+            vec![]
+        }
+        Action::TerminalScrollUp => {
+            if let Some(ref mut session) = state.terminal.session {
+                session.scroll_up(3);
+            }
+            vec![]
+        }
+        Action::TerminalScrollDown => {
+            if let Some(ref mut session) = state.terminal.session {
+                session.scroll_down(3);
+            }
+            vec![]
+        }
+        Action::TerminalSpawn => {
+            if !state.terminal.has_session() {
+                let cwd = state
+                    .explorer
+                    .as_ref()
+                    .map(|e| e.root.clone()) // CLONE: necesario — root se usa después para spawn
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+                let size = state
+                    .last_layout
+                    .map(|l| (l.bottom_panel.width.saturating_sub(2), l.bottom_panel.height.saturating_sub(2)))
+                    .unwrap_or((80, 10));
+
+                if let Err(e) = state.terminal.spawn_shell(&cwd, size) {
+                    tracing::error!(error = %e, "error al crear sesión de terminal");
+                }
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
         | Action::OpenFile(_)
         | Action::CloseBuffer
-        | Action::ToggleTerminal
         | Action::OpenGitPanel => vec![],
     }
 }
@@ -1094,6 +1208,14 @@ fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: Scro
                 }
             }
         }
+        PanelId::Terminal => {
+            if let Some(ref mut session) = state.terminal.session {
+                match direction {
+                    ScrollDirection::Up => session.scroll_up(MOUSE_SCROLL_LINES),
+                    ScrollDirection::Down => session.scroll_down(MOUSE_SCROLL_LINES),
+                }
+            }
+        }
         // Otros paneles: scroll no implementado aún
         _ => {}
     }
@@ -1240,6 +1362,13 @@ async fn event_loop(
         terminal.draw(|frame| {
             ui::render(frame, &state, theme);
         }).context("error en render")?;
+
+        // 8.5. Poll de output del terminal (non-blocking).
+        //      Se hace después del render para que el output nuevo
+        //      se muestre en el próximo frame.
+        if let Err(e) = state.terminal.poll_output() {
+            tracing::warn!(error = %e, "error al poll de output del terminal");
+        }
 
         // 9. Registrar métricas del frame (solo reduce + render, no poll wait)
         let frame_time = frame_timer.elapsed_us();

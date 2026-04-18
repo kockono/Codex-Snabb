@@ -74,7 +74,13 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // ── Bottom panel ──
     if layout.bottom_panel_visible {
         let bottom_focused = focused == PanelId::Terminal;
-        panels::render_bottom_panel(f, layout.bottom_panel, theme, bottom_focused);
+        panels::render_bottom_panel(
+            f,
+            layout.bottom_panel,
+            theme,
+            bottom_focused,
+            state.terminal.session.as_ref(),
+        );
     }
 
     // ── Status bar ──

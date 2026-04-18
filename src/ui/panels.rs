@@ -268,21 +268,62 @@ pub fn render_editor_area(f: &mut Frame, area: Rect, theme: &Theme, focused: boo
 
 // ─── Bottom Panel ──────────────────────────────────────────────────────────────
 
-/// Renderiza el panel inferior (terminal/problems/output).
+/// Renderiza el panel inferior con output real del terminal.
 ///
-/// Placeholder con texto "Terminal". El contenido real se implementará
-/// en épica 7. Borde refleja estado de foco.
-pub fn render_bottom_panel(f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
+/// Si hay una sesión activa, muestra las líneas visibles del scrollback.
+/// Si no hay sesión, muestra un placeholder con instrucciones.
+/// Borde refleja estado de foco (Double/cyan cuando enfocado).
+pub fn render_bottom_panel(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    session: Option<&crate::terminal::session::TerminalSession>,
+) {
     let block =
         panel_block("TERMINAL", focused, theme).style(Style::default().bg(theme.bg_secondary));
 
-    let content = Paragraph::new(Line::from(Span::styled(
-        "  Terminal placeholder",
-        Style::default().fg(theme.fg_secondary),
-    )))
-    .block(block);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    f.render_widget(content, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let Some(session) = session else {
+        // Sin sesión — mostrar placeholder con instrucciones
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  Press Ctrl+` to open terminal",
+            Style::default().fg(theme.fg_secondary),
+        )))
+        .style(Style::default().bg(theme.bg_secondary));
+        f.render_widget(placeholder, inner);
+        return;
+    };
+
+    // Obtener líneas visibles del scrollback
+    let visible = session.visible_lines(inner.height as usize);
+    let max_width = inner.width as usize;
+
+    // Construir líneas de ratatui — sin format!() en el loop
+    let lines: Vec<Line<'_>> = visible
+        .iter()
+        .map(|line| {
+            // Truncar línea al ancho del panel sin alocar
+            let display = if line.len() > max_width {
+                &line[..max_width]
+            } else {
+                line
+            };
+            Line::from(Span::styled(
+                display.to_string(), // CLONE: necesario — Span toma ownership, display es slice de session
+                Style::default().fg(theme.fg_primary),
+            ))
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(paragraph, inner);
 }
 
 // ─── Status Bar ────────────────────────────────────────────────────────────────
