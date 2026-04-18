@@ -21,10 +21,6 @@ pub struct Theme {
     /// Fondo de sidebar/panels (ligeramente más claro que primario).
     pub bg_secondary: Color,
     /// Fondo del panel enfocado (sutil diferencia para indicar foco).
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se active highlight de panel enfocado"
-    )]
     pub bg_active: Color,
     /// Fondo para hover states (futuro — mouse hover).
     #[expect(dead_code, reason = "se usará cuando se implemente mouse hover")]

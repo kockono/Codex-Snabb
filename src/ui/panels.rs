@@ -14,6 +14,7 @@ use ratatui::{
 
 use crate::core::PanelId;
 use crate::ui::theme::Theme;
+use crate::workspace::explorer::{ExplorerState, FlatEntry};
 
 // ─── StatusBarData ─────────────────────────────────────────────────────────────
 
@@ -95,34 +96,138 @@ pub fn render_title_bar(f: &mut Frame, area: Rect, theme: &Theme) {
 
 // ─── Sidebar ───────────────────────────────────────────────────────────────────
 
-/// Renderiza el panel lateral (sidebar).
+/// Renderiza el panel lateral (sidebar) con el árbol de archivos real.
 ///
-/// Por ahora es placeholder con el nombre del sub-panel activo.
-/// El contenido real (explorer, git, search) se implementará en épicas posteriores.
+/// Si hay un `ExplorerState` disponible, renderiza el árbol con:
+/// - Indentación por profundidad
+/// - Iconos `▸`/`▾` para directorios collapsed/expanded
+/// - Highlight del entry seleccionado
+/// - Viewport virtual: solo renderiza entries visibles (scroll)
+///
+/// Si no hay explorer, muestra "No folder open".
 pub fn render_sidebar(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
     focused: bool,
     active_panel: PanelId,
+    explorer: Option<&ExplorerState>,
 ) {
     let panel_label = match active_panel {
         PanelId::Explorer => "EXPLORER",
         PanelId::Git => "SOURCE CONTROL",
         PanelId::Search => "SEARCH",
-        _ => "EXPLORER", // default cuando el foco está en otro panel
+        _ => "EXPLORER",
     };
 
     let block =
         panel_block(panel_label, focused, theme).style(Style::default().bg(theme.bg_secondary));
 
-    let content = Paragraph::new(Line::from(Span::styled(
-        "  No folder open",
-        Style::default().fg(theme.fg_secondary),
-    )))
-    .block(block);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    f.render_widget(content, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let Some(explorer) = explorer else {
+        // Sin explorer — mostrar placeholder
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  No folder open",
+            Style::default().fg(theme.fg_secondary),
+        )))
+        .style(Style::default().bg(theme.bg_secondary));
+        f.render_widget(placeholder, inner);
+        return;
+    };
+
+    let flat = explorer.flatten();
+    let visible_height = inner.height as usize;
+    let scroll = explorer.scroll_offset;
+
+    // Viewport virtual: solo las entries visibles
+    let visible_entries = flat.iter().skip(scroll).take(visible_height);
+
+    // Pre-computar líneas fuera del render — evita format!() dentro del loop
+    let lines: Vec<Line<'_>> = visible_entries
+        .enumerate()
+        .map(|(i, entry)| {
+            render_explorer_entry(
+                entry,
+                scroll + i == explorer.selected_index,
+                inner.width as usize,
+                theme,
+            )
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(paragraph, inner);
+}
+
+/// Renderiza una entrada del explorer como una `Line` de ratatui.
+///
+/// No aloca `format!()` — construye spans directamente.
+/// El highlight de selección usa `bg_active` del theme.
+fn render_explorer_entry<'a>(
+    entry: &FlatEntry,
+    selected: bool,
+    max_width: usize,
+    theme: &'a Theme,
+) -> Line<'a> {
+    // Indentación: 2 espacios por nivel de profundidad
+    let indent_width = entry.depth * 2;
+
+    // Icono: directorios `▸`/`▾`, archivos espacio
+    let icon = if entry.is_dir {
+        if entry.expanded {
+            "▾ "
+        } else {
+            "▸ "
+        }
+    } else {
+        "  "
+    };
+
+    // Calcular cuánto espacio queda para el nombre
+    let prefix_len = indent_width + icon.len();
+    let name_max = max_width.saturating_sub(prefix_len);
+    let display_name = if entry.name.len() > name_max {
+        &entry.name[..name_max]
+    } else {
+        &entry.name
+    };
+
+    // Estilo base según tipo y selección
+    let bg = if selected {
+        theme.bg_active
+    } else {
+        theme.bg_secondary
+    };
+    let fg = if entry.is_dir {
+        theme.fg_accent
+    } else {
+        theme.fg_primary
+    };
+
+    let style = Style::default().fg(fg).bg(bg);
+    let indent_style = Style::default().bg(bg);
+
+    // Construir indent string — pre-allocated con capacidad conocida
+    // Usar un literal de espacios y tomar un slice es más eficiente
+    // que format!() para indentación
+    const SPACES: &str = "                                        "; // 40 espacios
+    let indent_str = &SPACES[..indent_width.min(SPACES.len())];
+
+    // CLONE: necesario en display_name.to_string() — Span::styled toma ownership
+    // de String, y display_name es un slice de entry.name que no podemos mover
+    let spans = vec![
+        Span::styled(indent_str, indent_style),
+        Span::styled(icon, style),
+        Span::styled(display_name.to_string(), style),
+    ];
+
+    Line::from(spans)
 }
 
 // ─── Editor Area ───────────────────────────────────────────────────────────────
