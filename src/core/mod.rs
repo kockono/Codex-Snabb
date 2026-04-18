@@ -70,6 +70,14 @@ pub enum Action {
     /// Rehacer la última operación deshecha (Ctrl+Y).
     Redo,
 
+    // ── Multicursor / Selección ──
+    /// Seleccionar la siguiente ocurrencia del texto seleccionado (Ctrl+D).
+    SelectNextOccurrence,
+    /// Limpiar cursores secundarios (Esc con multicursor activo).
+    ClearMultiCursor,
+    /// Mover cursor extendiendo la selección (Shift + flechas).
+    MoveCursorSelecting(Direction),
+
     // ── Archivos ──
     /// Abrir un archivo por path.
     #[expect(

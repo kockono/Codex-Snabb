@@ -187,15 +187,16 @@ impl AppState {
     /// Se llama después de cualquier acción que modifique el cursor o el buffer.
     /// Reutiliza la capacidad existente del String para minimizar allocaciones.
     fn update_status_cache(&mut self) {
-        // Actualizar posición del cursor (1-indexed para display)
+        // Actualizar posición del cursor primario (1-indexed para display)
         self.status_line.clear();
         // Escribir sin format!() — usamos write! con buffer reutilizado
         use std::fmt::Write;
+        let primary = self.editor.cursors.primary();
         let _ = write!(
             self.status_line,
             "Ln {}, Col {}",
-            self.editor.cursor.position.line + 1,
-            self.editor.cursor.position.col + 1
+            primary.position.line + 1,
+            primary.position.col + 1
         );
 
         // Actualizar nombre de archivo
@@ -348,7 +349,8 @@ fn keymap(
 
     // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
     match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => return Action::Quit,
+        // Esc: si hay multicursor activo, limpiar; sino, quit
+        (KeyCode::Esc, _) => return Action::ClearMultiCursor,
         (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
         (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
@@ -415,6 +417,23 @@ fn keymap(
             (KeyCode::Right, KeyModifiers::NONE) => Action::MoveCursor(Direction::Right),
             (KeyCode::Home, KeyModifiers::NONE) => Action::MoveToLineStart,
             (KeyCode::End, KeyModifiers::NONE) => Action::MoveToLineEnd,
+
+            // Shift + flechas → selección
+            (KeyCode::Up, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveCursorSelecting(Direction::Up)
+            }
+            (KeyCode::Down, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveCursorSelecting(Direction::Down)
+            }
+            (KeyCode::Left, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveCursorSelecting(Direction::Left)
+            }
+            (KeyCode::Right, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveCursorSelecting(Direction::Right)
+            }
+
+            // Ctrl+D → seleccionar siguiente ocurrencia
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Action::SelectNextOccurrence,
 
             // Edición
             (KeyCode::Backspace, KeyModifiers::NONE) => Action::DeleteChar,
@@ -497,9 +516,34 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::MoveCursor(dir) => {
-            state.editor.move_cursor(*dir);
+            state.editor.move_cursor(*dir, false);
             state.update_status_cache();
             vec![]
+        }
+        Action::MoveCursorSelecting(dir) => {
+            state.editor.move_cursor(*dir, true);
+            state.update_status_cache();
+            vec![]
+        }
+        Action::SelectNextOccurrence => {
+            state.editor.select_next_occurrence();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::ClearMultiCursor => {
+            if state.editor.has_multicursors() {
+                // Con multicursores activos, Esc limpia los secundarios
+                state.editor.clear_multicursors();
+                vec![]
+            } else if state.editor.cursors.primary().has_selection() {
+                // Con selección activa, Esc limpia la selección
+                state.editor.cursors.primary_mut().clear_selection();
+                vec![]
+            } else {
+                // Sin multicursor ni selección, Esc = Quit
+                state.running = false;
+                vec![Effect::Quit]
+            }
         }
         Action::MoveToLineStart => {
             state.editor.move_to_line_start();
@@ -976,10 +1020,13 @@ fn navigate_to_search_match(state: &mut AppState) {
     let max_col = state.editor.buffer.line_len(clamped_line);
     let clamped_col = target_col.min(max_col);
 
-    state.editor.cursor.position.line = clamped_line;
-    state.editor.cursor.position.col = clamped_col;
-    state.editor.cursor.sync_desired_col();
-    state.editor.viewport.ensure_cursor_visible(&state.editor.cursor.position);
+    let primary = state.editor.cursors.primary_mut();
+    primary.position.line = clamped_line;
+    primary.position.col = clamped_col;
+    primary.sync_desired_col();
+    primary.clear_selection();
+    let pos = state.editor.cursors.primary().position;
+    state.editor.viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 }
 
@@ -1147,10 +1194,15 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
     let max_col = state.editor.buffer.line_len(clamped_line);
     let clamped_col = target_col.min(max_col);
 
-    state.editor.cursor.position.line = clamped_line;
-    state.editor.cursor.position.col = clamped_col;
-    state.editor.cursor.sync_desired_col();
-    state.editor.viewport.ensure_cursor_visible(&state.editor.cursor.position);
+    // Limpiar cursores secundarios al hacer click
+    state.editor.cursors.clear_secondary();
+    let primary = state.editor.cursors.primary_mut();
+    primary.position.line = clamped_line;
+    primary.position.col = clamped_col;
+    primary.sync_desired_col();
+    primary.clear_selection();
+    let pos = state.editor.cursors.primary().position;
+    state.editor.viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 
     tracing::debug!(line = clamped_line, col = clamped_col, "mouse click → cursor editor");

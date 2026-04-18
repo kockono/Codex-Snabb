@@ -81,8 +81,8 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         let inner_h = layout.editor_area.height.saturating_sub(2) as usize;
 
         let scroll = state.editor.viewport.scroll_offset;
-        let cursor_line = state.editor.cursor.position.line;
-        let cursor_col = state.editor.cursor.position.col;
+        let cursor_line = state.editor.cursors.primary().position.line;
+        let cursor_col = state.editor.cursors.primary().position.col;
 
         // Verificar que el cursor está dentro del viewport visible
         if cursor_line >= scroll && cursor_line < scroll + inner_h {

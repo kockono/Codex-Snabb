@@ -13,6 +13,8 @@ use ratatui::{
 };
 
 use crate::core::PanelId;
+use crate::editor::cursor::Position;
+use crate::editor::selection::Selection;
 use crate::editor::EditorState;
 use crate::ui::theme::Theme;
 use crate::workspace::explorer::{ExplorerState, FlatEntry};
@@ -305,7 +307,25 @@ pub fn render_editor_area(
 
     // Usar viewport scroll_offset, pero clampear al tamaño real del inner area
     let scroll = editor.viewport.scroll_offset;
-    let cursor_line = editor.cursor.position.line;
+    let primary_cursor_line = editor.cursors.primary().position.line;
+
+    // Recopilar todas las selecciones activas para renderizar
+    let selections: Vec<Selection> = editor
+        .cursors
+        .cursors
+        .iter()
+        .filter_map(|c| c.selection.filter(|s| !s.is_empty()))
+        .collect();
+
+    // Recopilar posiciones de cursores secundarios para renderizar
+    let secondary_cursor_positions: Vec<Position> = editor
+        .cursors
+        .cursors
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != editor.cursors.primary_index)
+        .map(|(_, c)| c.position)
+        .collect();
 
     // Estilos pre-computados — sin allocaciones
     let gutter_style = Style::default().fg(theme.line_number).bg(theme.bg_primary);
@@ -320,6 +340,10 @@ pub fn render_editor_area(
     // Línea activa: background ligeramente más claro que bg_primary
     let active_line_bg = Color::Rgb(16, 20, 28);
     let text_active_style = Style::default().fg(theme.fg_primary).bg(active_line_bg);
+    let selection_style = Style::default().fg(theme.fg_primary).bg(theme.selection);
+    let secondary_cursor_style = Style::default()
+        .fg(theme.fg_accent)
+        .add_modifier(Modifier::REVERSED);
     let tilde_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
 
     // Buffer pre-alocado para el padding del gutter
@@ -337,10 +361,9 @@ pub fn render_editor_area(
         let buf_line_idx = scroll + i;
 
         if buf_line_idx < total_lines {
-            let is_cursor_line = buf_line_idx == cursor_line;
+            let is_cursor_line = buf_line_idx == primary_cursor_line;
 
             // ── Gutter: número de línea ──
-            // Alinear a la derecha sin format!() — usar dígitos pre-computados
             let line_num = buf_line_idx + 1; // 1-indexed para display
             let num_digits = digit_count(line_num);
             let padding = gutter_width.saturating_sub(num_digits);
@@ -375,19 +398,25 @@ pub fn render_editor_area(
             };
 
             // Construir spans para esta línea
-            let mut spans: Vec<Span<'_>> = Vec::with_capacity(6);
+            let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
             spans.push(Span::styled(pad_str, gutter_num_style));
             // CLONE: necesario — num_buf se reutiliza en cada iteración del loop,
             // Span toma ownership del String para mantenerlo vivo en el Line
             spans.push(Span::styled(num_buf.clone(), gutter_num_style));
             spans.push(Span::styled("\u{2502} ", separator_style));
 
-            // ── Texto sin cursor visual — el hardware cursor (SteadyBar) lo maneja ──
-            // CLONE: necesario — display_text es un slice del buffer,
-            // Span::styled necesita ownership porque la línea de ratatui
-            // toma ownership de los spans.
+            // ── Renderizar texto con selecciones y cursores secundarios ──
             if !display_text.is_empty() {
-                spans.push(Span::styled(display_text.to_string(), line_bg_style));
+                let text_spans = render_line_with_selections(
+                    display_text,
+                    buf_line_idx,
+                    &selections,
+                    &secondary_cursor_positions,
+                    line_bg_style,
+                    selection_style,
+                    secondary_cursor_style,
+                );
+                spans.extend(text_spans);
             }
 
             lines.push(Line::from(spans));
@@ -405,6 +434,141 @@ pub fn render_editor_area(
 
     let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_primary));
     f.render_widget(paragraph, inner);
+}
+
+/// Renderiza una línea de texto con highlights de selección y cursores secundarios.
+///
+/// Divide la línea en segmentos según las selecciones activas y posiciones
+/// de cursores secundarios. Cada segmento recibe el estilo apropiado.
+/// No usa `format!()` — construye spans directamente.
+fn render_line_with_selections<'a>(
+    text: &str,
+    line_idx: usize,
+    selections: &[Selection],
+    secondary_cursors: &[Position],
+    normal_style: Style,
+    selection_style: Style,
+    cursor_style: Style,
+) -> Vec<Span<'a>> {
+    let text_len = text.len();
+    if text_len == 0 {
+        return vec![];
+    }
+
+    // Determinar qué columnas están seleccionadas y cuáles tienen cursor secundario
+    // Usar un enfoque eficiente: construir rangos de selección en esta línea
+    let mut selected_ranges: Vec<(usize, usize)> = Vec::new();
+    for sel in selections {
+        let start = sel.start();
+        let end = sel.end();
+
+        // Verificar si esta selección toca esta línea
+        if start.line <= line_idx && end.line >= line_idx {
+            let sel_start_col = if start.line == line_idx { start.col } else { 0 };
+            let sel_end_col = if end.line == line_idx {
+                end.col
+            } else {
+                text_len
+            };
+            if sel_start_col < sel_end_col {
+                selected_ranges.push((sel_start_col.min(text_len), sel_end_col.min(text_len)));
+            }
+        }
+    }
+
+    // Columnas con cursores secundarios
+    let cursor_cols: Vec<usize> = secondary_cursors
+        .iter()
+        .filter(|p| p.line == line_idx && p.col < text_len)
+        .map(|p| p.col)
+        .collect();
+
+    // Si no hay selecciones ni cursores secundarios, renderizar normal
+    if selected_ranges.is_empty() && cursor_cols.is_empty() {
+        // CLONE: necesario — text es un slice del buffer, Span toma ownership
+        return vec![Span::styled(text.to_string(), normal_style)];
+    }
+
+    // Construir spans divididos por selección y cursores secundarios
+    // Estrategia: recorrer la línea char por char, agrupar segmentos contiguos
+    // con el mismo estilo para minimizar spans
+    let mut result: Vec<Span<'a>> = Vec::with_capacity(8);
+    let mut current_start = 0;
+    let mut current_style = char_style(
+        0,
+        &selected_ranges,
+        &cursor_cols,
+        normal_style,
+        selection_style,
+        cursor_style,
+    );
+
+    for col in 1..=text_len {
+        let style = if col < text_len {
+            char_style(
+                col,
+                &selected_ranges,
+                &cursor_cols,
+                normal_style,
+                selection_style,
+                cursor_style,
+            )
+        } else {
+            // Sentinela para flush del último segmento
+            Style::default()
+        };
+
+        if style != current_style || col == text_len {
+            // Flush segmento actual
+            let end = if col == text_len && style == current_style {
+                text_len
+            } else {
+                col
+            };
+            let segment = &text[current_start..end];
+            if !segment.is_empty() {
+                // CLONE: necesario — segment es slice del buffer
+                result.push(Span::styled(segment.to_string(), current_style));
+            }
+            current_start = col;
+            current_style = style;
+        }
+    }
+
+    // Flush final si queda algo
+    if current_start < text_len {
+        let segment = &text[current_start..text_len];
+        if !segment.is_empty() {
+            // CLONE: necesario — segment es slice del buffer
+            result.push(Span::styled(segment.to_string(), current_style));
+        }
+    }
+
+    result
+}
+
+/// Determina el estilo de un carácter en una columna dada.
+///
+/// Prioridad: cursor secundario > selección > normal.
+fn char_style(
+    col: usize,
+    selected_ranges: &[(usize, usize)],
+    cursor_cols: &[usize],
+    normal_style: Style,
+    selection_style: Style,
+    cursor_style: Style,
+) -> Style {
+    // Cursor secundario tiene prioridad visual máxima
+    if cursor_cols.contains(&col) {
+        return cursor_style;
+    }
+    // Selección
+    for &(start, end) in selected_ranges {
+        if col >= start && col < end {
+            return selection_style;
+        }
+    }
+    normal_style
 }
 
 /// Cuenta la cantidad de dígitos decimales de un número.
