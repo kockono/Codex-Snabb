@@ -211,6 +211,10 @@ pub async fn run() -> Result<()> {
 /// Ciclo: poll evento → keymap → reduce → process effects → render.
 /// Instrumentado con `FrameTimer` y `Metrics` para observabilidad.
 ///
+/// El `FrameTimer` mide SOLO el trabajo real (keymap + reduce + render),
+/// NO el tiempo de espera del poll. Así el budget de 16ms refleja
+/// latencia de procesamiento real, no tiempo idle.
+///
 /// No usa busy-polling: `event::poll` con timeout evita CPU idle > 0%.
 /// El tick_rate controla la frecuencia máxima de polling.
 async fn event_loop(
@@ -222,41 +226,43 @@ async fn event_loop(
     let tick_duration = Duration::from_millis(state.config.tick_rate_ms);
 
     loop {
-        // Iniciar medición del frame completo
-        let frame_timer = FrameTimer::start();
-
-        // Render frame actual
-        terminal.draw(|frame| {
-            ui::render(frame, &state, theme);
-        }).context("error en render")?;
-
-        // Poll de eventos con timeout (no busy-poll)
+        // 1. Poll de eventos con timeout (esto ESPERA — no cuenta como frame time)
         let event = poll_event(tick_duration)?;
 
-        // Mapear evento a acción
+        // 2. Iniciar medición del frame DESPUÉS del poll.
+        //    Mide solo trabajo real: keymap + reduce + effects + render.
+        //    El budget de 16ms es para render, no para espera de input.
+        let frame_timer = FrameTimer::start();
+
+        // 3. Mapear evento a acción
         let action = match &event {
             Some(Event::Input(crossterm_event)) => keymap(crossterm_event),
             Some(Event::Tick) => Action::Noop,
             _ => Action::Noop,
         };
 
-        // Registrar evento procesado
+        // 4. Registrar evento procesado
         if event.is_some() {
             state.metrics.record_event();
         }
 
-        // Reducer: actualizar estado y obtener efectos
+        // 5. Reducer: actualizar estado y obtener efectos
         let effects = reduce(&mut state, &action);
 
-        // Procesar efectos
+        // 6. Procesar efectos
         process_effects(&effects, shutdown);
 
-        // Registrar métricas del frame
+        // 7. Render frame actual
+        terminal.draw(|frame| {
+            ui::render(frame, &state, theme);
+        }).context("error en render")?;
+
+        // 8. Registrar métricas del frame (solo reduce + render, no poll wait)
         let frame_time = frame_timer.elapsed_us();
         state.metrics.record_frame(frame_time);
         state.metrics.record_input_latency(frame_time);
 
-        // Log de warning si el frame excede el budget target
+        // 9. Log de warning si el frame excede el budget target
         if crate::core::budgets::DEFAULT_BUDGETS.frame_exceeds_target(frame_time) {
             tracing::warn!(
                 frame_time_us = frame_time,
@@ -265,7 +271,7 @@ async fn event_loop(
             );
         }
 
-        // Salir si el estado lo indica o shutdown externo
+        // 10. Salir si el estado lo indica o shutdown externo
         if !state.running || shutdown.is_cancelled() {
             tracing::info!(
                 frames = state.metrics.frame_count,

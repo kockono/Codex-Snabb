@@ -305,7 +305,9 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            tick_rate_ms: 250,
+            // 50ms = ~20 polls/segundo. Buen balance entre responsividad
+            // y CPU idle. 250ms se sentía como lag visible en la TUI.
+            tick_rate_ms: 50,
             render_throttle_ms: 16,
             max_file_size_bytes: 10 * 1024 * 1024, // 10 MB
             terminal_scrollback: 5_000,
