@@ -6,13 +6,14 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
 use crate::core::PanelId;
+use crate::editor::EditorState;
 use crate::ui::theme::Theme;
 use crate::workspace::explorer::{ExplorerState, FlatEntry};
 
@@ -232,18 +233,39 @@ fn render_explorer_entry<'a>(
 
 // ─── Editor Area ───────────────────────────────────────────────────────────────
 
-/// Renderiza el área del editor.
+/// Renderiza el área del editor con contenido real del buffer.
 ///
-/// Placeholder: muestra "No file open" centrado. El editor real se
-/// implementará en épica 2. Borde refleja estado de foco.
-pub fn render_editor_area(f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
+/// Si el buffer está vacío y no tiene archivo asociado, muestra un placeholder.
+/// Si hay contenido, renderiza:
+/// - Gutter con números de línea (ancho dinámico)
+/// - Separador `│`
+/// - Texto del buffer con viewport virtual (solo líneas visibles)
+/// - Highlight de la línea actual (background sutil)
+/// - Cursor con `Modifier::REVERSED`
+///
+/// No aloca strings en el render — usa slices `&str` del buffer directamente.
+pub fn render_editor_area(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    editor: &EditorState,
+) {
     let block = panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
 
-    // Centrar el mensaje verticalmente
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.height > 0 && inner.width > 0 {
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // ── Placeholder: buffer vacío sin archivo ──
+    let has_content =
+        editor.buffer.line_count() > 1 || editor.buffer.line(0).is_some_and(|l| !l.is_empty());
+    let has_file = editor.buffer.file_path().is_some();
+
+    if !has_content && !has_file {
         let vertical = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -254,7 +276,7 @@ pub fn render_editor_area(f: &mut Frame, area: Rect, theme: &Theme, focused: boo
             .split(inner);
 
         let placeholder = Paragraph::new(Line::from(vec![Span::styled(
-            "No file open",
+            "No file open \u{2014} use Ctrl+P or Explorer",
             Style::default()
                 .fg(theme.fg_secondary)
                 .add_modifier(Modifier::ITALIC),
@@ -263,7 +285,167 @@ pub fn render_editor_area(f: &mut Frame, area: Rect, theme: &Theme, focused: boo
         .style(Style::default().bg(theme.bg_primary));
 
         f.render_widget(placeholder, vertical[1]);
+        return;
     }
+
+    // ── Pre-computar ancho del gutter fuera del loop ──
+    let total_lines = editor.buffer.line_count();
+    let gutter_digits = digit_count(total_lines);
+    // Mínimo 4 chars de ancho para el gutter (espacio visual)
+    let gutter_width = gutter_digits.max(4);
+    // Separador: 1 char `│` + 1 espacio
+    let separator_width: usize = 2;
+    let text_start = gutter_width + separator_width;
+
+    let view_height = inner.height as usize;
+    let view_width = inner.width as usize;
+    let text_width = view_width.saturating_sub(text_start);
+
+    // Usar viewport scroll_offset, pero clampear al tamaño real del inner area
+    let scroll = editor.viewport.scroll_offset;
+    let cursor_line = editor.cursor.position.line;
+    let cursor_col = editor.cursor.position.col;
+
+    // Estilos pre-computados — sin allocaciones
+    let gutter_style = Style::default().fg(theme.line_number).bg(theme.bg_primary);
+    let gutter_active_style = Style::default()
+        .fg(theme.line_number_active)
+        .bg(theme.bg_primary)
+        .add_modifier(Modifier::BOLD);
+    let separator_style = Style::default()
+        .fg(theme.border_unfocused)
+        .bg(theme.bg_primary);
+    let text_style = Style::default().fg(theme.fg_primary).bg(theme.bg_primary);
+    // Línea activa: background ligeramente más claro que bg_primary
+    let active_line_bg = Color::Rgb(16, 20, 28);
+    let text_active_style = Style::default().fg(theme.fg_primary).bg(active_line_bg);
+    let cursor_style = Style::default()
+        .fg(theme.bg_primary)
+        .bg(theme.cursor)
+        .add_modifier(Modifier::BOLD);
+    let tilde_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
+
+    // Buffer pre-alocado para el padding del gutter
+    // Máximo 10 dígitos (más que suficiente para cualquier archivo razonable)
+    const SPACES: &str = "          "; // 10 espacios
+
+    // Buffer reutilizable para números de línea — se limpia en cada iteración.
+    // Capacidad inicial cubre el máximo razonable de dígitos para un archivo.
+    let mut num_buf = String::with_capacity(12);
+
+    // ── Construir líneas del viewport ──
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(view_height);
+
+    for i in 0..view_height {
+        let buf_line_idx = scroll + i;
+
+        if buf_line_idx < total_lines {
+            let is_cursor_line = buf_line_idx == cursor_line;
+
+            // ── Gutter: número de línea ──
+            // Alinear a la derecha sin format!() — usar dígitos pre-computados
+            let line_num = buf_line_idx + 1; // 1-indexed para display
+            let num_digits = digit_count(line_num);
+            let padding = gutter_width.saturating_sub(num_digits);
+            let pad_str = &SPACES[..padding.min(SPACES.len())];
+
+            let gutter_num_style = if is_cursor_line {
+                gutter_active_style
+            } else {
+                gutter_style
+            };
+
+            // Reutilizar buffer para el número — clear() preserva capacidad
+            num_buf.clear();
+            {
+                use std::fmt::Write;
+                let _ = write!(num_buf, "{line_num}");
+            }
+
+            let line_bg_style = if is_cursor_line {
+                text_active_style
+            } else {
+                text_style
+            };
+
+            // ── Texto de la línea ──
+            let line_content = editor.buffer.line(buf_line_idx).unwrap_or("");
+            // Truncar al ancho del viewport sin alocar
+            let display_text = if line_content.len() > text_width {
+                &line_content[..text_width]
+            } else {
+                line_content
+            };
+
+            // Construir spans para esta línea
+            let mut spans: Vec<Span<'_>> = Vec::with_capacity(6);
+            spans.push(Span::styled(pad_str, gutter_num_style));
+            // CLONE: necesario — num_buf se reutiliza en cada iteración del loop,
+            // Span toma ownership del String para mantenerlo vivo en el Line
+            spans.push(Span::styled(num_buf.clone(), gutter_num_style));
+            spans.push(Span::styled("\u{2502} ", separator_style));
+
+            // ── Texto con cursor ──
+            if is_cursor_line && focused {
+                // Dividir la línea en: pre-cursor, cursor char, post-cursor
+                if cursor_col < display_text.len() {
+                    let pre = &display_text[..cursor_col];
+                    let cursor_ch = &display_text[cursor_col..cursor_col + 1];
+                    let post = &display_text[cursor_col + 1..];
+                    spans.push(Span::styled(pre.to_string(), line_bg_style));
+                    spans.push(Span::styled(cursor_ch.to_string(), cursor_style));
+                    if !post.is_empty() {
+                        spans.push(Span::styled(post.to_string(), line_bg_style));
+                    }
+                } else {
+                    // Cursor está al final o más allá del texto visible
+                    if !display_text.is_empty() {
+                        spans.push(Span::styled(display_text.to_string(), line_bg_style));
+                    }
+                    // Mostrar cursor como bloque en la posición después del texto
+                    spans.push(Span::styled(" ", cursor_style));
+                }
+            } else {
+                // Línea sin cursor — render directo
+                // CLONE: necesario — display_text es un slice del buffer,
+                // Span::styled necesita ownership porque la línea de ratatui
+                // toma ownership de los spans
+                if !display_text.is_empty() {
+                    spans.push(Span::styled(display_text.to_string(), line_bg_style));
+                }
+            }
+
+            lines.push(Line::from(spans));
+        } else {
+            // ── Líneas vacías después del buffer: `~` estilo Vim ──
+            let pad_str = &SPACES[..gutter_width.min(SPACES.len())];
+            let spans = vec![
+                Span::styled(pad_str, gutter_style),
+                Span::styled("\u{2502} ", separator_style),
+                Span::styled("~", tilde_style),
+            ];
+            lines.push(Line::from(spans));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_primary));
+    f.render_widget(paragraph, inner);
+}
+
+/// Cuenta la cantidad de dígitos decimales de un número.
+///
+/// Pre-computado fuera del render loop. Evita `format!()` para contar dígitos.
+fn digit_count(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    let mut val = n;
+    while val > 0 {
+        count += 1;
+        val /= 10;
+    }
+    count
 }
 
 // ─── Bottom Panel ──────────────────────────────────────────────────────────────

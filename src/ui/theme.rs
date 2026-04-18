@@ -52,13 +52,10 @@ pub struct Theme {
     #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     pub selection: Color,
     /// Color del cursor.
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     pub cursor: Color,
     /// Números de línea normales.
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     pub line_number: Color,
     /// Número de línea activa (línea del cursor).
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     pub line_number_active: Color,
     /// Borde del panel enfocado — cyan eléctrico prominente.
     pub border_focused: Color,

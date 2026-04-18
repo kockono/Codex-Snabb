@@ -69,7 +69,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
 
     // ── Editor area ──
     let editor_focused = focused == PanelId::Editor;
-    panels::render_editor_area(f, layout.editor_area, theme, editor_focused);
+    panels::render_editor_area(f, layout.editor_area, theme, editor_focused, &state.editor);
 
     // ── Bottom panel ──
     if layout.bottom_panel_visible {

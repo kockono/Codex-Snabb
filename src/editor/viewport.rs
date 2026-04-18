@@ -60,10 +60,6 @@ impl Viewport {
     }
 
     /// Actualiza el tamaño del viewport (se llama en resize o al cambiar layout).
-    #[expect(
-        dead_code,
-        reason = "se usará cuando el editor responda a eventos de resize"
-    )]
     pub fn update_size(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;

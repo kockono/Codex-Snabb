@@ -1352,11 +1352,33 @@ async fn event_loop(
         //    El layout se computa ANTES del render para que el reducer del
         //    próximo frame tenga las áreas actualizadas. `IdeLayout` es Copy.
         let term_size = terminal.size().context("no se pudo obtener tamaño de terminal")?;
-        state.last_layout = Some(IdeLayout::compute(
+        let layout = IdeLayout::compute(
             Rect::new(0, 0, term_size.width, term_size.height),
             state.sidebar_visible,
             state.bottom_panel_visible,
-        ));
+        );
+        state.last_layout = Some(layout);
+
+        // 7.5. Actualizar viewport del editor con el tamaño real del editor area.
+        //      Se hace ANTES del render para que ensure_cursor_visible funcione
+        //      con dimensiones correctas. Descontar bordes (2) + gutter dinámico.
+        {
+            let editor_inner_h = layout.editor_area.height.saturating_sub(2) as usize;
+            let editor_inner_w = layout.editor_area.width.saturating_sub(2) as usize;
+            // Gutter width dinámico: dígitos del total de líneas (mín 4) + 2 (separador)
+            let total_lines = state.editor.buffer.line_count();
+            let gutter_digits = {
+                let mut count = 0usize;
+                let mut val = total_lines;
+                if val == 0 { count = 1; } else {
+                    while val > 0 { count += 1; val /= 10; }
+                }
+                count
+            };
+            let gutter_total = gutter_digits.max(4) + 2; // gutter + separator
+            let text_width = editor_inner_w.saturating_sub(gutter_total);
+            state.editor.viewport.update_size(text_width, editor_inner_h);
+        }
 
         // 8. Render frame actual
         terminal.draw(|frame| {
