@@ -17,19 +17,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::command::CommandRegistry;
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::observe::{FrameTimer, Metrics};
+use crate::ui::layout::IdeLayout;
 use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
 use crate::workspace::ExplorerState;
+use crate::workspace::QuickOpenState;
 
 // ─── AppState ──────────────────────────────────────────────────────────────────
 
@@ -60,10 +65,15 @@ pub struct AppState {
     pub commands: CommandRegistry,
     /// Estado de la command palette (overlay Ctrl+Shift+P).
     pub palette: PaletteState,
+    /// Estado del quick open (overlay Ctrl+P).
+    pub quick_open: QuickOpenState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
     pub status_file: String,
+    /// Layout del último frame renderizado, para resolver posiciones de mouse.
+    /// Se actualiza cada frame antes del render. `IdeLayout` es Copy (struct de Rects).
+    pub last_layout: Option<IdeLayout>,
 }
 
 impl AppState {
@@ -72,16 +82,24 @@ impl AppState {
     /// Intenta inicializar el explorer con el directorio de trabajo actual.
     /// Si falla, el explorer queda como `None` — la app funciona sin él.
     fn new(config: AppConfig) -> Self {
-        let explorer = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| {
-                ExplorerState::new(&cwd)
-                    .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
-                    .ok()
-            });
+        let cwd = std::env::current_dir().ok();
+
+        let explorer = cwd.as_deref().and_then(|cwd| {
+            ExplorerState::new(cwd)
+                .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
+                .ok()
+        });
 
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
+
+        // Construir índice de quick open desde el workspace root
+        let mut quick_open = QuickOpenState::new();
+        if let Some(ref root) = cwd
+            && let Err(e) = quick_open.build_index(root)
+        {
+            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
+        }
 
         Self {
             running: true,
@@ -94,8 +112,10 @@ impl AppState {
             explorer,
             commands,
             palette: PaletteState::new(),
+            quick_open,
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
+            last_layout: None,
         }
     }
 
@@ -116,14 +136,22 @@ impl AppState {
             .map(std::path::Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok());
 
-        let explorer = explorer_root.and_then(|root| {
-            ExplorerState::new(&root)
+        let explorer = explorer_root.as_deref().and_then(|root| {
+            ExplorerState::new(root)
                 .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
                 .ok()
         });
 
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
+
+        // Construir índice de quick open desde el workspace root
+        let mut quick_open = QuickOpenState::new();
+        if let Some(ref root) = explorer_root
+            && let Err(e) = quick_open.build_index(root)
+        {
+            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
+        }
 
         Ok(Self {
             running: true,
@@ -136,8 +164,10 @@ impl AppState {
             explorer,
             commands,
             palette: PaletteState::new(),
+            quick_open,
             status_line: String::from("Ln 1, Col 1"),
             status_file,
+            last_layout: None,
         })
     }
 
@@ -182,23 +212,64 @@ impl AppState {
 /// Mapea un evento de crossterm a una acción del sistema.
 ///
 /// El keymap es CONTEXT-AWARE — las mismas teclas producen acciones
-/// distintas según el panel enfocado y si la palette está abierta:
+/// distintas según el panel enfocado y los overlays activos:
 ///
+/// - **Quick Open abierto**: captura TODO el input (Esc cierra, Enter confirma,
+///   flechas navegan, chars se escriben en búsqueda)
 /// - **Palette abierta**: captura TODO el input (Esc cierra, Enter confirma,
 ///   flechas navegan, chars se escriben en búsqueda)
-/// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando palette cerrada)
+/// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando overlays cerrados)
 /// - **Editor**: flechas mueven cursor, chars insertan texto
 /// - **Explorer**: flechas navegan el árbol, Enter abre/expande
 fn keymap(
     event: &crossterm::event::Event,
     focused_panel: PanelId,
     palette_visible: bool,
+    quick_open_visible: bool,
 ) -> Action {
+    // ── Eventos de mouse ── se procesan ANTES del match de teclado
+    if let CrosstermEvent::Mouse(mouse) = event {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => Action::MouseClick {
+                col: mouse.column,
+                row: mouse.row,
+            },
+            MouseEventKind::ScrollUp => Action::MouseScrollUp {
+                col: mouse.column,
+                row: mouse.row,
+            },
+            MouseEventKind::ScrollDown => Action::MouseScrollDown {
+                col: mouse.column,
+                row: mouse.row,
+            },
+            _ => Action::Noop,
+        };
+    }
+
     let CrosstermEvent::Key(key) = event else {
         return Action::Noop;
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Quick Open abierto: captura TODO el input ──
+    if quick_open_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::QuickOpenClose,
+            (KeyCode::Enter, _) => Action::QuickOpenConfirm,
+            (KeyCode::Up, KeyModifiers::NONE) => Action::QuickOpenUp,
+            (KeyCode::Down, KeyModifiers::NONE) => Action::QuickOpenDown,
+            // Ctrl+P / Ctrl+N para vim-style navigation
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::QuickOpenUp,
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::QuickOpenDown,
+            (KeyCode::Backspace, _) => Action::QuickOpenDeleteChar,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::QuickOpenInsertChar(ch)
+            }
+            // Cualquier otra tecla NO se propaga
+            _ => Action::Noop,
+        };
     }
 
     // ── Palette abierta: captura TODO el input ──
@@ -237,6 +308,14 @@ fn keymap(
             if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
         {
             return Action::OpenCommandPalette;
+        }
+        // Ctrl+P (sin Shift) abre quick open.
+        // crossterm reporta Ctrl+P (sin Shift) como 'p' minúscula con CONTROL flag.
+        // El guard !SHIFT asegura que no interfiera con Ctrl+Shift+P.
+        (KeyCode::Char('p'), mods)
+            if mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::SHIFT) =>
+        {
+            return Action::OpenQuickOpen;
         }
         _ => {}
     }
@@ -440,8 +519,11 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
 
         // ── Acciones de la Command Palette ──
         Action::OpenCommandPalette => {
-            state.palette.open(&state.commands);
-            tracing::debug!("command palette abierta");
+            // Solo abrir si el quick open NO está visible (un overlay a la vez)
+            if !state.quick_open.visible {
+                state.palette.open(&state.commands);
+                tracing::debug!("command palette abierta");
+            }
             vec![]
         }
         Action::PaletteClose => {
@@ -484,15 +566,295 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de mouse ──
+        Action::MouseClick { col, row } => {
+            reduce_mouse_click(state, *col, *row);
+            vec![]
+        }
+        Action::MouseScrollUp { col, row } => {
+            reduce_mouse_scroll(state, *col, *row, ScrollDirection::Up);
+            vec![]
+        }
+        Action::MouseScrollDown { col, row } => {
+            reduce_mouse_scroll(state, *col, *row, ScrollDirection::Down);
+            vec![]
+        }
+
+        // ── Acciones del Quick Open ──
+        Action::OpenQuickOpen => {
+            // Solo abrir si la palette NO está visible (un overlay a la vez)
+            if !state.palette.visible {
+                state.quick_open.open();
+                tracing::debug!("quick open abierto");
+            }
+            vec![]
+        }
+        Action::QuickOpenClose => {
+            state.quick_open.close();
+            tracing::debug!("quick open cerrado");
+            vec![]
+        }
+        Action::QuickOpenUp => {
+            state.quick_open.move_up();
+            vec![]
+        }
+        Action::QuickOpenDown => {
+            state.quick_open.move_down();
+            vec![]
+        }
+        Action::QuickOpenInsertChar(ch) => {
+            state.quick_open.insert_char(*ch);
+            vec![]
+        }
+        Action::QuickOpenDeleteChar => {
+            state.quick_open.delete_char();
+            vec![]
+        }
+        Action::QuickOpenConfirm => {
+            // Obtener path seleccionado, abrir en editor, cerrar quick open.
+            // CLONE: necesario — el path se extrae del quick_open state (inmutable
+            // durante la lectura) y luego se usa para abrir archivo (que requiere
+            // &mut state vía EditorState::open_file).
+            let selected = state.quick_open.selected_path().map(|p| p.to_path_buf());
+            state.quick_open.close();
+
+            if let Some(relative_path) = selected {
+                // Resolver path absoluto desde el workspace root
+                let absolute_path = if let Some(ref explorer) = state.explorer {
+                    explorer.root.join(&relative_path)
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    cwd.join(&relative_path)
+                } else {
+                    relative_path
+                };
+
+                match EditorState::open_file(&absolute_path) {
+                    Ok(editor) => {
+                        state.editor = editor;
+                        state.focused_panel = PanelId::Editor;
+                        state.update_status_cache();
+                        tracing::info!(path = %absolute_path.display(), "archivo abierto desde quick open");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error al abrir archivo desde quick open");
+                    }
+                }
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
         | Action::OpenFile(_)
         | Action::CloseBuffer
-        | Action::OpenQuickOpen
         | Action::OpenGlobalSearch
         | Action::ToggleTerminal
         | Action::OpenGitPanel => vec![],
+    }
+}
+
+// ─── Mouse helpers ─────────────────────────────────────────────────────────────
+
+/// Dirección de scroll del mouse.
+#[derive(Debug, Clone, Copy)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+/// Ancho del gutter (números de línea) en el editor.
+/// Valor fijo por ahora — en el futuro se computará dinámicamente
+/// según la cantidad de dígitos del número de línea más alto.
+const EDITOR_GUTTER_WIDTH: u16 = 4;
+
+/// Cantidad de líneas que el scroll del mouse desplaza por evento.
+const MOUSE_SCROLL_LINES: usize = 3;
+
+/// Determina en qué panel cayó una posición (col, row) absoluta.
+///
+/// Usa el layout almacenado en `AppState.last_layout`. Si no hay layout
+/// (primer frame), retorna `None`. La función es pura — no muta estado.
+fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<PanelId> {
+    let point_in_rect = |r: Rect, c: u16, rw: u16| -> bool {
+        c >= r.x && c < r.x + r.width && rw >= r.y && rw < r.y + r.height
+    };
+
+    // Verificar paneles en orden de prioridad visual (overlays primero si los hubiera)
+    if layout.sidebar_visible && point_in_rect(layout.sidebar, col, row) {
+        return Some(PanelId::Explorer);
+    }
+    if point_in_rect(layout.editor_area, col, row) {
+        return Some(PanelId::Editor);
+    }
+    if layout.bottom_panel_visible && point_in_rect(layout.bottom_panel, col, row) {
+        return Some(PanelId::Terminal);
+    }
+    // Title bar y status bar no son paneles enfocables
+    None
+}
+
+/// Procesa un click de mouse — resuelve panel, cambia foco, ejecuta acción contextual.
+fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
+    let Some(layout) = state.last_layout else {
+        return; // Sin layout aún — primer frame
+    };
+
+    let Some(panel) = hit_test_panel(&layout, col, row) else {
+        return; // Click en zona no interactiva (title bar, status bar)
+    };
+
+    // Cambiar foco al panel clickeado
+    state.focused_panel = panel;
+    tracing::debug!(?panel, col, row, "mouse click → foco");
+
+    match panel {
+        PanelId::Explorer => {
+            reduce_mouse_click_explorer(state, &layout, row);
+        }
+        PanelId::Editor => {
+            reduce_mouse_click_editor(state, &layout, col, row);
+        }
+        // Terminal y otros: solo cambio de foco por ahora
+        _ => {}
+    }
+}
+
+/// Procesa click en el explorer — seleccionar entry, abrir/toggle.
+fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u16) {
+    let Some(ref mut explorer) = state.explorer else {
+        return;
+    };
+
+    // Calcular el inner area de la sidebar (descontar bordes del Block)
+    // Block con Borders::ALL tiene 1px de borde arriba (+ título) y 1px abajo
+    let inner_y = layout.sidebar.y + 1; // Borde superior + título
+    let inner_height = layout.sidebar.height.saturating_sub(2); // Bordes superior e inferior
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // Click en el borde, no en contenido
+    }
+
+    // Índice visual dentro del inner area
+    let visual_row = (row - inner_y) as usize;
+    // Índice real en la lista aplanada = scroll_offset + visual_row
+    let flat_index = explorer.scroll_offset + visual_row;
+
+    let flat = explorer.flatten();
+    let flat_len = flat.len();
+    if flat_index >= flat_len {
+        return; // Click debajo de los entries
+    }
+
+    let is_dir = flat[flat_index].is_dir;
+    // CLONE: necesario — necesitamos el path para abrir archivo después de drop(flat)
+    let entry_path = flat[flat_index].path.clone();
+    drop(flat);
+
+    // Seleccionar el entry clickeado
+    explorer.selected_index = flat_index;
+
+    if is_dir {
+        // Toggle expand/collapse del directorio
+        if let Err(e) = explorer.toggle_selected() {
+            tracing::error!(error = %e, "error en toggle de explorer por mouse");
+        }
+    } else {
+        // Abrir archivo en el editor
+        match EditorState::open_file(&entry_path) {
+            Ok(editor) => {
+                state.editor = editor;
+                state.focused_panel = PanelId::Editor;
+                state.update_status_cache();
+                tracing::info!(path = %entry_path.display(), "archivo abierto por mouse click");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "error al abrir archivo por mouse click");
+            }
+        }
+    }
+}
+
+/// Procesa click en el editor — mover cursor a la posición clickeada.
+fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
+    // Calcular inner area del editor (descontar bordes del Block)
+    let inner_y = layout.editor_area.y + 1;
+    let inner_x = layout.editor_area.x + 1;
+    let inner_height = layout.editor_area.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // Click en borde
+    }
+
+    // Línea en el buffer = viewport offset + fila visual
+    let visual_row = (row - inner_y) as usize;
+    let target_line = state.editor.viewport.scroll_offset + visual_row;
+
+    // Columna en el buffer = col relativo al inner area - gutter
+    let gutter = EDITOR_GUTTER_WIDTH;
+    let text_x = inner_x + gutter;
+    let target_col = if col >= text_x {
+        (col - text_x) as usize
+    } else {
+        0 // Click en el gutter — columna 0
+    };
+
+    // Clampear a límites del buffer
+    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let clamped_line = target_line.min(max_line);
+    let max_col = state.editor.buffer.line_len(clamped_line);
+    let clamped_col = target_col.min(max_col);
+
+    state.editor.cursor.position.line = clamped_line;
+    state.editor.cursor.position.col = clamped_col;
+    state.editor.cursor.sync_desired_col();
+    state.editor.viewport.ensure_cursor_visible(&state.editor.cursor.position);
+    state.update_status_cache();
+
+    tracing::debug!(line = clamped_line, col = clamped_col, "mouse click → cursor editor");
+}
+
+/// Procesa scroll del mouse — scrollea el panel bajo el cursor.
+fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: ScrollDirection) {
+    let Some(layout) = state.last_layout else {
+        return;
+    };
+
+    let Some(panel) = hit_test_panel(&layout, col, row) else {
+        return;
+    };
+
+    match panel {
+        PanelId::Explorer => {
+            if let Some(ref mut explorer) = state.explorer {
+                let flat_count = explorer.flatten().len();
+                match direction {
+                    ScrollDirection::Up => {
+                        explorer.scroll_offset = explorer.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = flat_count.saturating_sub(1);
+                        explorer.scroll_offset = (explorer.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                    }
+                }
+            }
+        }
+        PanelId::Editor => {
+            let line_count = state.editor.buffer.line_count();
+            match direction {
+                ScrollDirection::Up => {
+                    state.editor.viewport.scroll_offset =
+                        state.editor.viewport.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                }
+                ScrollDirection::Down => {
+                    let max_scroll = line_count.saturating_sub(1);
+                    state.editor.viewport.scroll_offset =
+                        (state.editor.viewport.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                }
+            }
+        }
+        // Otros paneles: scroll no implementado aún
+        _ => {}
     }
 }
 
@@ -531,11 +893,11 @@ pub async fn run(file: Option<PathBuf>) -> Result<()> {
     let shutdown = CancellationToken::new();
     let theme = Theme::default();
 
-    // Setup terminal: raw mode + alternate screen
+    // Setup terminal: raw mode + alternate screen + captura de mouse
     terminal::enable_raw_mode()
         .context("no se pudo activar raw mode")?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)
-        .context("no se pudo entrar a alternate screen")?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("no se pudo entrar a alternate screen con mouse capture")?;
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)
@@ -582,10 +944,15 @@ async fn event_loop(
         // 2. Iniciar medición del frame DESPUÉS del poll.
         let frame_timer = FrameTimer::start();
 
-        // 3. Mapear evento a acción (sensible al panel enfocado y palette)
+        // 3. Mapear evento a acción (sensible al panel enfocado y overlays)
         let action = match &event {
             Some(Event::Input(crossterm_event)) => {
-                keymap(crossterm_event, state.focused_panel, state.palette.visible)
+                keymap(
+                    crossterm_event,
+                    state.focused_panel,
+                    state.palette.visible,
+                    state.quick_open.visible,
+                )
             }
             Some(Event::Tick) => Action::Noop,
             _ => Action::Noop,
@@ -617,17 +984,27 @@ async fn event_loop(
             explorer.ensure_visible(explorer_height);
         }
 
-        // 7. Render frame actual
+        // 7. Computar layout y almacenarlo para resolución de mouse.
+        //    El layout se computa ANTES del render para que el reducer del
+        //    próximo frame tenga las áreas actualizadas. `IdeLayout` es Copy.
+        let term_size = terminal.size().context("no se pudo obtener tamaño de terminal")?;
+        state.last_layout = Some(IdeLayout::compute(
+            Rect::new(0, 0, term_size.width, term_size.height),
+            state.sidebar_visible,
+            state.bottom_panel_visible,
+        ));
+
+        // 8. Render frame actual
         terminal.draw(|frame| {
             ui::render(frame, &state, theme);
         }).context("error en render")?;
 
-        // 8. Registrar métricas del frame (solo reduce + render, no poll wait)
+        // 9. Registrar métricas del frame (solo reduce + render, no poll wait)
         let frame_time = frame_timer.elapsed_us();
         state.metrics.record_frame(frame_time);
         state.metrics.record_input_latency(frame_time);
 
-        // 9. Log de warning si el frame excede el budget target
+        // 10. Log de warning si el frame excede el budget target
         if crate::core::budgets::DEFAULT_BUDGETS.frame_exceeds_target(frame_time) {
             tracing::warn!(
                 frame_time_us = frame_time,
@@ -636,7 +1013,7 @@ async fn event_loop(
             );
         }
 
-        // 10. Salir si el estado lo indica o shutdown externo
+        // 11. Salir si el estado lo indica o shutdown externo
         if !state.running || shutdown.is_cancelled() {
             tracing::info!(
                 frames = state.metrics.frame_count,
@@ -670,7 +1047,7 @@ fn poll_event(timeout: Duration) -> Result<Option<Event>> {
 fn cleanup_terminal() -> Result<()> {
     terminal::disable_raw_mode()
         .context("no se pudo desactivar raw mode")?;
-    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)
-        .context("no se pudo salir de alternate screen")?;
+    crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)
+        .context("no se pudo desactivar mouse capture y salir de alternate screen")?;
     Ok(())
 }

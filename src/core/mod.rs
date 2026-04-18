@@ -114,6 +114,29 @@ pub enum Action {
     /// Alternar visibilidad del panel inferior (Ctrl+J).
     ToggleBottomPanel,
 
+    // ── Mouse ──
+    /// Click izquierdo del mouse en posición absoluta de terminal.
+    MouseClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
+        row: u16,
+    },
+    /// Scroll hacia arriba del mouse en posición absoluta de terminal.
+    MouseScrollUp {
+        /// Columna donde ocurrió el scroll.
+        col: u16,
+        /// Fila donde ocurrió el scroll.
+        row: u16,
+    },
+    /// Scroll hacia abajo del mouse en posición absoluta de terminal.
+    MouseScrollDown {
+        /// Columna donde ocurrió el scroll.
+        col: u16,
+        /// Fila donde ocurrió el scroll.
+        row: u16,
+    },
+
     // ── Git ──
     /// Abrir el panel de Git / source control.
     OpenGitPanel,
@@ -131,6 +154,20 @@ pub enum Action {
     PaletteConfirm,
     /// Cerrar la command palette.
     PaletteClose,
+
+    // ── Quick Open ──
+    /// Mover selección arriba en el quick open.
+    QuickOpenUp,
+    /// Mover selección abajo en el quick open.
+    QuickOpenDown,
+    /// Insertar carácter en el input del quick open.
+    QuickOpenInsertChar(char),
+    /// Borrar carácter del input del quick open.
+    QuickOpenDeleteChar,
+    /// Confirmar y abrir el archivo seleccionado en el quick open.
+    QuickOpenConfirm,
+    /// Cerrar el quick open.
+    QuickOpenClose,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
