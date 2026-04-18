@@ -273,6 +273,10 @@ fn keymap(
                 col: mouse.column,
                 row: mouse.row,
             },
+            MouseEventKind::Drag(MouseButton::Left) => Action::MouseDrag {
+                col: mouse.column,
+                row: mouse.row,
+            },
             _ => Action::Noop,
         };
     }
@@ -769,6 +773,10 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::MouseScrollDown { col, row } => {
             reduce_mouse_scroll(state, *col, *row, ScrollDirection::Down);
+            vec![]
+        }
+        Action::MouseDrag { col, row } => {
+            reduce_mouse_drag(state, *col, *row);
             vec![]
         }
 
@@ -1360,12 +1368,89 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
     primary.position.line = clamped_line;
     primary.position.col = clamped_col;
     primary.sync_desired_col();
-    primary.clear_selection();
+    // Iniciar selección con anchor = head = click_pos.
+    // Si el usuario no arrastra, anchor == head → selección vacía (equivale a sin selección).
+    // Si arrastra, el drag handler actualiza head para extender la selección.
+    let click_pos = crate::editor::cursor::Position {
+        line: clamped_line,
+        col: clamped_col,
+    };
+    primary.selection = Some(crate::editor::selection::Selection::new(click_pos, click_pos));
     let pos = state.editor.cursors.primary().position;
     state.editor.viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 
     tracing::debug!(line = clamped_line, col = clamped_col, "mouse click → cursor editor");
+}
+
+/// Procesa drag del mouse — selección de texto arrastrando.
+///
+/// Solo actúa si el drag cae en el editor area. Extiende la selección
+/// desde el anchor (seteado en el click) hasta la posición actual del drag.
+fn reduce_mouse_drag(state: &mut AppState, col: u16, row: u16) {
+    let Some(layout) = state.last_layout else {
+        return; // Sin layout — primer frame
+    };
+
+    let Some(panel) = hit_test_panel(&layout, col, row) else {
+        return;
+    };
+
+    // Drag-to-select solo en el editor
+    if panel == PanelId::Editor {
+        reduce_mouse_drag_editor(state, &layout, col, row);
+    }
+}
+
+/// Procesa drag en el editor — extiende selección desde anchor hasta posición del drag.
+fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
+    // Calcular inner area del editor (descontar bordes del Block)
+    let inner_y = layout.editor_area.y + 1;
+    let inner_x = layout.editor_area.x + 1;
+    let inner_height = layout.editor_area.height.saturating_sub(2);
+
+    // Clampear row al rango visible del editor para permitir scroll
+    // cuando el drag sale por arriba o abajo del viewport
+    let clamped_row = row.clamp(inner_y, inner_y + inner_height.saturating_sub(1));
+
+    // Línea en el buffer = viewport offset + fila visual
+    let visual_row = (clamped_row - inner_y) as usize;
+    let target_line = state.editor.viewport.scroll_offset + visual_row;
+
+    // Columna en el buffer = col relativo al inner area - gutter
+    let gutter = EDITOR_GUTTER_WIDTH;
+    let text_x = inner_x + gutter;
+    let target_col = if col >= text_x {
+        (col - text_x) as usize
+    } else {
+        0 // Drag en el gutter — columna 0
+    };
+
+    // Clampear a límites del buffer
+    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let clamped_line = target_line.min(max_line);
+    let max_col = state.editor.buffer.line_len(clamped_line);
+    let clamped_col = target_col.min(max_col);
+
+    let primary = state.editor.cursors.primary_mut();
+
+    // Verificar que hay una selección activa (seteada por el click previo)
+    if primary.selection.is_none() {
+        return;
+    }
+
+    // Actualizar posición del cursor y head de la selección
+    primary.position.line = clamped_line;
+    primary.position.col = clamped_col;
+    primary.sync_desired_col();
+    primary.extend_selection();
+
+    // Scroll automático si el drag lleva el cursor fuera del viewport
+    let pos = state.editor.cursors.primary().position;
+    state.editor.viewport.ensure_cursor_visible(&pos);
+    state.update_status_cache();
+
+    tracing::trace!(line = clamped_line, col = clamped_col, "mouse drag → selección editor");
 }
 
 /// Procesa scroll del mouse — scrollea el panel bajo el cursor.

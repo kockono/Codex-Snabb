@@ -185,6 +185,14 @@ pub enum Action {
         /// Fila donde ocurrió el scroll.
         row: u16,
     },
+    /// Drag del mouse (botón izquierdo presionado + movimiento).
+    /// Se usa para selección de texto arrastrando el mouse.
+    MouseDrag {
+        /// Columna actual del drag (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila actual del drag (0-indexed, coordenada de terminal).
+        row: u16,
+    },
 
     // ── Git ──
     /// Abrir el panel de Git / source control.
