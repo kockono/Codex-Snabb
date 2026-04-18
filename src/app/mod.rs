@@ -30,6 +30,7 @@ use crate::core::command::CommandRegistry;
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::observe::{FrameTimer, Metrics};
+use crate::search::SearchState;
 use crate::ui::layout::IdeLayout;
 use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
@@ -67,6 +68,8 @@ pub struct AppState {
     pub palette: PaletteState,
     /// Estado del quick open (overlay Ctrl+P).
     pub quick_open: QuickOpenState,
+    /// Estado del panel de búsqueda global (Ctrl+Shift+F).
+    pub search: SearchState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -113,6 +116,7 @@ impl AppState {
             commands,
             palette: PaletteState::new(),
             quick_open,
+            search: SearchState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
@@ -165,6 +169,7 @@ impl AppState {
             commands,
             palette: PaletteState::new(),
             quick_open,
+            search: SearchState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
@@ -214,10 +219,9 @@ impl AppState {
 /// El keymap es CONTEXT-AWARE — las mismas teclas producen acciones
 /// distintas según el panel enfocado y los overlays activos:
 ///
-/// - **Quick Open abierto**: captura TODO el input (Esc cierra, Enter confirma,
-///   flechas navegan, chars se escriben en búsqueda)
-/// - **Palette abierta**: captura TODO el input (Esc cierra, Enter confirma,
-///   flechas navegan, chars se escriben en búsqueda)
+/// - **Quick Open abierto**: captura TODO el input
+/// - **Palette abierta**: captura TODO el input
+/// - **Search panel activo**: captura input cuando sidebar tiene foco
 /// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando overlays cerrados)
 /// - **Editor**: flechas mueven cursor, chars insertan texto
 /// - **Explorer**: flechas navegan el árbol, Enter abre/expande
@@ -226,6 +230,7 @@ fn keymap(
     focused_panel: PanelId,
     palette_visible: bool,
     quick_open_visible: bool,
+    search_visible: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -291,6 +296,50 @@ fn keymap(
         };
     }
 
+    // ── Search panel activo: captura input cuando foco en Search ──
+    if search_visible && focused_panel == PanelId::Search {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::SearchClose,
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::SearchExecute,
+            (KeyCode::Tab, KeyModifiers::NONE) => Action::SearchNextField,
+            (KeyCode::BackTab, KeyModifiers::SHIFT) => Action::SearchPrevField,
+            (KeyCode::Up, KeyModifiers::NONE) => Action::SearchPrevMatch,
+            (KeyCode::Down, KeyModifiers::NONE) => Action::SearchNextMatch,
+            (KeyCode::F(3), KeyModifiers::NONE) => Action::SearchNextMatch,
+            (KeyCode::F(3), mods) if mods.contains(KeyModifiers::SHIFT) => Action::SearchPrevMatch,
+            (KeyCode::Backspace, _) => Action::SearchDeleteChar,
+            // Alt+C → toggle case sensitive
+            (KeyCode::Char('c'), KeyModifiers::ALT) => Action::SearchToggleCase,
+            // Alt+W → toggle whole word
+            (KeyCode::Char('w'), KeyModifiers::ALT) => Action::SearchToggleWholeWord,
+            // Alt+R → toggle regex
+            (KeyCode::Char('r'), KeyModifiers::ALT) => Action::SearchToggleRegex,
+            // Ctrl+Shift+H → toggle replace
+            (KeyCode::Char('H'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SearchToggleReplace
+            }
+            // Ctrl+Shift+1 → replace current
+            (KeyCode::Char('!'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SearchReplaceCurrent
+            }
+            // Ctrl+Shift+A en search → replace all in file
+            (KeyCode::Char('A'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SearchReplaceAllInFile
+            }
+            // Chars se escriben en el campo activo
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::SearchInsertChar(ch)
+            }
+            _ => Action::Noop,
+        };
+    }
+
     // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => return Action::Quit,
@@ -301,6 +350,12 @@ fn keymap(
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => return Action::SaveFile,
         (KeyCode::Char('z'), KeyModifiers::CONTROL) => return Action::Undo,
         (KeyCode::Char('y'), KeyModifiers::CONTROL) => return Action::Redo,
+        // Ctrl+Shift+F abre búsqueda global.
+        (KeyCode::Char('F'), mods)
+            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+        {
+            return Action::OpenGlobalSearch;
+        }
         // Ctrl+Shift+P abre la command palette.
         // crossterm reporta Ctrl+Shift+P como 'P' mayúscula con CONTROL|SHIFT flags.
         // Necesitamos un guard porque `|` en match es OR, no bitwise OR.
@@ -643,15 +698,174 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de búsqueda global ──
+        Action::OpenGlobalSearch => {
+            // Abrir panel de búsqueda: hacer sidebar visible, foco en Search
+            state.sidebar_visible = true;
+            state.search.open();
+            state.focused_panel = PanelId::Search;
+            tracing::debug!("búsqueda global abierta");
+            vec![]
+        }
+        Action::SearchClose => {
+            state.search.close();
+            // Volver foco al editor
+            state.focused_panel = PanelId::Editor;
+            tracing::debug!("búsqueda global cerrada");
+            vec![]
+        }
+        Action::SearchInsertChar(ch) => {
+            state.search.insert_char(*ch);
+            vec![]
+        }
+        Action::SearchDeleteChar => {
+            state.search.delete_char();
+            vec![]
+        }
+        Action::SearchNextField => {
+            state.search.next_field();
+            vec![]
+        }
+        Action::SearchPrevField => {
+            state.search.prev_field();
+            vec![]
+        }
+        Action::SearchExecute => {
+            // Determinar workspace root para la búsqueda
+            let root = state.explorer.as_ref()
+                .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut self
+                .or_else(|| std::env::current_dir().ok());
+
+            if let Some(root) = root {
+                let max = state.config.search_max_results;
+                state.search.execute_search(&root, max);
+                tracing::info!(
+                    query = %state.search.options.query,
+                    matches = state.search.results.as_ref().map(|r| r.total_matches).unwrap_or(0),
+                    "búsqueda ejecutada"
+                );
+            } else {
+                tracing::warn!("no hay workspace root para búsqueda");
+            }
+            vec![]
+        }
+        Action::SearchNextMatch => {
+            state.search.next_match();
+            // Navegar al match en el editor
+            navigate_to_search_match(state);
+            vec![]
+        }
+        Action::SearchPrevMatch => {
+            state.search.prev_match();
+            navigate_to_search_match(state);
+            vec![]
+        }
+        Action::SearchToggleCase => {
+            state.search.toggle_case_sensitive();
+            tracing::debug!(case = state.search.options.case_sensitive, "toggle case");
+            vec![]
+        }
+        Action::SearchToggleWholeWord => {
+            state.search.toggle_whole_word();
+            tracing::debug!(whole_word = state.search.options.whole_word, "toggle whole word");
+            vec![]
+        }
+        Action::SearchToggleRegex => {
+            state.search.toggle_regex();
+            tracing::debug!(regex = state.search.options.use_regex, "toggle regex");
+            vec![]
+        }
+        Action::SearchToggleReplace => {
+            state.search.toggle_replace();
+            tracing::debug!(replace = state.search.replace_visible, "toggle replace");
+            vec![]
+        }
+        Action::SearchReplaceCurrent => {
+            let root = state.explorer.as_ref()
+                .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut self
+                .or_else(|| std::env::current_dir().ok());
+
+            if let Some(root) = root
+                && let Err(e) = state.search.replace_current(&root)
+            {
+                tracing::error!(error = %e, "error en replace current");
+            }
+            vec![]
+        }
+        Action::SearchReplaceAllInFile => {
+            let root = state.explorer.as_ref()
+                .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut self
+                .or_else(|| std::env::current_dir().ok());
+
+            if let Some(root) = root
+                && let Err(e) = state.search.replace_all_in_file(&root)
+            {
+                tracing::error!(error = %e, "error en replace all in file");
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
         | Action::OpenFile(_)
         | Action::CloseBuffer
-        | Action::OpenGlobalSearch
         | Action::ToggleTerminal
         | Action::OpenGitPanel => vec![],
     }
+}
+
+// ─── Search navigation helper ──────────────────────────────────────────────────
+
+/// Abre el archivo del match seleccionado y mueve el cursor a la posición.
+///
+/// Si el match apunta a un archivo diferente al editor actual, lo abre.
+/// Luego posiciona el cursor en la línea y columna del match.
+fn navigate_to_search_match(state: &mut AppState) {
+    let Some(m) = state.search.selected_match_data() else {
+        return;
+    };
+
+    // Resolver path absoluto
+    let abs_path = if let Some(ref explorer) = state.explorer {
+        explorer.root.join(&m.path)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&m.path)
+    } else {
+        return;
+    };
+
+    let target_line = m.line_number.saturating_sub(1); // 1-indexed → 0-indexed
+    let target_col = m.match_start;
+
+    // Verificar si necesitamos abrir otro archivo
+    let needs_open = state.editor.buffer.file_path()
+        .is_none_or(|current| current != abs_path);
+
+    if needs_open {
+        match EditorState::open_file(&abs_path) {
+            Ok(editor) => {
+                state.editor = editor;
+                tracing::info!(path = %abs_path.display(), "archivo abierto desde search");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "error al abrir archivo desde search");
+                return;
+            }
+        }
+    }
+
+    // Posicionar cursor
+    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let clamped_line = target_line.min(max_line);
+    let max_col = state.editor.buffer.line_len(clamped_line);
+    let clamped_col = target_col.min(max_col);
+
+    state.editor.cursor.position.line = clamped_line;
+    state.editor.cursor.position.col = clamped_col;
+    state.editor.cursor.sync_desired_col();
+    state.editor.viewport.ensure_cursor_visible(&state.editor.cursor.position);
+    state.update_status_cache();
 }
 
 // ─── Mouse helpers ─────────────────────────────────────────────────────────────
@@ -681,7 +895,10 @@ fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<PanelId> {
     };
 
     // Verificar paneles en orden de prioridad visual (overlays primero si los hubiera)
+    // La sidebar puede mostrar Explorer o Search según el estado activo
     if layout.sidebar_visible && point_in_rect(layout.sidebar, col, row) {
+        // El panel activo de la sidebar se resuelve en reduce_mouse_click
+        // Retornamos Explorer como default — el reducer ajusta a Search si corresponde
         return Some(PanelId::Explorer);
     }
     if point_in_rect(layout.editor_area, col, row) {
@@ -704,11 +921,21 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
         return; // Click en zona no interactiva (title bar, status bar)
     };
 
+    // Si la sidebar muestra el search panel, redirigir foco a Search
+    let panel = if panel == PanelId::Explorer && state.search.visible {
+        PanelId::Search
+    } else {
+        panel
+    };
+
     // Cambiar foco al panel clickeado
     state.focused_panel = panel;
     tracing::debug!(?panel, col, row, "mouse click → foco");
 
     match panel {
+        PanelId::Search => {
+            // Click en search panel — no hay acción de click específica por ahora
+        }
         PanelId::Explorer => {
             reduce_mouse_click_explorer(state, &layout, row);
         }
@@ -826,7 +1053,21 @@ fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: Scro
 
     match panel {
         PanelId::Explorer => {
-            if let Some(ref mut explorer) = state.explorer {
+            // Si search está visible, scrollear resultados de búsqueda
+            if state.search.visible {
+                let match_count = state.search.results.as_ref()
+                    .map(|r| r.matches.len())
+                    .unwrap_or(0);
+                match direction {
+                    ScrollDirection::Up => {
+                        state.search.scroll_offset = state.search.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = match_count.saturating_sub(1);
+                        state.search.scroll_offset = (state.search.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                    }
+                }
+            } else if let Some(ref mut explorer) = state.explorer {
                 let flat_count = explorer.flatten().len();
                 match direction {
                     ScrollDirection::Up => {
@@ -952,6 +1193,7 @@ async fn event_loop(
                     state.focused_panel,
                     state.palette.visible,
                     state.quick_open.visible,
+                    state.search.visible,
                 )
             }
             Some(Event::Tick) => Action::Noop,

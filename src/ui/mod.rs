@@ -9,6 +9,7 @@ pub mod layout;
 pub mod palette;
 pub mod panels;
 pub mod quick_open;
+pub mod search_panel;
 pub mod theme;
 
 pub use theme::Theme;
@@ -45,14 +46,25 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // ── Sidebar ──
     if layout.sidebar_visible {
         let sidebar_focused = matches!(focused, PanelId::Explorer | PanelId::Git | PanelId::Search);
-        panels::render_sidebar(
-            f,
-            layout.sidebar,
-            theme,
-            sidebar_focused,
-            sidebar_active_panel(focused),
-            state.explorer.as_ref(),
-        );
+        if state.search.visible {
+            // Búsqueda activa: renderizar panel de búsqueda en la sidebar
+            search_panel::render_search_panel(
+                f,
+                layout.sidebar,
+                &state.search,
+                theme,
+                sidebar_focused,
+            );
+        } else {
+            panels::render_sidebar(
+                f,
+                layout.sidebar,
+                theme,
+                sidebar_focused,
+                sidebar_active_panel(focused),
+                state.explorer.as_ref(),
+            );
+        }
     }
 
     // ── Editor area ──

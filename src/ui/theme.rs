@@ -71,7 +71,6 @@ pub struct Theme {
     #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
     pub diff_remove: Color,
     /// Coincidencia de búsqueda — fondo highlight.
-    #[expect(dead_code, reason = "se usará en épica 6 — global search")]
     pub search_match: Color,
 }
 

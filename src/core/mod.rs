@@ -91,6 +91,34 @@ pub enum Action {
     // ── Search ──
     /// Abrir el panel de búsqueda global.
     OpenGlobalSearch,
+    /// Cerrar el panel de búsqueda global.
+    SearchClose,
+    /// Insertar carácter en el campo activo del search.
+    SearchInsertChar(char),
+    /// Borrar carácter del campo activo del search.
+    SearchDeleteChar,
+    /// Siguiente campo de input en search (Tab).
+    SearchNextField,
+    /// Campo anterior de input en search (Shift+Tab).
+    SearchPrevField,
+    /// Ejecutar la búsqueda con las opciones actuales.
+    SearchExecute,
+    /// Navegar al siguiente match en resultados.
+    SearchNextMatch,
+    /// Navegar al match anterior en resultados.
+    SearchPrevMatch,
+    /// Toggle case sensitive en search.
+    SearchToggleCase,
+    /// Toggle whole word en search.
+    SearchToggleWholeWord,
+    /// Toggle regex en search.
+    SearchToggleRegex,
+    /// Toggle visibilidad del campo replace.
+    SearchToggleReplace,
+    /// Reemplazar el match seleccionado.
+    SearchReplaceCurrent,
+    /// Reemplazar todos los matches del archivo actual.
+    SearchReplaceAllInFile,
 
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.
@@ -285,7 +313,6 @@ pub enum PanelId {
     /// Panel inferior de terminal integrada.
     Terminal,
     /// Panel de búsqueda global.
-    #[expect(dead_code, reason = "se usará en épica 6 — global search")]
     Search,
     /// Panel de Git / source control.
     #[expect(dead_code, reason = "se usará en épica 9 — git panel")]
@@ -373,7 +400,6 @@ pub struct AppConfig {
     #[expect(dead_code, reason = "se usará en épica 7 — terminal integrada")]
     pub terminal_scrollback: usize,
     /// Resultados máximos que retorna una búsqueda global.
-    #[expect(dead_code, reason = "se usará en épica 6 — global search")]
     pub search_max_results: usize,
 }
 
