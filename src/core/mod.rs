@@ -41,27 +41,42 @@ pub enum Action {
 
     // ── Editor ──
     /// Insertar un carácter en la posición del cursor.
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     InsertChar(char),
-    /// Eliminar el carácter en la posición del cursor.
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
+    /// Eliminar el carácter antes del cursor (backspace).
     DeleteChar,
+    /// Insertar un salto de línea (Enter).
+    InsertNewline,
     /// Mover el cursor en una dirección.
-    #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     MoveCursor(Direction),
+    /// Mover cursor al inicio de la línea actual (Home).
+    MoveToLineStart,
+    /// Mover cursor al final de la línea actual (End).
+    MoveToLineEnd,
+    /// Mover cursor al inicio absoluto del buffer (Ctrl+Home).
+    #[expect(
+        dead_code,
+        reason = "se habilitará cuando se agregue keybinding Ctrl+Home"
+    )]
+    MoveToBufferStart,
+    /// Mover cursor al final absoluto del buffer (Ctrl+End).
+    #[expect(
+        dead_code,
+        reason = "se habilitará cuando se agregue keybinding Ctrl+End"
+    )]
+    MoveToBufferEnd,
+    /// Deshacer la última operación de edición (Ctrl+Z).
+    Undo,
+    /// Rehacer la última operación deshecha (Ctrl+Y).
+    Redo,
 
     // ── Archivos ──
     /// Abrir un archivo por path.
     #[expect(
         dead_code,
-        reason = "se usará cuando se implemente apertura de archivos"
+        reason = "se usará cuando se implemente apertura de archivos via UI"
     )]
     OpenFile(PathBuf),
     /// Guardar el archivo del buffer activo.
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se implemente guardado de archivos"
-    )]
     SaveFile,
     /// Cerrar el buffer activo.
     #[expect(dead_code, reason = "se usará cuando se implemente cierre de buffers")]
@@ -262,7 +277,6 @@ impl PanelId {
 /// Dirección de movimiento del cursor.
 ///
 /// Usada por `Action::MoveCursor` para indicar dirección sin ambigüedad.
-#[expect(dead_code, reason = "se usará en épica 2 — editor base")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Mover hacia arriba (línea anterior).

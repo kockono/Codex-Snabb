@@ -12,6 +12,7 @@
 //! Los efectos se procesan después (por ahora solo `Effect::Quit`).
 //! Métricas se registran en cada ciclo via `FrameTimer`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,7 +23,8 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{Action, AppConfig, Effect, Event, PanelId};
+use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
+use crate::editor::EditorState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::ui::{self, Theme};
 
@@ -31,8 +33,8 @@ use crate::ui::{self, Theme};
 /// Estado central de la aplicación.
 ///
 /// Contiene todo el estado mutable del sistema. El reducer lo modifica
-/// en respuesta a acciones y produce efectos. Los subsistemas futuros
-/// (editor, workspace, search, etc.) agregarán sus sub-estados acá.
+/// en respuesta a acciones y produce efectos. Cada subsistema agrega
+/// su sub-estado acá.
 #[derive(Debug)]
 pub struct AppState {
     /// Si la aplicación sigue ejecutando.
@@ -47,10 +49,16 @@ pub struct AppState {
     pub sidebar_visible: bool,
     /// Si el bottom panel está visible.
     pub bottom_panel_visible: bool,
+    /// Estado del editor de texto.
+    pub editor: EditorState,
+    /// Datos pre-computados para la status bar (se actualizan en cada frame).
+    /// Evita allocaciones dentro del render — se computan antes.
+    pub status_line: String,
+    pub status_file: String,
 }
 
 impl AppState {
-    /// Crea un nuevo estado con valores por defecto.
+    /// Crea un nuevo estado con valores por defecto y editor vacío.
     fn new(config: AppConfig) -> Self {
         Self {
             running: true,
@@ -59,6 +67,64 @@ impl AppState {
             metrics: Metrics::new(),
             sidebar_visible: true,
             bottom_panel_visible: true,
+            editor: EditorState::new(),
+            status_line: String::from("Ln 1, Col 1"),
+            status_file: String::from("[no file]"),
+        }
+    }
+
+    /// Crea un nuevo estado con un archivo abierto.
+    fn with_file(config: AppConfig, path: &std::path::Path) -> Result<Self> {
+        let editor = EditorState::open_file(path)?;
+        let status_file = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("[no file]"));
+        Ok(Self {
+            running: true,
+            focused_panel: PanelId::Editor,
+            config,
+            metrics: Metrics::new(),
+            sidebar_visible: true,
+            bottom_panel_visible: true,
+            editor,
+            status_line: String::from("Ln 1, Col 1"),
+            status_file,
+        })
+    }
+
+    /// Actualiza los strings pre-computados de la status bar.
+    ///
+    /// Se llama después de cualquier acción que modifique el cursor o el buffer.
+    /// Reutiliza la capacidad existente del String para minimizar allocaciones.
+    fn update_status_cache(&mut self) {
+        // Actualizar posición del cursor (1-indexed para display)
+        self.status_line.clear();
+        // Escribir sin format!() — usamos write! con buffer reutilizado
+        use std::fmt::Write;
+        let _ = write!(
+            self.status_line,
+            "Ln {}, Col {}",
+            self.editor.cursor.position.line + 1,
+            self.editor.cursor.position.col + 1
+        );
+
+        // Actualizar nombre de archivo
+        if let Some(path) = self.editor.buffer.file_path() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            if self.editor.buffer.is_dirty() {
+                self.status_file.clear();
+                let _ = write!(self.status_file, "{name} [+]");
+            } else {
+                self.status_file.clear();
+                self.status_file.push_str(&name);
+            }
+        } else {
+            self.status_file.clear();
+            self.status_file.push_str("[no file]");
         }
     }
 }
@@ -67,45 +133,63 @@ impl AppState {
 
 /// Mapea un evento de crossterm a una acción del sistema.
 ///
-/// Solo procesa key press events (ignora release y repeat).
-/// Retorna `Action::Noop` para eventos no mapeados.
-///
-/// Mapeos actuales:
-/// - `q` / `Esc` → `Action::Quit`
-/// - `Tab` → `Action::FocusNext`
-/// - `Shift+Tab` (BackTab) → `Action::FocusPrev`
-/// - `Ctrl+B` → `Action::ToggleSidebar`
-/// - `Ctrl+J` → `Action::ToggleBottomPanel`
-/// - cualquier otro → `Action::Noop`
-fn keymap(event: &crossterm::event::Event) -> Action {
-    if let CrosstermEvent::Key(key) = event {
-        if key.kind != KeyEventKind::Press {
-            return Action::Noop;
-        }
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => Action::Quit,
-            (KeyCode::Tab, KeyModifiers::NONE) => Action::FocusNext,
-            (KeyCode::BackTab, KeyModifiers::SHIFT) => Action::FocusPrev,
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => Action::ToggleSidebar,
-            (KeyCode::Char('j'), KeyModifiers::CONTROL) => Action::ToggleBottomPanel,
-            _ => Action::Noop,
-        }
-    } else {
-        Action::Noop
+/// El keymap es sensible al panel enfocado:
+/// - Cuando el foco está en el Editor, caracteres alfanuméricos
+///   se convierten en `InsertChar` (modo INSERT siempre por ahora).
+/// - Atajos con Ctrl se procesan globalmente.
+/// - Esc sale de la aplicación (se cambiará cuando haya modos).
+fn keymap(event: &crossterm::event::Event, focused_panel: PanelId) -> Action {
+    let CrosstermEvent::Key(key) = event else {
+        return Action::Noop;
+    };
+    if key.kind != KeyEventKind::Press {
+        return Action::Noop;
     }
+
+    // Atajos globales (Ctrl+algo, Esc, Tab)
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => return Action::Quit,
+        (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
+        (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
+        (KeyCode::Char('j'), KeyModifiers::CONTROL) => return Action::ToggleBottomPanel,
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => return Action::SaveFile,
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => return Action::Undo,
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => return Action::Redo,
+        _ => {}
+    }
+
+    // Atajos específicos del editor (solo cuando el foco está en Editor)
+    if focused_panel == PanelId::Editor {
+        match (key.code, key.modifiers) {
+            // Movimiento de cursor
+            (KeyCode::Up, KeyModifiers::NONE) => return Action::MoveCursor(Direction::Up),
+            (KeyCode::Down, KeyModifiers::NONE) => return Action::MoveCursor(Direction::Down),
+            (KeyCode::Left, KeyModifiers::NONE) => return Action::MoveCursor(Direction::Left),
+            (KeyCode::Right, KeyModifiers::NONE) => return Action::MoveCursor(Direction::Right),
+            (KeyCode::Home, KeyModifiers::NONE) => return Action::MoveToLineStart,
+            (KeyCode::End, KeyModifiers::NONE) => return Action::MoveToLineEnd,
+
+            // Edición
+            (KeyCode::Backspace, KeyModifiers::NONE) => return Action::DeleteChar,
+            (KeyCode::Enter, KeyModifiers::NONE) => return Action::InsertNewline,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                return Action::InsertChar(ch);
+            }
+
+            _ => {}
+        }
+    }
+
+    Action::Noop
 }
 
 // ─── Reducer ───────────────────────────────────────────────────────────────────
 
-/// Reducer puro: actualiza estado según la acción y retorna efectos.
+/// Reducer: actualiza estado según la acción y retorna efectos.
 ///
-/// Este es el corazón del message passing. Toda mutación de estado
-/// pasa por acá. Los efectos retornados se procesan fuera del reducer.
-///
-/// Garantías:
-/// - No ejecuta IO
-/// - No aloca en heap (retorna Vec, pero con capacidad mínima)
-/// - Determinístico: misma entrada → misma salida
+/// Delega las operaciones de edición al `EditorState`.
+/// Las acciones de editor solo se procesan si el foco está en el Editor.
 fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
     match action {
         Action::Quit => {
@@ -132,14 +216,75 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             tracing::debug!(visible = state.bottom_panel_visible, "toggle bottom panel");
             vec![]
         }
+
+        // ── Acciones de editor ──
+        Action::InsertChar(ch) => {
+            state.editor.insert_char(*ch);
+            state.update_status_cache();
+            vec![]
+        }
+        Action::DeleteChar => {
+            state.editor.delete_char();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::InsertNewline => {
+            state.editor.insert_newline();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveCursor(dir) => {
+            state.editor.move_cursor(*dir);
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToLineStart => {
+            state.editor.move_to_line_start();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToLineEnd => {
+            state.editor.move_to_line_end();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToBufferStart => {
+            state.editor.move_to_buffer_start();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToBufferEnd => {
+            state.editor.move_to_buffer_end();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::Undo => {
+            state.editor.undo();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::Redo => {
+            state.editor.redo();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::SaveFile => {
+            match state.editor.save() {
+                Ok(()) => {
+                    tracing::info!("archivo guardado");
+                    state.update_status_cache();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "error al guardar archivo");
+                }
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
-        | Action::InsertChar(_)
-        | Action::DeleteChar
-        | Action::MoveCursor(_)
         | Action::OpenFile(_)
-        | Action::SaveFile
         | Action::CloseBuffer
         | Action::OpenCommandPalette
         | Action::OpenQuickOpen
@@ -178,10 +323,9 @@ fn process_effects(effects: &[Effect], shutdown: &CancellationToken) {
 
 /// Ejecuta la aplicación completa.
 ///
-/// Setup de terminal → event loop → cleanup.
-/// Retorna `Result<()>` para propagar errores al caller (main).
-pub async fn run() -> Result<()> {
-    let _config = AppConfig::new();
+/// Acepta un path opcional para abrir un archivo al inicio.
+/// Setup de terminal -> event loop -> cleanup.
+pub async fn run(file: Option<PathBuf>) -> Result<()> {
     let shutdown = CancellationToken::new();
     let theme = Theme::default();
 
@@ -196,7 +340,7 @@ pub async fn run() -> Result<()> {
         .context("no se pudo crear terminal ratatui")?;
 
     // Event loop con cleanup garantizado
-    let result = event_loop(&mut terminal, &shutdown, &theme).await;
+    let result = event_loop(&mut terminal, &shutdown, &theme, file).await;
 
     // Cleanup: SIEMPRE restaurar terminal, incluso si hubo error
     cleanup_terminal()?;
@@ -208,21 +352,25 @@ pub async fn run() -> Result<()> {
 
 /// Event loop principal.
 ///
-/// Ciclo: poll evento → keymap → reduce → process effects → render.
+/// Ciclo: poll evento -> keymap -> reduce -> process effects -> render.
 /// Instrumentado con `FrameTimer` y `Metrics` para observabilidad.
-///
-/// El `FrameTimer` mide SOLO el trabajo real (keymap + reduce + render),
-/// NO el tiempo de espera del poll. Así el budget de 16ms refleja
-/// latencia de procesamiento real, no tiempo idle.
-///
-/// No usa busy-polling: `event::poll` con timeout evita CPU idle > 0%.
-/// El tick_rate controla la frecuencia máxima de polling.
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     shutdown: &CancellationToken,
     theme: &Theme,
+    file: Option<PathBuf>,
 ) -> Result<()> {
-    let mut state = AppState::new(AppConfig::new());
+    let config = AppConfig::new();
+    let mut state = if let Some(ref path) = file {
+        AppState::with_file(config, path)
+            .with_context(|| format!("no se pudo abrir: {}", path.display()))?
+    } else {
+        AppState::new(config)
+    };
+
+    // Inicializar status cache
+    state.update_status_cache();
+
     let tick_duration = Duration::from_millis(state.config.tick_rate_ms);
 
     loop {
@@ -230,13 +378,11 @@ async fn event_loop(
         let event = poll_event(tick_duration)?;
 
         // 2. Iniciar medición del frame DESPUÉS del poll.
-        //    Mide solo trabajo real: keymap + reduce + effects + render.
-        //    El budget de 16ms es para render, no para espera de input.
         let frame_timer = FrameTimer::start();
 
-        // 3. Mapear evento a acción
+        // 3. Mapear evento a acción (sensible al panel enfocado)
         let action = match &event {
-            Some(Event::Input(crossterm_event)) => keymap(crossterm_event),
+            Some(Event::Input(crossterm_event)) => keymap(crossterm_event, state.focused_panel),
             Some(Event::Tick) => Action::Noop,
             _ => Action::Noop,
         };
@@ -290,10 +436,6 @@ async fn event_loop(
 // ─── Poll Event ────────────────────────────────────────────────────────────────
 
 /// Poll de eventos de crossterm con timeout.
-///
-/// Retorna `Some(Event)` si hay evento disponible dentro del timeout,
-/// `None` si no hay eventos (tick implícito).
-/// No bloquea indefinidamente — respeta el tick rate.
 fn poll_event(timeout: Duration) -> Result<Option<Event>> {
     if event::poll(timeout).context("error en poll de eventos")? {
         let crossterm_event = event::read().context("error leyendo evento")?;
@@ -306,9 +448,6 @@ fn poll_event(timeout: Duration) -> Result<Option<Event>> {
 // ─── Cleanup ───────────────────────────────────────────────────────────────────
 
 /// Restaura la terminal a su estado original.
-///
-/// Crítico: debe ejecutarse SIEMPRE, incluso en panic.
-/// Raw mode off + leave alternate screen + show cursor.
 fn cleanup_terminal() -> Result<()> {
     terminal::disable_raw_mode()
         .context("no se pudo desactivar raw mode")?;
