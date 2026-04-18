@@ -1,89 +1,168 @@
 # IDE-Rust
 
-> Un IDE de terminal estilo VS Code, hecho en Rust y diseñado con una obsesión clara: **performance primero**.
+> IDE TUI en Rust, inspirado en flujos tipo VS Code, con una restricción central NO negociable: **RAM/CPU first**.
 
 ![Vista conceptual del proyecto](img/image.png)
 
-## ¿Qué es este proyecto?
+## ¿Qué es?
 
-**IDE-Rust** busca llevar la experiencia de un editor/IDE moderno al mundo de la terminal.
+**IDE-Rust** busca llevar a terminal una experiencia de trabajo estilo IDE sin arrastrar el costo operativo típico de una app gráfica pesada.
 
-La idea es simple: tomar los flujos más útiles de herramientas como **VS Code** —editor central, explorer, paneles, búsqueda, terminal integrada y comandos rápidos— y llevarlos a una **TUI** (*Terminal User Interface*) hecha en Rust.
+La propuesta no es “meter VS Code entero en una TTY”. La propuesta es más disciplinada:
 
-No quiere ser “VS Code completo dentro de la terminal”.
-Quiere ser una versión **más austera, rápida y disciplinada**, pensada para trabajar en terminal sin sacrificar una experiencia de uso moderna.
+- layout familiar de IDE
+- editor central + explorer + panel inferior + overlays rápidos
+- arquitectura explícita para event loop, efectos y workers
+- budgets medibles de memoria, CPU y latencia desde el diseño
 
-## ¿Qué problema resuelve?
+En otras palabras: una **TUI seria para trabajo diario**, hecha en Rust, donde performance y predictibilidad importan tanto como la UX.
 
-Hoy muchas herramientas de terminal son potentes, pero suelen sentirse:
+## Mockup ASCII
 
-- fragmentadas
-- poco visuales
-- incómodas para flujos largos de trabajo
-- o demasiado limitadas frente a un IDE moderno
+```text
+┌ IDE-Rust ───────────────────────────────────────────────────────────────────────────┐
+│ Explorer                  │ editor.rs                                               │
+├───────────────────────────┬─────────────────────────────────────────────────────────┤
+│ ▸ src/                    │  12 fn reduce(state: &mut AppState, action: Action) {  │
+│   ▸ app/                  │  13     match action {                                  │
+│   ▸ core/                 │  14         Action::OpenPalette => { ... }             │
+│   ▸ ui/                   │  15         Action::ToggleSidebar => { ... }           │
+│ ▸ Cargo.toml              │  16     }                                               │
+│ ▸ architecture.md         │                                                         │
+│ ▸ roadmap.md              │  42 // viewport virtualizado + render incremental       │
+│                           │                                                         │
+├───────────────────────────┴─────────────────────────────────────────────────────────┤
+│ Search / Terminal / Git / Problems                                                  │
+│ > cargo test                                                                         │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ NORMAL | editor.rs [+] | Ln 42, Col 7 | main | UTF-8                                │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-Este proyecto apunta a cerrar esa brecha: ofrecer una experiencia tipo IDE dentro de la terminal, pero sin pagar el costo excesivo de RAM y CPU de una app gráfica pesada.
+Ese layout no es marketing: coincide con la dirección visible del proyecto (`src/ui/layout.rs`, `src/ui/mod.rs`) y con la arquitectura documentada.
 
-## Inspiración
+## Problema que intenta resolver
 
-La inspiración principal es clara:
+Muchas herramientas de terminal son potentes, pero el flujo completo suele quedar repartido entre varios programas o interfaces austeras al punto de romper continuidad.
 
-- **VS Code**, por sus flujos de trabajo y organización visual
-- **las TUIs modernas**, por su velocidad, foco y portabilidad
+IDE-Rust intenta cerrar esa brecha con una TUI que combine:
 
-La meta no es copiar una interfaz por marketing, sino capturar lo mejor de ese estilo:
+- navegación de proyecto
+- edición
+- búsqueda
+- terminal integrada
+- surfaces rápidas como `Ctrl+P` y command palette
 
-- layout familiar
-- navegación rápida
-- paneles útiles
-- buena jerarquía visual
-- experiencia cómoda para trabajo diario
+Todo eso sin aceptar como “normal” un consumo excesivo de RAM, CPU o renders innecesarios.
 
-## Objetivos principales
+## Stack confirmado por el repo
 
-El proyecto está diseñado alrededor de estos objetivos:
+- **Rust** (`edition = "2024"`)
+- **ratatui** para rendering TUI
+- **crossterm** para input/terminal
+- **tokio** para runtime async
+- **portable-pty** para terminal integrada
+- **regex** + **globset** para búsqueda y filtros
+- **tracing** para observabilidad
+- **anyhow** + **thiserror** para manejo de errores
 
-- **Performance first**: RAM, CPU y latencia son restricciones reales de diseño.
-- **UX moderna en terminal**: look sobrio, claro y con vibra VS Code/cyberpunk, pero sin efectos caros.
-- **Arquitectura austera**: módulos pequeños, medibles y extensibles.
-- **Features con criterio**: primero lo que aporta valor real; lo complejo queda para más adelante.
-- **Trabajo serio en terminal**: pensado para uso diario, no sólo como demo visual.
+Referencia: `Cargo.toml`.
 
-## Stack principal
+## Arquitectura resumida
 
-El proyecto está planteado sobre:
+La arquitectura objetivo está documentada en `architecture.md` y ya se refleja parcialmente en la estructura actual del proyecto.
 
-- **Rust**
-- **ratatui** para la interfaz TUI
-- **crossterm** para manejo de terminal e input
-- **tokio** para runtime async y coordinación de tareas
+### Flujo central
 
-## Principios técnicos del proyecto
+```text
+crossterm input -> Action -> reducer/store -> Effects -> workers -> Event -> invalidation -> render
+```
 
-Hay una idea que manda sobre todas las demás: **la experiencia tiene que sentirse fluida**.
+### Decisiones técnicas confirmadas
 
-Por eso la documentación del proyecto pone foco en:
+- **UI thread único** para input, reducción de estado y scheduling de render
+- **workers dedicados** para IO/subsistemas pesados
+- **message passing tipado** entre acciones, efectos y eventos
+- **estado particionado** (`ui`, `workspace`, `editor`, `search`, `git`, `terminal`, `lsp`)
+- **render por regiones/paneles**, no redraw conceptual completo
+- **virtualización por viewport** para editor, explorer, search y terminal
+- **cómputo fuera del render** para evitar allocaciones en el frame loop
+- **colas acotadas + cancelación explícita** como regla de diseño
 
-- render incremental
-- estado particionado
-- trabajo en background con límites claros
-- cancelación explícita de tareas
-- budgets concretos de memoria y latencia
+## Principios de performance
 
-En otras palabras: antes de sumar features, hay que sostener una base técnica sana.
+Este proyecto está diseñado con budgets explícitos, no con “optimización después”.
 
-## Estado actual
+Metas documentadas hoy:
 
-Actualmente el repositorio está centrado en **documentación, arquitectura y roadmap**.
+- **cold startup:** `< 150 ms`
+- **warm startup:** `< 80 ms`
+- **idle RAM sin LSP:** `< 40 MB`
+- **RAM normal de uso:** `< 70 MB`
+- **input-to-render:** objetivo `< 16 ms`, hard limit `< 33 ms`
+- **CPU idle:** `~0% a 1%`
 
-Eso significa que la visión del producto ya está bastante clara, pero la implementación todavía está en una etapa temprana.
+Principios operativos asociados:
+
+- nada costoso corre por defecto
+- search/Git/LSP deben ser cancelables
+- terminal con scrollback acotado
+- theming con palette precomputada
+- observabilidad desde el inicio, no al final
+
+Referencias: `architecture.md`, `roadmap.md`.
+
+## Componentes principales confirmados
+
+El repo ya define esta organización de módulos en `src/`:
+
+- `app/` — bootstrap, terminal setup, event loop principal
+- `core/` — tipos compartidos, acciones, efectos, comandos, config
+- `ui/` — layout, theme, panels, quick open, search panel
+- `editor/` — estado del editor y buffer
+- `workspace/` — explorer y quick open
+- `search/` — estado de búsqueda global
+- `terminal/` — terminal integrada / PTY
+- `observe/` — métricas y tracing
+- `git/` — base para source control
+- `lsp/` — base para integración LSP
+
+Importante: que el módulo exista **no significa** que el subsistema ya esté completo. El README describe estructura confirmada del repo, no promesas de feature parity.
+
+## Estado actual del proyecto
+
+Hoy el proyecto está en una etapa **temprana pero ya ejecutable a nivel de base estructural**:
+
+- hay documentación de arquitectura, roadmap y tareas
+- existe una app TUI con event loop principal y layout tipo IDE
+- ya aparecen módulos para editor, explorer, quick open, search, terminal, Git y LSP
+- el roadmap sigue marcando gran parte del producto como trabajo pendiente o en evolución
+
+Si querés ver el alcance planificado vs. implementado, arrancá por:
+
+- `architecture.md`
+- `roadmap.md`
+- `tasks.md`
+
+## Qué NO promete este README
+
+Para mantener precisión técnica, este README **no afirma** que hoy exista un IDE completo con todas estas capacidades listas para producción:
+
+- LSP completo
+- Git estilo GitLens
+- multicursor avanzado
+- indexación global agresiva
+- sistema de plugins maduro
+
+Esas piezas aparecen en documentación y módulos base, pero su madurez real depende del estado de implementación de cada subsistema.
 
 ## Documentación clave
 
-- `architecture.md` — decisiones de arquitectura, event loop, estado, render y budgets
-- `roadmap.md` — visión de producto, prioridades y fases
-- `tasks.md` — tareas y épicas planeadas
+- `architecture.md` — event loop, estado, render pipeline, budgets y tradeoffs
+- `roadmap.md` — visión de producto, MVP, post-MVP y límites de alcance
+- `tasks.md` — breakdown de épicas y orden recomendado
+- `Cargo.toml` — stack técnico real del repo
 
 ## En una frase
 
-**Un IDE estilo VS Code para la terminal, hecho en Rust, con foco extremo en performance y una UX moderna sin despilfarrar recursos.**
+**IDE-Rust es un IDE TUI en Rust con layout tipo VS Code, event loop explícito y budgets de RAM/CPU definidos desde el diseño, pensado para ofrecer UX moderna en terminal sin despilfarrar recursos.**
