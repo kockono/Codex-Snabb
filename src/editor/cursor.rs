@@ -7,16 +7,31 @@
 //! vuelve a col 40 — no a 10.
 
 use super::buffer::TextBuffer;
+use super::selection::Selection;
 
 /// Posición lógica en el buffer (línea + columna, 0-indexed).
 ///
 /// Tipo `Copy` — 16 bytes en 64-bit. Se pasa por valor sin problema.
+/// Implementa `Ord` comparando primero `line` y luego `col` para
+/// poder determinar el inicio/fin de selecciones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     /// Índice de línea (0-indexed).
     pub line: usize,
     /// Índice de columna en bytes (0-indexed).
     pub col: usize,
+}
+
+impl PartialOrd for Position {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Position {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.line.cmp(&other.line).then(self.col.cmp(&other.col))
+    }
 }
 
 impl Position {
@@ -26,55 +41,118 @@ impl Position {
     }
 }
 
-/// Cursor con posición actual y columna deseada para movimiento vertical.
+/// Cursor con posición actual, columna deseada y selección opcional.
+///
+/// Nota: el `EditorState` ahora usa `MultiCursorState` con `CursorInstance`.
+/// Este struct se mantiene como API alternativa para contextos de un solo cursor.
 #[derive(Debug)]
 pub struct Cursor {
     /// Posición actual en el buffer.
     pub position: Position,
     /// Columna deseada — se preserva al moverse verticalmente.
     pub desired_col: usize,
+    /// Selección activa (None si no hay selección).
+    pub selection: Option<Selection>,
 }
 
+#[expect(
+    dead_code,
+    reason = "API de cursor simple — EditorState migró a MultiCursorState/CursorInstance"
+)]
 impl Cursor {
     /// Crea un cursor en la posición (0, 0).
     pub fn new() -> Self {
         Self {
             position: Position::zero(),
             desired_col: 0,
+            selection: None,
         }
+    }
+
+    /// Inicia una selección con anchor en la posición actual.
+    ///
+    /// Si ya hay una selección, no hace nada — solo se inicia
+    /// cuando no existe. Esto permite que Shift+flecha funcione
+    /// de forma continua sin reiniciar el anchor.
+    pub fn start_selection(&mut self) {
+        if self.selection.is_none() {
+            self.selection = Some(Selection::new(self.position, self.position));
+        }
+    }
+
+    /// Actualiza el head de la selección a la posición actual del cursor.
+    ///
+    /// Se llama después de cada movimiento con Shift mantenido.
+    pub fn extend_selection(&mut self) {
+        if let Some(ref mut sel) = self.selection {
+            sel.head = self.position;
+        }
+    }
+
+    /// Limpia la selección activa.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Verifica si hay una selección activa (no vacía).
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| !s.is_empty())
+    }
+
+    /// Retorna el texto seleccionado del buffer, si hay selección.
+    pub fn selected_text(&self, buffer: &TextBuffer) -> Option<String> {
+        self.selection.and_then(|sel| {
+            if sel.is_empty() {
+                None
+            } else {
+                Some(sel.selected_text(buffer))
+            }
+        })
     }
 
     /// Mueve el cursor una línea hacia arriba.
     ///
     /// Si ya está en la primera línea, no se mueve.
     /// Respeta `desired_col` y clampea a la longitud de la línea destino.
-    pub fn move_up(&mut self, buffer: &TextBuffer) {
+    /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
+    pub fn move_up(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
         if self.position.line == 0 {
             return;
         }
         self.position.line -= 1;
         let line_len = buffer.line_len(self.position.line);
         self.position.col = self.desired_col.min(line_len);
+        if selecting {
+            self.extend_selection();
+        }
     }
 
     /// Mueve el cursor una línea hacia abajo.
     ///
     /// Si ya está en la última línea, no se mueve.
     /// Respeta `desired_col` y clampea a la longitud de la línea destino.
-    pub fn move_down(&mut self, buffer: &TextBuffer) {
+    /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
+    pub fn move_down(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
         if self.position.line + 1 >= buffer.line_count() {
             return;
         }
         self.position.line += 1;
         let line_len = buffer.line_len(self.position.line);
         self.position.col = self.desired_col.min(line_len);
+        if selecting {
+            self.extend_selection();
+        }
     }
 
     /// Mueve el cursor un carácter a la izquierda.
     ///
     /// Si está al inicio de una línea, sube al final de la anterior.
     /// Actualiza `desired_col`.
-    pub fn move_left(&mut self, buffer: &TextBuffer) {
+    /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
+    pub fn move_left(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
         if self.position.col > 0 {
             self.position.col -= 1;
         } else if self.position.line > 0 {
@@ -82,13 +160,18 @@ impl Cursor {
             self.position.col = buffer.line_len(self.position.line);
         }
         self.desired_col = self.position.col;
+        if selecting {
+            self.extend_selection();
+        }
     }
 
     /// Mueve el cursor un carácter a la derecha.
     ///
     /// Si está al final de una línea, baja al inicio de la siguiente.
     /// Actualiza `desired_col`.
-    pub fn move_right(&mut self, buffer: &TextBuffer) {
+    /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
+    pub fn move_right(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
         let line_len = buffer.line_len(self.position.line);
         if self.position.col < line_len {
             self.position.col += 1;
@@ -97,6 +180,21 @@ impl Cursor {
             self.position.col = 0;
         }
         self.desired_col = self.position.col;
+        if selecting {
+            self.extend_selection();
+        }
+    }
+
+    /// Maneja el modo de selección antes de un movimiento.
+    ///
+    /// Si `selecting`, inicia selección si no existe.
+    /// Si `!selecting`, limpia cualquier selección existente.
+    fn handle_selection_mode(&mut self, selecting: bool) {
+        if selecting {
+            self.start_selection();
+        } else {
+            self.clear_selection();
+        }
     }
 
     /// Mueve el cursor al inicio de la línea actual.
