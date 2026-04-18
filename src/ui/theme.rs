@@ -51,7 +51,11 @@ pub struct Theme {
     /// Selección de texto (fondo de selección).
     #[expect(dead_code, reason = "se usará en épica 2 — editor base")]
     pub selection: Color,
-    /// Color del cursor.
+    /// Color del cursor (reservado para modos visuales futuros, ej: VISUAL mode highlight).
+    #[expect(
+        dead_code,
+        reason = "reservado para cursor visual en modos como VISUAL/INSERT"
+    )]
     pub cursor: Color,
     /// Números de línea normales.
     pub line_number: Color,

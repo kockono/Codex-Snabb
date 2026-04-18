@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
         KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -1256,11 +1257,16 @@ pub async fn run(file: Option<PathBuf>) -> Result<()> {
     let shutdown = CancellationToken::new();
     let theme = Theme::default();
 
-    // Setup terminal: raw mode + alternate screen + captura de mouse
+    // Setup terminal: raw mode + alternate screen + captura de mouse + cursor bar
     terminal::enable_raw_mode()
         .context("no se pudo activar raw mode")?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)
-        .context("no se pudo entrar a alternate screen con mouse capture")?;
+    crossterm::execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        SetCursorStyle::SteadyBar, // cursor estilo VS Code (línea vertical)
+    )
+    .context("no se pudo entrar a alternate screen con mouse capture")?;
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)
@@ -1440,7 +1446,12 @@ fn poll_event(timeout: Duration) -> Result<Option<Event>> {
 fn cleanup_terminal() -> Result<()> {
     terminal::disable_raw_mode()
         .context("no se pudo desactivar raw mode")?;
-    crossterm::execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)
-        .context("no se pudo desactivar mouse capture y salir de alternate screen")?;
+    crossterm::execute!(
+        std::io::stdout(),
+        SetCursorStyle::DefaultUserShape, // restaurar cursor del usuario
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    )
+    .context("no se pudo restaurar terminal")?;
     Ok(())
 }

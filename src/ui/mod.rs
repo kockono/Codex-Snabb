@@ -71,6 +71,36 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     let editor_focused = focused == PanelId::Editor;
     panels::render_editor_area(f, layout.editor_area, theme, editor_focused, &state.editor);
 
+    // ── Hardware cursor: posicionar la línea vertical del terminal ──
+    // Solo cuando el editor tiene foco y no hay overlays activos.
+    // La posición se computa una vez acá — sin allocaciones.
+    if editor_focused && !state.palette.visible && !state.quick_open.visible {
+        // Inner area del editor (descontar bordes del Block)
+        let inner_x = layout.editor_area.x + 1;
+        let inner_y = layout.editor_area.y + 1;
+        let inner_h = layout.editor_area.height.saturating_sub(2) as usize;
+
+        let scroll = state.editor.viewport.scroll_offset;
+        let cursor_line = state.editor.cursor.position.line;
+        let cursor_col = state.editor.cursor.position.col;
+
+        // Verificar que el cursor está dentro del viewport visible
+        if cursor_line >= scroll && cursor_line < scroll + inner_h {
+            let visual_row = (cursor_line - scroll) as u16;
+
+            // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
+            let total_lines = state.editor.buffer.line_count();
+            let gutter_width = panels::digit_count(total_lines).max(4);
+            let separator_width: u16 = 2;
+            let text_offset = gutter_width as u16 + separator_width;
+
+            let abs_col = inner_x + text_offset + cursor_col as u16;
+            let abs_row = inner_y + visual_row;
+
+            f.set_cursor_position((abs_col, abs_row));
+        }
+    }
+
     // ── Bottom panel ──
     if layout.bottom_panel_visible {
         let bottom_focused = focused == PanelId::Terminal;

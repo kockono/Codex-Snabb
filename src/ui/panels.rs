@@ -241,7 +241,9 @@ fn render_explorer_entry<'a>(
 /// - Separador `│`
 /// - Texto del buffer con viewport virtual (solo líneas visibles)
 /// - Highlight de la línea actual (background sutil)
-/// - Cursor con `Modifier::REVERSED`
+///
+/// El cursor visual es el hardware cursor de la terminal (SteadyBar),
+/// posicionado por `f.set_cursor_position()` en `ui::render()`.
 ///
 /// No aloca strings en el render — usa slices `&str` del buffer directamente.
 pub fn render_editor_area(
@@ -304,7 +306,6 @@ pub fn render_editor_area(
     // Usar viewport scroll_offset, pero clampear al tamaño real del inner area
     let scroll = editor.viewport.scroll_offset;
     let cursor_line = editor.cursor.position.line;
-    let cursor_col = editor.cursor.position.col;
 
     // Estilos pre-computados — sin allocaciones
     let gutter_style = Style::default().fg(theme.line_number).bg(theme.bg_primary);
@@ -319,10 +320,6 @@ pub fn render_editor_area(
     // Línea activa: background ligeramente más claro que bg_primary
     let active_line_bg = Color::Rgb(16, 20, 28);
     let text_active_style = Style::default().fg(theme.fg_primary).bg(active_line_bg);
-    let cursor_style = Style::default()
-        .fg(theme.bg_primary)
-        .bg(theme.cursor)
-        .add_modifier(Modifier::BOLD);
     let tilde_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
 
     // Buffer pre-alocado para el padding del gutter
@@ -385,34 +382,12 @@ pub fn render_editor_area(
             spans.push(Span::styled(num_buf.clone(), gutter_num_style));
             spans.push(Span::styled("\u{2502} ", separator_style));
 
-            // ── Texto con cursor ──
-            if is_cursor_line && focused {
-                // Dividir la línea en: pre-cursor, cursor char, post-cursor
-                if cursor_col < display_text.len() {
-                    let pre = &display_text[..cursor_col];
-                    let cursor_ch = &display_text[cursor_col..cursor_col + 1];
-                    let post = &display_text[cursor_col + 1..];
-                    spans.push(Span::styled(pre.to_string(), line_bg_style));
-                    spans.push(Span::styled(cursor_ch.to_string(), cursor_style));
-                    if !post.is_empty() {
-                        spans.push(Span::styled(post.to_string(), line_bg_style));
-                    }
-                } else {
-                    // Cursor está al final o más allá del texto visible
-                    if !display_text.is_empty() {
-                        spans.push(Span::styled(display_text.to_string(), line_bg_style));
-                    }
-                    // Mostrar cursor como bloque en la posición después del texto
-                    spans.push(Span::styled(" ", cursor_style));
-                }
-            } else {
-                // Línea sin cursor — render directo
-                // CLONE: necesario — display_text es un slice del buffer,
-                // Span::styled necesita ownership porque la línea de ratatui
-                // toma ownership de los spans
-                if !display_text.is_empty() {
-                    spans.push(Span::styled(display_text.to_string(), line_bg_style));
-                }
+            // ── Texto sin cursor visual — el hardware cursor (SteadyBar) lo maneja ──
+            // CLONE: necesario — display_text es un slice del buffer,
+            // Span::styled necesita ownership porque la línea de ratatui
+            // toma ownership de los spans.
+            if !display_text.is_empty() {
+                spans.push(Span::styled(display_text.to_string(), line_bg_style));
             }
 
             lines.push(Line::from(spans));
@@ -435,7 +410,7 @@ pub fn render_editor_area(
 /// Cuenta la cantidad de dígitos decimales de un número.
 ///
 /// Pre-computado fuera del render loop. Evita `format!()` para contar dígitos.
-fn digit_count(n: usize) -> usize {
+pub(crate) fn digit_count(n: usize) -> usize {
     if n == 0 {
         return 1;
     }
