@@ -12,7 +12,7 @@ Construir un IDE TUI en Rust para trabajo diario serio, con identidad clara:
 La idea NO es copiar VSCode entero en terminal. La idea es tomar sus flujos más valiosos y llevarlos a una implementación TUI disciplinada.
 
 ---
-
+ss
 ## 2. Principios rectores
 
 ### 2.1 RAM/CPU first
