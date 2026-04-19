@@ -169,8 +169,8 @@ pub fn render_activity_bar(
     // Settings siempre al fondo
     if area.height > 0 {
         let settings_style = style_for(settings_active);
-        // Icono de settings: ⚙ (U+2699, 1-cell wide en la mayoría de terminales)
-        lines.push(Line::from(Span::styled(" ⚙ ", settings_style)));
+        // Icono de settings: ⚙ (U+2699, 2-cell wide en algunas terminales)
+        lines.push(Line::from(Span::styled("⚙ ", settings_style)));
     }
 
     let paragraph = Paragraph::new(lines).style(bg_style);
