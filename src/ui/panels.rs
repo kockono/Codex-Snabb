@@ -342,7 +342,6 @@ pub fn render_editor_area(
     let secondary_cursor_style = Style::default()
         .fg(theme.fg_accent)
         .add_modifier(Modifier::REVERSED);
-    let tilde_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
     // Estilos de diagnóstico (subrayado con color de severidad)
     let diag_error_style = Style::default()
         .fg(theme.fg_error)
@@ -436,12 +435,11 @@ pub fn render_editor_area(
 
             lines.push(Line::from(spans));
         } else {
-            // ── Líneas vacías después del buffer: `~` estilo Vim ──
+            // ── Líneas vacías después del buffer ──
             let pad_str = &SPACES[..gutter_width.min(SPACES.len())];
             let spans = vec![
                 Span::styled(pad_str, gutter_style),
                 Span::styled("\u{2502} ", separator_style),
-                Span::styled("~", tilde_style),
             ];
             lines.push(Line::from(spans));
         }
