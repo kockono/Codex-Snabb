@@ -1403,10 +1403,15 @@ enum ScrollDirection {
     Down,
 }
 
-/// Ancho del gutter (números de línea) en el editor.
-/// Valor fijo por ahora — en el futuro se computará dinámicamente
-/// según la cantidad de dígitos del número de línea más alto.
-const EDITOR_GUTTER_WIDTH: u16 = 4;
+/// Calcula el ancho real del gutter (números de línea + separador `│ `).
+///
+/// Debe coincidir EXACTAMENTE con la lógica de render en `panels.rs`:
+/// `digit_count(line_count).max(4)` + 2 (separador).
+fn editor_gutter_width(line_count: usize) -> u16 {
+    let digits = crate::ui::panels::digit_count(line_count).max(4);
+    let separator = 2; // "│ "
+    (digits + separator) as u16
+}
 
 /// Cantidad de líneas que el scroll del mouse desplaza por evento.
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -1545,8 +1550,8 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
     let visual_row = (row - inner_y) as usize;
     let target_line = state.editor.viewport.scroll_offset + visual_row;
 
-    // Columna en el buffer = col relativo al inner area - gutter
-    let gutter = EDITOR_GUTTER_WIDTH;
+    // Columna en el buffer = col relativo al inner area - gutter dinámico
+    let gutter = editor_gutter_width(state.editor.buffer.line_count());
     let text_x = inner_x + gutter;
     let target_col = if col >= text_x {
         (col - text_x) as usize
@@ -1615,8 +1620,8 @@ fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, 
     let visual_row = (clamped_row - inner_y) as usize;
     let target_line = state.editor.viewport.scroll_offset + visual_row;
 
-    // Columna en el buffer = col relativo al inner area - gutter
-    let gutter = EDITOR_GUTTER_WIDTH;
+    // Columna en el buffer = col relativo al inner area - gutter dinámico
+    let gutter = editor_gutter_width(state.editor.buffer.line_count());
     let text_x = inner_x + gutter;
     let target_col = if col >= text_x {
         (col - text_x) as usize
