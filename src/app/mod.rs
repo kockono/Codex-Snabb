@@ -28,6 +28,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::command::CommandRegistry;
+use crate::core::settings::{KeybindingsState, SidebarSection};
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::git::branch_picker::BranchPicker;
@@ -83,6 +84,8 @@ pub struct AppState {
     pub branch_picker: BranchPicker,
     /// Estado del subsistema LSP (language server protocol).
     pub lsp: LspState,
+    /// Estado del overlay de settings / keybindings editor.
+    pub keybindings: KeybindingsState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -140,6 +143,7 @@ impl AppState {
             git,
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
+            keybindings: KeybindingsState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
@@ -203,6 +207,7 @@ impl AppState {
             git,
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
+            keybindings: KeybindingsState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
@@ -273,6 +278,9 @@ fn keymap(
     search_visible: bool,
     git_state: &GitState,
     lsp_completion_visible: bool,
+    settings_visible: bool,
+    settings_editing: bool,
+    commands: &CommandRegistry,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -302,6 +310,30 @@ fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Settings overlay visible: prioridad máxima ──
+    if settings_visible {
+        if settings_editing {
+            // Modo edición: capturar la tecla como nuevo keybind
+            return match key.code {
+                KeyCode::Esc => Action::SettingsCancelEdit,
+                _ => Action::SettingsCaptureKey(*key),
+            };
+        }
+        // Modo normal del settings overlay
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::SettingsClose,
+            (KeyCode::Up, KeyModifiers::NONE) => Action::SettingsUp,
+            (KeyCode::Down, KeyModifiers::NONE) => Action::SettingsDown,
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::SettingsStartEdit,
+            (KeyCode::Delete, _) => Action::SettingsRemoveKeybind,
+            (KeyCode::Backspace, _) => Action::SettingsSearchDelete,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::SettingsSearchInsert(ch)
+            }
+            _ => Action::Noop,
+        };
     }
 
     // ── LSP Completion visible: captura navegación, Enter, Esc ──
@@ -463,6 +495,12 @@ fn keymap(
             (KeyCode::Char('r'), KeyModifiers::NONE) => Action::GitRefresh,
             _ => Action::Noop,
         };
+    }
+
+    // ── Custom keybinds del registry (prioridad sobre hardcodeados) ──
+    // Solo verificar si hay overrides para evitar overhead innecesario
+    if let Some(custom_action) = commands.match_key_event(key) {
+        return custom_action;
     }
 
     // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
@@ -1369,6 +1407,93 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de Settings ──
+        Action::SettingsOpen => {
+            // Cerrar otros overlays al abrir settings
+            state.palette.close();
+            state.quick_open.close();
+            state.branch_picker.close();
+            state.keybindings.open(&state.commands);
+            tracing::debug!("settings overlay abierto");
+            vec![]
+        }
+        Action::SettingsClose => {
+            // Aplicar cambios al registry antes de cerrar
+            state.keybindings.apply_to_registry(&mut state.commands);
+            state.keybindings.close();
+            tracing::debug!("settings overlay cerrado");
+            vec![]
+        }
+        Action::SettingsUp => {
+            state.keybindings.move_up();
+            vec![]
+        }
+        Action::SettingsDown => {
+            state.keybindings.move_down();
+            vec![]
+        }
+        Action::SettingsSearchInsert(ch) => {
+            state.keybindings.insert_search_char(*ch);
+            vec![]
+        }
+        Action::SettingsSearchDelete => {
+            state.keybindings.delete_search_char();
+            vec![]
+        }
+        Action::SettingsStartEdit => {
+            state.keybindings.start_editing();
+            tracing::debug!("settings: modo edición de keybind");
+            vec![]
+        }
+        Action::SettingsCancelEdit => {
+            state.keybindings.cancel_editing();
+            tracing::debug!("settings: edición cancelada");
+            vec![]
+        }
+        Action::SettingsCaptureKey(key_event) => {
+            // Formatear el KeyEvent capturado como display string
+            let keybind_str = crate::core::settings::format_keybind(key_event);
+            if !keybind_str.is_empty() {
+                state.keybindings.set_keybind(&keybind_str);
+                tracing::info!(keybind = %keybind_str, "settings: keybind capturado");
+            } else {
+                state.keybindings.cancel_editing();
+            }
+            vec![]
+        }
+        Action::SettingsRemoveKeybind => {
+            state.keybindings.remove_keybind();
+            tracing::debug!("settings: keybind removido");
+            vec![]
+        }
+
+        // ── Activity Bar ──
+        Action::ActivityBarSelect(section) => {
+            match section {
+                SidebarSection::Explorer => {
+                    state.sidebar_visible = true;
+                    state.search.close();
+                    state.git.visible = false;
+                    state.focused_panel = PanelId::Explorer;
+                }
+                SidebarSection::Git => {
+                    state.sidebar_visible = true;
+                    state.search.close();
+                    state.git.visible = true;
+                    state.git.refresh(&get_workspace_root(state));
+                    state.focused_panel = PanelId::Git;
+                }
+                SidebarSection::Search => {
+                    state.sidebar_visible = true;
+                    state.git.visible = false;
+                    state.search.open();
+                    state.focused_panel = PanelId::Search;
+                }
+            }
+            tracing::debug!(?section, "activity bar: sección seleccionada");
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
@@ -1502,23 +1627,36 @@ const MOUSE_SCROLL_LINES: usize = 3;
 ///
 /// Usa el layout almacenado en `AppState.last_layout`. Si no hay layout
 /// (primer frame), retorna `None`. La función es pura — no muta estado.
-fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<PanelId> {
+/// Resultado de hit-test que distingue activity bar de paneles normales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitTestResult {
+    /// Click en un panel normal del IDE.
+    Panel(PanelId),
+    /// Click en la activity bar — incluye la fila relativa dentro de la barra.
+    ActivityBar { row_in_bar: u16 },
+}
+
+fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<HitTestResult> {
     let point_in_rect = |r: Rect, c: u16, rw: u16| -> bool {
         c >= r.x && c < r.x + r.width && rw >= r.y && rw < r.y + r.height
     };
 
-    // Verificar paneles en orden de prioridad visual (overlays primero si los hubiera)
-    // La sidebar puede mostrar Explorer o Search según el estado activo
+    // Activity bar siempre visible — verificar primero
+    if point_in_rect(layout.activity_bar, col, row) {
+        return Some(HitTestResult::ActivityBar {
+            row_in_bar: row - layout.activity_bar.y,
+        });
+    }
+
+    // Verificar paneles en orden de prioridad visual
     if layout.sidebar_visible && point_in_rect(layout.sidebar, col, row) {
-        // El panel activo de la sidebar se resuelve en reduce_mouse_click
-        // Retornamos Explorer como default — el reducer ajusta a Search si corresponde
-        return Some(PanelId::Explorer);
+        return Some(HitTestResult::Panel(PanelId::Explorer));
     }
     if point_in_rect(layout.editor_area, col, row) {
-        return Some(PanelId::Editor);
+        return Some(HitTestResult::Panel(PanelId::Editor));
     }
     if layout.bottom_panel_visible && point_in_rect(layout.bottom_panel, col, row) {
-        return Some(PanelId::Terminal);
+        return Some(HitTestResult::Panel(PanelId::Terminal));
     }
     // Title bar y status bar no son paneles enfocables
     None
@@ -1565,35 +1703,63 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
         }
     }
 
-    let Some(panel) = hit_test_panel(&layout, col, row) else {
+    let Some(hit) = hit_test_panel(&layout, col, row) else {
         return; // Click en zona no interactiva (title bar)
     };
 
-    // Si la sidebar muestra search o git, redirigir foco al panel activo
-    let panel = if panel == PanelId::Explorer && state.search.visible {
-        PanelId::Search
-    } else if panel == PanelId::Explorer && state.git.visible {
-        PanelId::Git
-    } else {
-        panel
-    };
+    match hit {
+        HitTestResult::ActivityBar { row_in_bar } => {
+            // Resolver qué icono fue clickeado
+            // Iconos: 0=Explorer, 1=Git, 2=Search, último=Settings
+            let bar_height = layout.activity_bar.height;
+            let settings_row = bar_height.saturating_sub(1);
 
-    // Cambiar foco al panel clickeado
-    state.focused_panel = panel;
-    tracing::debug!(?panel, col, row, "mouse click → foco");
+            if row_in_bar == settings_row {
+                // Click en Settings (último icono)
+                let effects = reduce(state, &Action::SettingsOpen);
+                process_effects(&effects, &CancellationToken::new());
+            } else {
+                // Click en iconos de sección (0, 1, 2)
+                let section = match row_in_bar {
+                    0 => Some(SidebarSection::Explorer),
+                    1 => Some(SidebarSection::Git),
+                    2 => Some(SidebarSection::Search),
+                    _ => None,
+                };
+                if let Some(section) = section {
+                    let effects = reduce(state, &Action::ActivityBarSelect(section));
+                    process_effects(&effects, &CancellationToken::new());
+                }
+            }
+        }
+        HitTestResult::Panel(panel) => {
+            // Si la sidebar muestra search o git, redirigir foco al panel activo
+            let panel = if panel == PanelId::Explorer && state.search.visible {
+                PanelId::Search
+            } else if panel == PanelId::Explorer && state.git.visible {
+                PanelId::Git
+            } else {
+                panel
+            };
 
-    match panel {
-        PanelId::Search => {
-            // Click en search panel — no hay acción de click específica por ahora
+            // Cambiar foco al panel clickeado
+            state.focused_panel = panel;
+            tracing::debug!(?panel, col, row, "mouse click → foco");
+
+            match panel {
+                PanelId::Search => {
+                    // Click en search panel — no hay acción de click específica por ahora
+                }
+                PanelId::Explorer => {
+                    reduce_mouse_click_explorer(state, &layout, row);
+                }
+                PanelId::Editor => {
+                    reduce_mouse_click_editor(state, &layout, col, row);
+                }
+                // Terminal y otros: solo cambio de foco por ahora
+                _ => {}
+            }
         }
-        PanelId::Explorer => {
-            reduce_mouse_click_explorer(state, &layout, row);
-        }
-        PanelId::Editor => {
-            reduce_mouse_click_editor(state, &layout, col, row);
-        }
-        // Terminal y otros: solo cambio de foco por ahora
-        _ => {}
     }
 }
 
@@ -1712,12 +1878,12 @@ fn reduce_mouse_drag(state: &mut AppState, col: u16, row: u16) {
         return; // Sin layout — primer frame
     };
 
-    let Some(panel) = hit_test_panel(&layout, col, row) else {
+    let Some(hit) = hit_test_panel(&layout, col, row) else {
         return;
     };
 
     // Drag-to-select solo en el editor
-    if panel == PanelId::Editor {
+    if let HitTestResult::Panel(PanelId::Editor) = hit {
         reduce_mouse_drag_editor(state, &layout, col, row);
     }
 }
@@ -1779,8 +1945,13 @@ fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: Scro
         return;
     };
 
-    let Some(panel) = hit_test_panel(&layout, col, row) else {
+    let Some(hit) = hit_test_panel(&layout, col, row) else {
         return;
+    };
+
+    let panel = match hit {
+        HitTestResult::Panel(p) => p,
+        HitTestResult::ActivityBar { .. } => return, // No scroll en activity bar
     };
 
     match panel {
@@ -1942,6 +2113,9 @@ async fn event_loop(
                     state.search.visible,
                     &state.git,
                     state.lsp.completion_visible,
+                    state.keybindings.visible,
+                    state.keybindings.editing_index.is_some(),
+                    &state.commands,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -1974,6 +2148,13 @@ async fn event_loop(
 
             if let Some(ref mut explorer) = state.explorer {
                 explorer.ensure_visible(sidebar_height);
+            }
+
+            // Ajustar scroll del settings overlay
+            if state.keybindings.visible {
+                // Estimado: alto del overlay menos header/footer (~6 líneas de chrome)
+                let settings_vis = (term_height as usize).saturating_sub(10);
+                state.keybindings.ensure_visible(settings_vis);
             }
 
             // Ajustar scroll del git panel

@@ -9,8 +9,11 @@
 pub mod budgets;
 pub mod command;
 pub mod ids;
+pub mod settings;
 
 use std::path::PathBuf;
+
+use crossterm::event::KeyEvent;
 
 // ─── Action ────────────────────────────────────────────────────────────────────
 
@@ -291,6 +294,32 @@ pub enum Action {
     BranchPickerDeleteChar,
     /// Confirmar y hacer checkout de la rama seleccionada.
     BranchPickerConfirm,
+
+    // ── Settings ──
+    /// Abrir el overlay de settings (keybindings editor).
+    SettingsOpen,
+    /// Cerrar el overlay de settings.
+    SettingsClose,
+    /// Mover selección arriba en la tabla de keybindings.
+    SettingsUp,
+    /// Mover selección abajo en la tabla de keybindings.
+    SettingsDown,
+    /// Insertar carácter en el campo de búsqueda del settings.
+    SettingsSearchInsert(char),
+    /// Borrar carácter del campo de búsqueda del settings.
+    SettingsSearchDelete,
+    /// Empezar a editar el keybind del entry seleccionado.
+    SettingsStartEdit,
+    /// Cancelar la edición del keybind.
+    SettingsCancelEdit,
+    /// Capturar un KeyEvent como nuevo keybind en modo edición.
+    SettingsCaptureKey(KeyEvent),
+    /// Quitar el keybind del entry seleccionado.
+    SettingsRemoveKeybind,
+
+    // ── Activity Bar ──
+    /// Click en un icono de la activity bar para cambiar sección de sidebar.
+    ActivityBarSelect(crate::core::settings::SidebarSection),
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────

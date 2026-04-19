@@ -7,6 +7,8 @@
 //! El catálogo vive en memoria y nunca ejecuta IO al filtrar.
 //! La palette solo consulta este catálogo pre-registrado.
 
+use std::collections::HashMap;
+
 use crate::core::Action;
 
 // ─── CommandEntry ──────────────────────────────────────────────────────────────
@@ -36,9 +38,14 @@ pub struct CommandEntry {
 /// Almacena comandos en un Vec — la cantidad es fija y pequeña (~20-30),
 /// no justifica un HashMap. La búsqueda lineal es más eficiente para
 /// este tamaño que el overhead de hashing.
+///
+/// Los keybinding overrides permiten al usuario modificar atajos en runtime.
+/// El HashMap solo se aloca cuando hay overrides — costo cero si no se usa.
 #[derive(Debug)]
 pub struct CommandRegistry {
     commands: Vec<CommandEntry>,
+    /// Overrides de keybindings: command_id → nuevo keybinding (None = removido).
+    keybind_overrides: HashMap<&'static str, Option<String>>,
 }
 
 impl CommandRegistry {
@@ -46,6 +53,7 @@ impl CommandRegistry {
     pub fn new() -> Self {
         Self {
             commands: Vec::new(),
+            keybind_overrides: HashMap::new(),
         }
     }
 
@@ -61,7 +69,7 @@ impl CommandRegistry {
     pub fn register_defaults(&mut self) {
         self.commands.clear();
         // Pre-alocar capacidad conocida — sabemos exactamente cuántos hay
-        self.commands.reserve(23);
+        self.commands.reserve(24);
 
         // ── File ──
         self.register(CommandEntry {
@@ -212,6 +220,15 @@ impl CommandRegistry {
             action: Action::ExplorerRefresh,
         });
 
+        // ── Settings ──
+        self.register(CommandEntry {
+            id: "settings.keybindings",
+            label: "Open Keybindings",
+            category: "Settings",
+            keybinding: None,
+            action: Action::SettingsOpen,
+        });
+
         // ── App ──
         self.register(CommandEntry {
             id: "app.quit",
@@ -284,5 +301,73 @@ impl CommandRegistry {
     /// Cantidad de comandos registrados.
     pub fn len(&self) -> usize {
         self.commands.len()
+    }
+
+    /// Retorna el keybinding custom (override) para un comando, si existe.
+    ///
+    /// Si el override es `Some(None)`, significa que el keybind fue removido.
+    /// Si no hay override, retorna `None` (usar el default).
+    pub fn custom_keybind(&self, command_id: &str) -> Option<&str> {
+        self.keybind_overrides
+            .get(command_id)
+            .and_then(|opt| opt.as_deref())
+    }
+
+    /// Retorna el keybinding efectivo para un comando: override > default.
+    ///
+    /// Si hay un override, lo usa. Si el override es `None` (removido),
+    /// retorna cadena vacía. Si no hay override, retorna el default.
+    pub fn effective_keybind(&self, command_id: &str) -> &str {
+        if let Some(override_opt) = self.keybind_overrides.get(command_id) {
+            // Hay override: Some(keybind) = custom, None = removido
+            match override_opt {
+                Some(kb) => kb.as_str(),
+                None => "",
+            }
+        } else {
+            // Sin override: usar default del CommandEntry
+            self.commands
+                .iter()
+                .find(|cmd| cmd.id == command_id)
+                .and_then(|cmd| cmd.keybinding)
+                .unwrap_or("")
+        }
+    }
+
+    /// Actualiza o remueve un keybinding para un comando.
+    ///
+    /// `keybinding: Some("Ctrl+S")` → setea nuevo atajo.
+    /// `keybinding: None` → remueve el atajo.
+    pub fn update_keybinding(&mut self, command_id: &str, keybinding: Option<&str>) {
+        // Buscar el command_id estático para usar como key
+        let static_id = self
+            .commands
+            .iter()
+            .find(|cmd| cmd.id == command_id)
+            .map(|cmd| cmd.id);
+
+        if let Some(id) = static_id {
+            self.keybind_overrides
+                .insert(id, keybinding.map(String::from));
+        }
+    }
+
+    /// Verifica si un `KeyEvent` matchea algún keybinding custom.
+    ///
+    /// Recorre todos los comandos con overrides y defaults, buscando
+    /// un match. Retorna la Action del comando que matchea.
+    ///
+    /// Se usa para priorizar keybindings custom sobre el keymap hardcodeado.
+    pub fn match_key_event(&self, key: &crossterm::event::KeyEvent) -> Option<Action> {
+        use crate::core::settings::key_matches_keybind;
+
+        for cmd in &self.commands {
+            let effective = self.effective_keybind(cmd.id);
+            if !effective.is_empty() && key_matches_keybind(key, effective) {
+                // CLONE: necesario — Action se retorna al caller, cmd vive en el registry
+                return Some(cmd.action.clone());
+            }
+        }
+        None
     }
 }
