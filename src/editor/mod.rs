@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod multicursor;
 pub mod search;
 pub mod selection;
+pub mod tabs;
 pub mod undo;
 pub mod viewport;
 
