@@ -455,11 +455,10 @@ fn keymap(
         {
             return Action::OpenGlobalSearch;
         }
-        // Ctrl+Shift+P abre la command palette.
-        // crossterm reporta Ctrl+Shift+P como 'P' mayúscula con CONTROL|SHIFT flags.
-        // Necesitamos un guard porque `|` en match es OR, no bitwise OR.
+        // Alt+Shift+P abre la command palette.
+        // crossterm reporta Alt+Shift+P como 'P' mayúscula con ALT|SHIFT flags.
         (KeyCode::Char('P'), mods)
-            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            if mods.contains(KeyModifiers::ALT) && mods.contains(KeyModifiers::SHIFT) =>
         {
             return Action::OpenCommandPalette;
         }

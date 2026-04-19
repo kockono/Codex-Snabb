@@ -91,7 +91,7 @@ pub enum Action {
     CloseBuffer,
 
     // ── Comandos ──
-    /// Abrir el command palette (Ctrl+Shift+P).
+    /// Abrir el command palette (Alt+Shift+P).
     OpenCommandPalette,
     /// Abrir quick open (Ctrl+P).
     OpenQuickOpen,

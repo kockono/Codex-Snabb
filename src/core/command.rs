@@ -137,7 +137,7 @@ impl CommandRegistry {
             id: "navigate.open_command_palette",
             label: "Command Palette",
             category: "Navigate",
-            keybinding: Some("Ctrl+Shift+P"),
+            keybinding: Some("Alt+Shift+P"),
             action: Action::OpenCommandPalette,
         });
         self.register(CommandEntry {
