@@ -1,9 +1,11 @@
-//! Git: status, diff, stage/unstage, commit básico.
+//! Git: status, diff, stage/unstage, commit básico, branch picker.
 //!
 //! Integración austera con Git: snapshot de estado, panel de cambios,
-//! diff por archivo, stage/unstage por archivo, y commit básico.
+//! diff por archivo, stage/unstage por archivo, commit básico y
+//! selección de rama via branch picker.
 //! Usa el binario `git` directamente — sin libgit2.
 
+pub mod branch_picker;
 pub mod commands;
 
 use std::path::Path;

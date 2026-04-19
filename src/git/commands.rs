@@ -173,6 +173,82 @@ pub fn commit(repo_path: &Path, message: &str) -> Result<String> {
     run_git(repo_path, &["commit", "-m", message])
 }
 
+// ─── Branch Types ──────────────────────────────────────────────────────────────
+
+/// Información de una rama del repositorio.
+///
+/// Puede ser local o remota. `is_current` indica si es la rama activa.
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    /// Nombre de la rama (ej: "main", "remotes/origin/develop").
+    pub name: String,
+    /// Si esta rama es la actualmente checked out.
+    pub is_current: bool,
+    /// Si es una rama remota (empieza con "remotes/").
+    pub is_remote: bool,
+}
+
+// ─── Branch Commands ───────────────────────────────────────────────────────────
+
+/// Lista todas las ramas del repo (locales y remotas).
+///
+/// Ejecuta `git branch -a --no-color` y parsea la salida.
+/// Cada línea: `  branch-name` o `* current-branch` o `  remotes/origin/branch`.
+/// Filtra entradas de HEAD simbólico (`remotes/origin/HEAD -> ...`).
+pub fn list_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
+    let output = run_git(repo_path, &["branch", "-a", "--no-color"])?;
+    let mut branches = Vec::with_capacity(output.lines().count());
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Filtrar HEAD simbólico (ej: "remotes/origin/HEAD -> origin/main")
+        if trimmed.contains(" -> ") {
+            continue;
+        }
+
+        let is_current = trimmed.starts_with("* ");
+        let name_raw = if is_current {
+            &trimmed[2..]
+        } else {
+            trimmed
+        };
+
+        let is_remote = name_raw.starts_with("remotes/");
+
+        branches.push(BranchInfo {
+            name: name_raw.to_string(),
+            is_current,
+            is_remote,
+        });
+    }
+
+    Ok(branches)
+}
+
+/// Hace checkout a una rama específica.
+///
+/// Ejecuta `git checkout <branch_name>`. Para ramas remotas,
+/// se extrae el nombre local (ej: "remotes/origin/feat" → "feat").
+/// Retorna el output del comando.
+pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<String> {
+    // Si es rama remota, extraer nombre local para checkout
+    let checkout_name = if let Some(stripped) = branch_name.strip_prefix("remotes/") {
+        // "remotes/origin/feat" → "feat" (quitar "origin/")
+        stripped
+            .find('/')
+            .map(|pos| &stripped[pos + 1..])
+            .unwrap_or(stripped)
+    } else {
+        branch_name
+    };
+
+    run_git(repo_path, &["checkout", checkout_name])
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Parsea un carácter de status de `git status --porcelain=v1`.
