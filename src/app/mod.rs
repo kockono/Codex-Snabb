@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::command::CommandRegistry;
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
+use crate::git::branch_picker::BranchPicker;
 use crate::git::GitState;
 use crate::lsp::LspState;
 use crate::observe::{FrameTimer, Metrics};
@@ -78,6 +79,8 @@ pub struct AppState {
     pub terminal: TerminalState,
     /// Estado del panel de Git / source control.
     pub git: GitState,
+    /// Estado del branch picker (overlay de selección de rama).
+    pub branch_picker: BranchPicker,
     /// Estado del subsistema LSP (language server protocol).
     pub lsp: LspState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
@@ -135,6 +138,7 @@ impl AppState {
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
+            branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
@@ -197,6 +201,7 @@ impl AppState {
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
+            branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file,
@@ -255,11 +260,16 @@ impl AppState {
 /// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando overlays cerrados)
 /// - **Editor**: flechas mueven cursor, chars insertan texto
 /// - **Explorer**: flechas navegan el árbol, Enter abre/expande
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keymap requiere estado de cada overlay — refactorizar a struct agregaría indirección sin beneficio"
+)]
 fn keymap(
     event: &crossterm::event::Event,
     focused_panel: PanelId,
     palette_visible: bool,
     quick_open_visible: bool,
+    branch_picker_visible: bool,
     search_visible: bool,
     git_state: &GitState,
     lsp_completion_visible: bool,
@@ -308,6 +318,25 @@ fn keymap(
                 // No capturar — caer al flujo normal para que chars se inserten
             }
         }
+    }
+
+    // ── Branch Picker abierto: captura TODO el input ──
+    if branch_picker_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::BranchPickerClose,
+            (KeyCode::Enter, _) => Action::BranchPickerConfirm,
+            (KeyCode::Up, KeyModifiers::NONE) => Action::BranchPickerUp,
+            (KeyCode::Down, KeyModifiers::NONE) => Action::BranchPickerDown,
+            // Ctrl+P / Ctrl+N para vim-style navigation
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::BranchPickerUp,
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::BranchPickerDown,
+            (KeyCode::Backspace, _) => Action::BranchPickerDeleteChar,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::BranchPickerInsertChar(ch)
+            }
+            // Cualquier otra tecla NO se propaga
+            _ => Action::Noop,
+        };
     }
 
     // ── Quick Open abierto: captura TODO el input ──
@@ -1286,6 +1315,60 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones del Branch Picker ──
+        Action::BranchPickerOpen => {
+            // Solo abrir si no hay otros overlays visibles
+            if !state.palette.visible && !state.quick_open.visible {
+                let root = get_workspace_root(state);
+                match state.branch_picker.open(&root) {
+                    Ok(()) => {
+                        tracing::debug!("branch picker abierto");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error al abrir branch picker");
+                    }
+                }
+            }
+            vec![]
+        }
+        Action::BranchPickerClose => {
+            state.branch_picker.close();
+            tracing::debug!("branch picker cerrado");
+            vec![]
+        }
+        Action::BranchPickerUp => {
+            state.branch_picker.move_up();
+            vec![]
+        }
+        Action::BranchPickerDown => {
+            state.branch_picker.move_down();
+            vec![]
+        }
+        Action::BranchPickerInsertChar(ch) => {
+            state.branch_picker.insert_char(*ch);
+            vec![]
+        }
+        Action::BranchPickerDeleteChar => {
+            state.branch_picker.delete_char();
+            vec![]
+        }
+        Action::BranchPickerConfirm => {
+            let root = get_workspace_root(state);
+            match state.branch_picker.checkout_selected(&root) {
+                Ok(()) => {
+                    // Refrescar git state para actualizar branch en status bar
+                    state.git.refresh(&root);
+                    tracing::info!(branch = %state.git.branch, "checkout exitoso");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "error en checkout de branch");
+                    // Cerrar picker incluso si falla
+                    state.branch_picker.close();
+                }
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
@@ -1447,8 +1530,43 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
         return; // Sin layout aún — primer frame
     };
 
+    // ── Click en status bar: detectar click en zona del branch ──
+    {
+        let sb = layout.status_bar;
+        if row >= sb.y && row < sb.y + sb.height {
+            // La status bar tiene: " MODE " + " " + branch + "  " + file_name...
+            // El branch empieza aprox en col = sb.x + mode_width + 2
+            // El mode ("NORMAL" o "LSP") ocupa ~8 chars (espacio + texto + espacio + separador)
+            // Estimado conservador: el branch está entre col 8 y 8 + branch_len
+            let mode_width: u16 = if state.lsp.has_server() { 6 } else { 8 }; // " LSP " vs " NORMAL "
+            let branch_start = sb.x + mode_width;
+            let branch_len = if state.git.is_repo {
+                state.git.branch.len() as u16
+            } else {
+                6 // "no git"
+            };
+            let branch_end = branch_start + branch_len + 1; // +1 margen
+
+            if col >= branch_start && col < branch_end && state.git.is_repo {
+                // Click en el branch name → abrir branch picker
+                let root = get_workspace_root(state);
+                match state.branch_picker.open(&root) {
+                    Ok(()) => {
+                        tracing::debug!("branch picker abierto via mouse click");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error al abrir branch picker via mouse");
+                    }
+                }
+                return;
+            }
+            // Click en otra parte de la status bar — ignorar
+            return;
+        }
+    }
+
     let Some(panel) = hit_test_panel(&layout, col, row) else {
-        return; // Click en zona no interactiva (title bar, status bar)
+        return; // Click en zona no interactiva (title bar)
     };
 
     // Si la sidebar muestra search o git, redirigir foco al panel activo
@@ -1820,6 +1938,7 @@ async fn event_loop(
                     state.focused_panel,
                     state.palette.visible,
                     state.quick_open.visible,
+                    state.branch_picker.visible,
                     state.search.visible,
                     &state.git,
                     state.lsp.completion_visible,

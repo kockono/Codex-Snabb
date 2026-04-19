@@ -5,6 +5,7 @@
 //! Los widgets son stateless renderers — reciben datos pre-computados
 //! y dibujan. Nada de IO ni cómputo pesado en render.
 
+pub mod branch_picker;
 pub mod git_panel;
 pub mod layout;
 pub mod palette;
@@ -121,7 +122,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
     // Solo cuando el editor tiene foco y no hay overlays activos.
     // La posición se computa una vez acá — sin allocaciones.
-    if editor_focused && !state.palette.visible && !state.quick_open.visible {
+    if editor_focused
+        && !state.palette.visible
+        && !state.quick_open.visible
+        && !state.branch_picker.visible
+    {
         // Inner area del editor (descontar bordes del Block)
         let inner_x = layout.editor_area.x + 1;
         let inner_y = layout.editor_area.y + 1;
@@ -192,7 +197,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // ── LSP Overlays (hover, completions) ──
     // Se renderizan antes de los overlays modales (palette, quick open)
     // porque los modales tienen prioridad visual.
-    if editor_focused && !state.palette.visible && !state.quick_open.visible {
+    if editor_focused
+        && !state.palette.visible
+        && !state.quick_open.visible
+        && !state.branch_picker.visible
+    {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
             panels::render_lsp_hover(f, layout.editor_area, theme, hover, &state.editor);
@@ -212,9 +221,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Overlays ──
-    // Solo un overlay a la vez. Quick open tiene prioridad visual sobre palette.
+    // Solo un overlay a la vez. Branch picker > Quick open > Palette (prioridad visual).
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
-    if state.quick_open.visible {
+    if state.branch_picker.visible {
+        branch_picker::render_branch_picker(f, area, &state.branch_picker, theme);
+    } else if state.quick_open.visible {
         quick_open::render_quick_open(f, area, &state.quick_open, theme);
     } else if state.palette.visible {
         palette::render_palette(f, area, &state.palette, &state.commands, theme);

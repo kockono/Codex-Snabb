@@ -271,6 +271,26 @@ pub enum Action {
     QuickOpenConfirm,
     /// Cerrar el quick open.
     QuickOpenClose,
+
+    // ── Branch Picker ──
+    /// Abrir el branch picker (click en branch de status bar).
+    #[expect(
+        dead_code,
+        reason = "se dispara via mouse click directo — disponible para keybinding futuro"
+    )]
+    BranchPickerOpen,
+    /// Cerrar el branch picker (Esc).
+    BranchPickerClose,
+    /// Mover selección arriba en el branch picker.
+    BranchPickerUp,
+    /// Mover selección abajo en el branch picker.
+    BranchPickerDown,
+    /// Insertar carácter en el input del branch picker.
+    BranchPickerInsertChar(char),
+    /// Borrar carácter del input del branch picker.
+    BranchPickerDeleteChar,
+    /// Confirmar y hacer checkout de la rama seleccionada.
+    BranchPickerConfirm,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
