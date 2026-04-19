@@ -1710,8 +1710,9 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
     match hit {
         HitTestResult::ActivityBar { row_in_bar } => {
             // Resolver qué icono fue clickeado
-            // Iconos: 0=Explorer, 1=Git, 2=Search, 4=Settings (fila 3 es separador)
-            let settings_row = 4;
+            // Iconos: 0=Explorer, 1=Git, 2=Search, penúltima fila=Settings
+            let bar_height = layout.activity_bar.height;
+            let settings_row = bar_height.saturating_sub(2);
 
             if row_in_bar == settings_row {
                 // Click en Settings (último icono)

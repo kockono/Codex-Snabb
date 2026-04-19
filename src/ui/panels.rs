@@ -160,17 +160,19 @@ pub fn render_activity_bar(
         }
     }
 
-    // Settings justo debajo de los iconos con una línea de separación
-    if lines.len() < area.height as usize {
-        lines.push(Line::from(Span::styled("   ", bg_style))); // separador
+    // Rellenar hasta la penúltima fila
+    let settings_row = (area.height as usize).saturating_sub(2);
+    while lines.len() < settings_row {
+        lines.push(Line::from(Span::styled("   ", bg_style)));
     }
+
+    // Settings en la penúltima fila
     if lines.len() < area.height as usize {
         let settings_style = style_for(settings_active);
-        // Icono de settings: ⚙ (U+2699, 2-cell wide en algunas terminales)
         lines.push(Line::from(Span::styled("⚙ ", settings_style)));
     }
 
-    // Rellenar resto con líneas vacías
+    // Última fila vacía
     while lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled("   ", bg_style)));
     }
