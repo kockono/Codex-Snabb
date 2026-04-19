@@ -249,7 +249,17 @@ pub fn search_workspace(
 
                 let relative = file_path.strip_prefix(root).unwrap_or(file_path);
                 // Truncar línea para display — no guardar líneas enormes
-                let display_line = if line.len() > 500 { &line[..500] } else { line };
+                // Usar floor_char_boundary para no cortar multi-byte UTF-8
+                let display_line = if line.len() > 500 {
+                    // Encontrar el char boundary más cercano en o antes de 500 bytes
+                    let mut end_byte = 500;
+                    while end_byte > 0 && !line.is_char_boundary(end_byte) {
+                        end_byte -= 1;
+                    }
+                    &line[..end_byte]
+                } else {
+                    line
+                };
 
                 results.matches.push(SearchMatch {
                     path: relative.to_path_buf(),

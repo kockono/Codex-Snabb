@@ -363,11 +363,11 @@ fn render_match_line<'a>(
 
     let ln_style = Style::default().fg(theme.fg_secondary).bg(bg);
 
-    // Truncar contenido de línea para el ancho disponible
+    // Truncar contenido de línea para el ancho disponible — char-safe para multi-byte
     let prefix_len = indicator.len() + ln_prefix.len();
     let content_max = max_width.saturating_sub(prefix_len);
-    let display_content = if m.line_content.len() > content_max {
-        let truncated = &m.line_content[..content_max.saturating_sub(3)];
+    let display_content = if m.line_content.chars().count() > content_max {
+        let truncated = crate::ui::truncate_str(&m.line_content, content_max.saturating_sub(3));
         format!("{truncated}...")
     } else {
         m.line_content.clone() // CLONE: necesario — Span toma ownership del String

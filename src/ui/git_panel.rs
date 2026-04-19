@@ -279,14 +279,10 @@ fn render_file_entry<'a>(
     let status_style = Style::default().fg(status_color).bg(bg);
     let path_style = Style::default().fg(theme.fg_primary).bg(bg);
 
-    // Truncar path al ancho disponible
+    // Truncar path al ancho disponible — char-safe para multi-byte
     let prefix_len = indicator.len() + 2 + 1; // indicator + "X " + espacio
     let path_max = max_width.saturating_sub(prefix_len);
-    let display_path = if file.path.len() > path_max {
-        &file.path[..path_max]
-    } else {
-        &file.path
-    };
+    let display_path = crate::ui::truncate_str(&file.path, path_max);
 
     Line::from(vec![
         Span::styled(indicator, indicator_style),
@@ -410,11 +406,7 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
 /// - Headers `@@` → cyan (fg_accent)
 /// - Resto → texto normal
 fn render_diff_line<'a>(line: &str, max_width: usize, theme: &'a Theme) -> Line<'a> {
-    let display = if line.len() > max_width {
-        &line[..max_width]
-    } else {
-        line
-    };
+    let display = crate::ui::truncate_str(line, max_width);
 
     let style = if display.starts_with('+') {
         Style::default().fg(theme.diff_add).bg(theme.bg_secondary)

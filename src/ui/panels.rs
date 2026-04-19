@@ -196,11 +196,7 @@ fn render_explorer_entry<'a>(
     // Calcular cuánto espacio queda para el nombre
     let prefix_len = indent_width + icon.len();
     let name_max = max_width.saturating_sub(prefix_len);
-    let display_name = if entry.name.len() > name_max {
-        &entry.name[..name_max]
-    } else {
-        &entry.name
-    };
+    let display_name = crate::ui::truncate_str(&entry.name, name_max);
 
     // Estilo base según tipo y selección
     let bg = if selected {
@@ -399,12 +395,8 @@ pub fn render_editor_area(
 
             // ── Texto de la línea ──
             let line_content = editor.buffer.line(buf_line_idx).unwrap_or("");
-            // Truncar al ancho del viewport sin alocar
-            let display_text = if line_content.len() > text_width {
-                &line_content[..text_width]
-            } else {
-                line_content
-            };
+            // Truncar al ancho del viewport sin alocar — char-safe para multi-byte
+            let display_text = crate::ui::truncate_str(line_content, text_width);
 
             // Construir spans para esta línea
             let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
@@ -519,10 +511,20 @@ fn render_line_with_selections<'a>(
         return vec![Span::styled(text.to_string(), normal_style)];
     }
 
-    // Construir spans divididos por selección, cursores y diagnósticos
-    // Estrategia: recorrer la línea char por char, agrupar segmentos contiguos
-    // con el mismo estilo para minimizar spans
+    // Construir spans divididos por selección, cursores y diagnósticos.
+    // Estrategia: recorrer por char boundaries (byte offsets válidos),
+    // agrupar segmentos contiguos con el mismo estilo para minimizar spans.
+    // IMPORTANTE: iterar por char_indices() garantiza que nunca cortamos
+    // en medio de un carácter multi-byte (UTF-8 de 2-4 bytes).
     let mut result: Vec<Span<'a>> = Vec::with_capacity(8);
+
+    // Recopilar byte offsets de char boundaries
+    let char_boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+
+    if char_boundaries.is_empty() {
+        return result;
+    }
+
     let mut current_start = 0;
     let mut current_style = char_style_with_diags(
         0,
@@ -536,44 +538,35 @@ fn render_line_with_selections<'a>(
         diag_warning_style,
     );
 
-    for col in 1..=text_len {
-        let style = if col < text_len {
-            char_style_with_diags(
-                col,
-                &selected_ranges,
-                &cursor_cols,
-                diagnostics,
-                normal_style,
-                selection_style,
-                cursor_style,
-                diag_error_style,
-                diag_warning_style,
-            )
-        } else {
-            // Sentinela para flush del último segmento
-            Style::default()
-        };
+    // Iterar desde el segundo char boundary hasta el final
+    for &byte_offset in char_boundaries.iter().skip(1) {
+        let style = char_style_with_diags(
+            byte_offset,
+            &selected_ranges,
+            &cursor_cols,
+            diagnostics,
+            normal_style,
+            selection_style,
+            cursor_style,
+            diag_error_style,
+            diag_warning_style,
+        );
 
-        if style != current_style || col == text_len {
-            // Flush segmento actual
-            let end = if col == text_len && style == current_style {
-                text_len
-            } else {
-                col
-            };
-            let segment = &text[current_start..end];
+        if style != current_style {
+            // Flush segmento actual — current_start y byte_offset son char boundaries
+            let segment = &text[current_start..byte_offset];
             if !segment.is_empty() {
                 // CLONE: necesario — segment es slice del buffer
                 result.push(Span::styled(segment.to_string(), current_style));
             }
-            current_start = col;
+            current_start = byte_offset;
             current_style = style;
         }
     }
 
-    // Flush final si queda algo
+    // Flush final: desde current_start hasta el final del string
     if current_start < text_len {
-        let segment = &text[current_start..text_len];
+        let segment = &text[current_start..];
         if !segment.is_empty() {
             // CLONE: necesario — segment es slice del buffer
             result.push(Span::styled(segment.to_string(), current_style));
@@ -687,12 +680,8 @@ pub fn render_bottom_panel(
     let lines: Vec<Line<'_>> = visible
         .iter()
         .map(|line| {
-            // Truncar línea al ancho del panel sin alocar
-            let display = if line.len() > max_width {
-                &line[..max_width]
-            } else {
-                line
-            };
+            // Truncar línea al ancho del panel sin alocar — char-safe para multi-byte
+            let display = crate::ui::truncate_str(line, max_width);
             Line::from(Span::styled(
                 display.to_string(), // CLONE: necesario — Span toma ownership, display es slice de session
                 Style::default().fg(theme.fg_primary),
@@ -843,11 +832,7 @@ pub fn render_lsp_hover(
         .iter()
         .take(inner.height as usize)
         .map(|line| {
-            let display = if line.len() > inner.width as usize {
-                &line[..inner.width as usize]
-            } else {
-                line
-            };
+            let display = crate::ui::truncate_str(line, inner.width as usize);
             Line::from(Span::styled(
                 display.to_string(), // CLONE: necesario — display es slice, Span toma ownership
                 Style::default().fg(theme.fg_primary),

@@ -17,6 +17,34 @@ pub use theme::Theme;
 
 use ratatui::Frame;
 
+// ─── String Truncation Helper ──────────────────────────────────────────────────
+
+/// Trunca un `&str` a un máximo de `max_width` caracteres (no bytes).
+///
+/// Retorna un slice válido que nunca corta caracteres multi-byte (UTF-8).
+/// Esto es necesario porque `&str[..n]` con `n` en medio de un carácter
+/// multi-byte causa panic. Anchos de viewport/columna son caracteres,
+/// no bytes — usar esta función en lugar de slicing directo.
+///
+/// # Ejemplo
+/// ```ignore
+/// let s = "─hello";
+/// // s.len() == 6 (─ ocupa 3 bytes UTF-8)
+/// // truncate_str(s, 3) == "─he" (3 caracteres, no 3 bytes)
+/// ```
+pub(crate) fn truncate_str(s: &str, max_width: usize) -> &str {
+    if s.len() <= max_width {
+        // Fast path: si el total de bytes <= max_width, el string
+        // tiene como mucho max_width caracteres (cada char >= 1 byte)
+        return s;
+    }
+    // Encontrar el byte offset del carácter en posición max_width
+    match s.char_indices().nth(max_width) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s, // string tiene menos de max_width caracteres
+    }
+}
+
 use crate::app::AppState;
 use crate::core::PanelId;
 
