@@ -99,9 +99,9 @@ pub fn render_settings(f: &mut Frame, area: Rect, state: &KeybindingsState, them
 
     // ── Separador ──
     let sep_width = separator_area.width as usize;
-    // Usar un string estático largo y tomar slice
+    // Usar truncate_str para corte char-safe en string multi-byte
     const DASHES: &str = "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────";
-    let sep_str = &DASHES[..sep_width.min(DASHES.len())];
+    let sep_str = crate::ui::truncate_str(DASHES, sep_width);
     let separator = Paragraph::new(Line::from(Span::styled(
         sep_str,
         Style::default().fg(theme.border_unfocused),
