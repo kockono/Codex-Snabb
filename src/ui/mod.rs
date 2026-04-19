@@ -12,6 +12,7 @@ pub mod palette;
 pub mod panels;
 pub mod quick_open;
 pub mod search_panel;
+pub mod settings_panel;
 pub mod theme;
 
 pub use theme::Theme;
@@ -47,6 +48,7 @@ pub(crate) fn truncate_str(s: &str, max_width: usize) -> &str {
 }
 
 use crate::app::AppState;
+use crate::core::settings::SidebarSection;
 use crate::core::PanelId;
 
 use layout::IdeLayout;
@@ -72,6 +74,24 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
 
     // ── Title bar ──
     panels::render_title_bar(f, layout.title_bar, theme);
+
+    // ── Activity bar ──
+    // Determinar sección activa de la sidebar para highlight de icono.
+    // La activity bar se renderiza SIEMPRE — no depende de sidebar_visible.
+    let active_section = if state.search.visible {
+        SidebarSection::Search
+    } else if state.git.visible {
+        SidebarSection::Git
+    } else {
+        SidebarSection::Explorer
+    };
+    panels::render_activity_bar(
+        f,
+        layout.activity_bar,
+        theme,
+        active_section,
+        state.keybindings.visible,
+    );
 
     // ── Sidebar ──
     // Prioridad de paneles en sidebar: search > git > explorer
@@ -126,6 +146,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.palette.visible
         && !state.quick_open.visible
         && !state.branch_picker.visible
+        && !state.keybindings.visible
     {
         // Inner area del editor (descontar bordes del Block)
         let inner_x = layout.editor_area.x + 1;
@@ -201,6 +222,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.palette.visible
         && !state.quick_open.visible
         && !state.branch_picker.visible
+        && !state.keybindings.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -221,9 +243,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Overlays ──
-    // Solo un overlay a la vez. Branch picker > Quick open > Palette (prioridad visual).
+    // Prioridad: Settings > Branch picker > Quick open > Palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
-    if state.branch_picker.visible {
+    if state.keybindings.visible {
+        settings_panel::render_settings(f, area, &state.keybindings, theme);
+    } else if state.branch_picker.visible {
         branch_picker::render_branch_picker(f, area, &state.branch_picker, theme);
     } else if state.quick_open.visible {
         quick_open::render_quick_open(f, area, &state.quick_open, theme);

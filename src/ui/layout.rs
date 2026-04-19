@@ -1,19 +1,19 @@
 //! Layout: cómputo del layout principal tipo IDE.
 //!
-//! Define las áreas del shell visual: title bar, sidebar, editor, bottom panel
-//! y status bar. El layout se computa una vez y se invalida solo en resize
-//! o toggle de paneles — nunca se recalcula cada frame sin cambio.
+//! Define las áreas del shell visual: title bar, activity bar, sidebar, editor,
+//! bottom panel y status bar. El layout se computa una vez y se invalida solo
+//! en resize o toggle de paneles — nunca se recalcula cada frame sin cambio.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────┐
 //! │                  Title Bar                    │
-//! ├──────────┬───────────────────────────────────┤
-//! │          │                                   │
-//! │ Sidebar  │          Editor Area              │
-//! │          │                                   │
-//! │          ├───────────────────────────────────┤
-//! │          │        Bottom Panel               │
-//! ├──────────┴───────────────────────────────────┤
+//! ├─┬────────┬───────────────────────────────────┤
+//! │ │        │                                   │
+//! │A│Sidebar │          Editor Area              │
+//! │B│        │                                   │
+//! │ │        ├───────────────────────────────────┤
+//! │ │        │        Bottom Panel               │
+//! ├─┴────────┴───────────────────────────────────┤
 //! │                 Status Bar                    │
 //! └──────────────────────────────────────────────┘
 //! ```
@@ -29,6 +29,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 pub struct IdeLayout {
     /// Barra superior con nombre del IDE (1 línea).
     pub title_bar: Rect,
+    /// Activity bar: columna delgada con iconos de sección (3 cols).
+    /// Siempre visible — no se oculta con toggle sidebar.
+    pub activity_bar: Rect,
     /// Panel lateral izquierdo (explorer, git, search).
     pub sidebar: Rect,
     /// Área principal del editor de texto.
@@ -43,6 +46,8 @@ pub struct IdeLayout {
     pub bottom_panel_visible: bool,
 }
 
+/// Ancho fijo de la activity bar en columnas (1 pad + 1 icono + 1 pad).
+const ACTIVITY_BAR_WIDTH: u16 = 3;
 /// Ancho mínimo de la sidebar en columnas.
 const SIDEBAR_MIN_COLS: u16 = 20;
 /// Ancho máximo de la sidebar en columnas.
@@ -75,16 +80,25 @@ impl IdeLayout {
         let center = vertical[1];
         let status_bar = vertical[2];
 
-        // Layout horizontal del centro: sidebar + main content
+        // Layout horizontal del centro: activity_bar + sidebar + main content.
+        // La activity bar SIEMPRE está visible (3 cols), la sidebar es togglable.
+        let activity_bar_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(ACTIVITY_BAR_WIDTH), Constraint::Fill(1)])
+            .split(center);
+
+        let activity_bar = activity_bar_split[0];
+        let after_activity = activity_bar_split[1];
+
         let (sidebar, main_area) = if sidebar_visible {
-            let sidebar_width = compute_sidebar_width(center.width);
+            let sidebar_width = compute_sidebar_width(after_activity.width);
             let horizontal = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(sidebar_width), Constraint::Fill(1)])
-                .split(center);
+                .split(after_activity);
             (horizontal[0], horizontal[1])
         } else {
-            (Rect::default(), center)
+            (Rect::default(), after_activity)
         };
 
         // Layout vertical del main content: editor + bottom panel
@@ -101,6 +115,7 @@ impl IdeLayout {
 
         Self {
             title_bar,
+            activity_bar,
             sidebar,
             editor_area,
             bottom_panel,

@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::core::settings::SidebarSection;
 use crate::core::PanelId;
 use crate::editor::cursor::Position;
 use crate::editor::selection::Selection;
@@ -96,6 +97,84 @@ pub fn render_title_bar(f: &mut Frame, area: Rect, theme: &Theme) {
     let bar = Paragraph::new(title).style(Style::default().bg(theme.bg_status));
 
     f.render_widget(bar, area);
+}
+
+// ─── Activity Bar ──────────────────────────────────────────────────────────────
+
+/// Renderiza la activity bar: columna delgada (3 cols) con iconos de sección.
+///
+/// Siempre visible (no se oculta con Ctrl+B). Muestra iconos apilados
+/// verticalmente: Explorer, Git, Search en la parte superior, y Settings
+/// siempre en la parte inferior.
+///
+/// El icono activo tiene highlight con `fg_accent`. Los demás usan `fg_secondary`.
+/// No aloca — usa literales y estilos estáticos.
+pub fn render_activity_bar(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    active_section: SidebarSection,
+    settings_active: bool,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Fondo de la activity bar
+    let bg_style = Style::default().bg(theme.bg_status);
+
+    // Ícono activo vs inactivo
+    let style_for = |active: bool| -> Style {
+        if active {
+            Style::default()
+                .fg(theme.fg_accent)
+                .bg(theme.bg_status)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg_secondary).bg(theme.bg_status)
+        }
+    };
+
+    // Definir iconos (centrados en 3 columnas: " X ")
+    let icons: &[(&str, bool)] = &[
+        (
+            " E ",
+            active_section == SidebarSection::Explorer && !settings_active,
+        ),
+        (
+            " G ",
+            active_section == SidebarSection::Git && !settings_active,
+        ),
+        (
+            " S ",
+            active_section == SidebarSection::Search && !settings_active,
+        ),
+    ];
+
+    // Construir líneas: iconos en la parte superior, settings en la parte inferior
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+
+    for (i, &(icon, active)) in icons.iter().enumerate() {
+        if i < area.height as usize {
+            lines.push(Line::from(Span::styled(icon, style_for(active))));
+        }
+    }
+
+    // Rellenar espacio intermedio con líneas vacías
+    let settings_row = (area.height as usize).saturating_sub(1);
+    while lines.len() < settings_row {
+        lines.push(Line::from(Span::styled("   ", bg_style)));
+    }
+
+    // Settings siempre al fondo
+    if area.height > 0 {
+        let settings_style = style_for(settings_active);
+        // Icono de settings: usar carácter simple
+        lines.push(Line::from(Span::styled(" * ", settings_style)));
+    }
+
+    let paragraph = Paragraph::new(lines).style(bg_style);
+    f.render_widget(paragraph, area);
 }
 
 // ─── Sidebar ───────────────────────────────────────────────────────────────────
