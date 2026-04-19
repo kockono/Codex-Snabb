@@ -74,7 +74,21 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
 
     // ── Editor area ──
     let editor_focused = focused == PanelId::Editor;
-    panels::render_editor_area(f, layout.editor_area, theme, editor_focused, &state.editor);
+    // Obtener diagnósticos para el archivo actual (si hay LSP activo)
+    let current_diagnostics = state
+        .editor
+        .buffer
+        .file_path()
+        .map(|p| state.lsp.diagnostics_for(p))
+        .unwrap_or(&[]);
+    panels::render_editor_area(
+        f,
+        layout.editor_area,
+        theme,
+        editor_focused,
+        &state.editor,
+        current_diagnostics,
+    );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
     // Solo cuando el editor tiene foco y no hay overlays activos.
@@ -128,14 +142,46 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     } else {
         "no git"
     };
+    // Si hay un mensaje de diagnóstico LSP, mostrarlo como file_name override
+    let file_display = state
+        .lsp
+        .status_message
+        .as_deref()
+        .unwrap_or(&state.status_file);
     let status_data = StatusBarData {
-        mode: "NORMAL",
-        file_name: &state.status_file,
+        mode: if state.lsp.has_server() {
+            "LSP"
+        } else {
+            "NORMAL"
+        },
+        file_name: file_display,
         cursor_pos: &state.status_line,
         branch: branch_display,
         encoding: "UTF-8",
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
+
+    // ── LSP Overlays (hover, completions) ──
+    // Se renderizan antes de los overlays modales (palette, quick open)
+    // porque los modales tienen prioridad visual.
+    if editor_focused && !state.palette.visible && !state.quick_open.visible {
+        // Hover tooltip
+        if let Some(ref hover) = state.lsp.hover_content {
+            panels::render_lsp_hover(f, layout.editor_area, theme, hover, &state.editor);
+        }
+
+        // Completion dropdown
+        if state.lsp.completion_visible && !state.lsp.completions.is_empty() {
+            panels::render_lsp_completions(
+                f,
+                layout.editor_area,
+                theme,
+                &state.lsp.completions,
+                state.lsp.completion_selected,
+                &state.editor,
+            );
+        }
+    }
 
     // ── Overlays ──
     // Solo un overlay a la vez. Quick open tiene prioridad visual sobre palette.

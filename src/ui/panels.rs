@@ -16,6 +16,7 @@ use crate::core::PanelId;
 use crate::editor::cursor::Position;
 use crate::editor::selection::Selection;
 use crate::editor::EditorState;
+use crate::lsp;
 use crate::ui::theme::Theme;
 use crate::workspace::explorer::{ExplorerState, FlatEntry};
 
@@ -254,6 +255,7 @@ pub fn render_editor_area(
     theme: &Theme,
     focused: bool,
     editor: &EditorState,
+    diagnostics: &[lsp::Diagnostic],
 ) {
     let block = panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
 
@@ -345,6 +347,13 @@ pub fn render_editor_area(
         .fg(theme.fg_accent)
         .add_modifier(Modifier::REVERSED);
     let tilde_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
+    // Estilos de diagnóstico (subrayado con color de severidad)
+    let diag_error_style = Style::default()
+        .fg(theme.fg_error)
+        .add_modifier(Modifier::UNDERLINED);
+    let diag_warning_style = Style::default()
+        .fg(theme.fg_warning)
+        .add_modifier(Modifier::UNDERLINED);
 
     // Buffer pre-alocado para el padding del gutter
     // Máximo 10 dígitos (más que suficiente para cualquier archivo razonable)
@@ -405,16 +414,30 @@ pub fn render_editor_area(
             spans.push(Span::styled(num_buf.clone(), gutter_num_style));
             spans.push(Span::styled("\u{2502} ", separator_style));
 
-            // ── Renderizar texto con selecciones y cursores secundarios ──
+            // ── Renderizar texto con selecciones, cursores y diagnósticos ──
             if !display_text.is_empty() {
+                // Recopilar rangos de diagnósticos para esta línea
+                let line_diags: Vec<(usize, usize, &lsp::DiagnosticSeverity)> = diagnostics
+                    .iter()
+                    .filter(|d| d.line == buf_line_idx as u32)
+                    .map(|d| {
+                        let start = (d.col_start as usize).min(display_text.len());
+                        let end = (d.col_end as usize).min(display_text.len());
+                        (start, end, &d.severity)
+                    })
+                    .collect();
+
                 let text_spans = render_line_with_selections(
                     display_text,
                     buf_line_idx,
                     &selections,
                     &secondary_cursor_positions,
+                    &line_diags,
                     line_bg_style,
                     selection_style,
                     secondary_cursor_style,
+                    diag_error_style,
+                    diag_warning_style,
                 );
                 spans.extend(text_spans);
             }
@@ -436,19 +459,26 @@ pub fn render_editor_area(
     f.render_widget(paragraph, inner);
 }
 
-/// Renderiza una línea de texto con highlights de selección y cursores secundarios.
+/// Renderiza una línea de texto con highlights de selección, cursores y diagnósticos.
 ///
-/// Divide la línea en segmentos según las selecciones activas y posiciones
-/// de cursores secundarios. Cada segmento recibe el estilo apropiado.
-/// No usa `format!()` — construye spans directamente.
+/// Divide la línea en segmentos según las selecciones activas, posiciones
+/// de cursores secundarios y rangos de diagnósticos. Cada segmento recibe
+/// el estilo apropiado. No usa `format!()` — construye spans directamente.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render helper — pasar struct de estilos agregaría complejidad sin beneficio"
+)]
 fn render_line_with_selections<'a>(
     text: &str,
     line_idx: usize,
     selections: &[Selection],
     secondary_cursors: &[Position],
+    diagnostics: &[(usize, usize, &lsp::DiagnosticSeverity)],
     normal_style: Style,
     selection_style: Style,
     cursor_style: Style,
+    diag_error_style: Style,
+    diag_warning_style: Style,
 ) -> Vec<Span<'a>> {
     let text_len = text.len();
     if text_len == 0 {
@@ -483,35 +513,41 @@ fn render_line_with_selections<'a>(
         .map(|p| p.col)
         .collect();
 
-    // Si no hay selecciones ni cursores secundarios, renderizar normal
-    if selected_ranges.is_empty() && cursor_cols.is_empty() {
+    // Si no hay selecciones, cursores secundarios, ni diagnósticos, renderizar normal
+    if selected_ranges.is_empty() && cursor_cols.is_empty() && diagnostics.is_empty() {
         // CLONE: necesario — text es un slice del buffer, Span toma ownership
         return vec![Span::styled(text.to_string(), normal_style)];
     }
 
-    // Construir spans divididos por selección y cursores secundarios
+    // Construir spans divididos por selección, cursores y diagnósticos
     // Estrategia: recorrer la línea char por char, agrupar segmentos contiguos
     // con el mismo estilo para minimizar spans
     let mut result: Vec<Span<'a>> = Vec::with_capacity(8);
     let mut current_start = 0;
-    let mut current_style = char_style(
+    let mut current_style = char_style_with_diags(
         0,
         &selected_ranges,
         &cursor_cols,
+        diagnostics,
         normal_style,
         selection_style,
         cursor_style,
+        diag_error_style,
+        diag_warning_style,
     );
 
     for col in 1..=text_len {
         let style = if col < text_len {
-            char_style(
+            char_style_with_diags(
                 col,
                 &selected_ranges,
                 &cursor_cols,
+                diagnostics,
                 normal_style,
                 selection_style,
                 cursor_style,
+                diag_error_style,
+                diag_warning_style,
             )
         } else {
             // Sentinela para flush del último segmento
@@ -549,14 +585,21 @@ fn render_line_with_selections<'a>(
 
 /// Determina el estilo de un carácter en una columna dada.
 ///
-/// Prioridad: cursor secundario > selección > normal.
-fn char_style(
+/// Prioridad: cursor secundario > selección > diagnóstico > normal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render helper — pasar struct de estilos agregaría complejidad sin beneficio"
+)]
+fn char_style_with_diags(
     col: usize,
     selected_ranges: &[(usize, usize)],
     cursor_cols: &[usize],
+    diagnostics: &[(usize, usize, &lsp::DiagnosticSeverity)],
     normal_style: Style,
     selection_style: Style,
     cursor_style: Style,
+    diag_error_style: Style,
+    diag_warning_style: Style,
 ) -> Style {
     // Cursor secundario tiene prioridad visual máxima
     if cursor_cols.contains(&col) {
@@ -567,6 +610,20 @@ fn char_style(
         if col >= start && col < end {
             return selection_style;
         }
+    }
+    // Diagnóstico (error tiene prioridad sobre warning)
+    let mut has_warning = false;
+    for &(start, end, severity) in diagnostics {
+        if col >= start && col < end {
+            match severity {
+                lsp::DiagnosticSeverity::Error => return diag_error_style,
+                lsp::DiagnosticSeverity::Warning => has_warning = true,
+                _ => {}
+            }
+        }
+    }
+    if has_warning {
+        return diag_warning_style;
     }
     normal_style
 }
@@ -704,4 +761,220 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, theme: &Theme, data: &Status
 
     f.render_widget(left, horizontal[0]);
     f.render_widget(right, horizontal[1]);
+}
+
+// ─── LSP Hover ─────────────────────────────────────────────────────────────────
+
+/// Renderiza un tooltip de hover LSP como overlay cerca del cursor.
+///
+/// Box con borde, fondo secundario, texto del hover.
+/// Posicionado justo encima del cursor (o debajo si no hay espacio arriba).
+/// No aloca strings adicionales — usa el content del HoverInfo directamente.
+pub fn render_lsp_hover(
+    f: &mut Frame,
+    editor_area: Rect,
+    theme: &Theme,
+    hover: &lsp::HoverInfo,
+    editor: &EditorState,
+) {
+    let content = &hover.content;
+    if content.is_empty() {
+        return;
+    }
+
+    // Calcular posición del cursor en coordenadas absolutas del terminal
+    let inner_x = editor_area.x + 1;
+    let inner_y = editor_area.y + 1;
+
+    let scroll = editor.viewport.scroll_offset;
+    let cursor_line = editor.cursors.primary().position.line;
+    let cursor_col = editor.cursors.primary().position.col;
+
+    // Verificar que el cursor está visible
+    let inner_h = editor_area.height.saturating_sub(2) as usize;
+    if cursor_line < scroll || cursor_line >= scroll + inner_h {
+        return;
+    }
+
+    let visual_row = (cursor_line - scroll) as u16;
+    let total_lines = editor.buffer.line_count();
+    let gutter_width = digit_count(total_lines).max(4) as u16 + 2;
+
+    // Posición del tooltip: encima del cursor si hay espacio, sino debajo
+    let abs_col = inner_x + gutter_width + cursor_col as u16;
+    let abs_row = inner_y + visual_row;
+
+    // Calcular dimensiones del tooltip
+    let lines: Vec<&str> = content.lines().collect();
+    let max_line_width = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    let tooltip_width = (max_line_width as u16 + 4).clamp(10, 60);
+    let tooltip_height = (lines.len() as u16 + 2).min(10);
+
+    // Posicionar: intentar arriba del cursor primero
+    let tooltip_y = if abs_row > tooltip_height {
+        abs_row - tooltip_height
+    } else {
+        abs_row + 1
+    };
+
+    // Clampear al área del frame
+    let frame_area = f.area();
+    let tooltip_x = abs_col.min(frame_area.width.saturating_sub(tooltip_width));
+    let tooltip_y = tooltip_y.min(frame_area.height.saturating_sub(tooltip_height));
+
+    let tooltip_area = Rect::new(tooltip_x, tooltip_y, tooltip_width, tooltip_height);
+
+    // Renderizar el tooltip
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Hover ",
+            Style::default()
+                .fg(theme.fg_accent)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme.border_focused))
+        .style(Style::default().bg(theme.bg_secondary));
+
+    // Truncar contenido al espacio disponible
+    let inner = block.inner(tooltip_area);
+    let visible_lines: Vec<Line<'_>> = lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|line| {
+            let display = if line.len() > inner.width as usize {
+                &line[..inner.width as usize]
+            } else {
+                line
+            };
+            Line::from(Span::styled(
+                display.to_string(), // CLONE: necesario — display es slice, Span toma ownership
+                Style::default().fg(theme.fg_primary),
+            ))
+        })
+        .collect();
+
+    // Clear the area under the tooltip first
+    let clear = Paragraph::new("").style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(clear, tooltip_area);
+
+    let paragraph = Paragraph::new(visible_lines)
+        .block(block)
+        .style(Style::default().bg(theme.bg_secondary));
+
+    f.render_widget(paragraph, tooltip_area);
+}
+
+// ─── LSP Completions ───────────────────────────────────────────────────────────
+
+/// Renderiza la lista dropdown de autocompletado LSP.
+///
+/// Posicionada debajo del cursor. Max 10 items visibles.
+/// El item seleccionado tiene highlight de fondo.
+pub fn render_lsp_completions(
+    f: &mut Frame,
+    editor_area: Rect,
+    theme: &Theme,
+    completions: &[lsp::CompletionItem],
+    selected: usize,
+    editor: &EditorState,
+) {
+    if completions.is_empty() {
+        return;
+    }
+
+    // Calcular posición del cursor en coordenadas absolutas
+    let inner_x = editor_area.x + 1;
+    let inner_y = editor_area.y + 1;
+
+    let scroll = editor.viewport.scroll_offset;
+    let cursor_line = editor.cursors.primary().position.line;
+    let cursor_col = editor.cursors.primary().position.col;
+
+    let inner_h = editor_area.height.saturating_sub(2) as usize;
+    if cursor_line < scroll || cursor_line >= scroll + inner_h {
+        return;
+    }
+
+    let visual_row = (cursor_line - scroll) as u16;
+    let total_lines = editor.buffer.line_count();
+    let gutter_width = digit_count(total_lines).max(4) as u16 + 2;
+
+    let abs_col = inner_x + gutter_width + cursor_col as u16;
+    let abs_row = inner_y + visual_row;
+
+    // Dimensiones del dropdown
+    let max_visible = 10.min(completions.len());
+    let max_label_width = completions
+        .iter()
+        .take(max_visible)
+        .map(|c| {
+            let kind_len = c.kind.as_ref().map(|k| k.len() + 3).unwrap_or(0);
+            c.label.len() + kind_len
+        })
+        .max()
+        .unwrap_or(10);
+    let dropdown_width = (max_label_width as u16 + 4).clamp(15, 50);
+    let dropdown_height = max_visible as u16 + 2; // +2 para bordes
+
+    // Posicionar debajo del cursor
+    let dropdown_y = abs_row + 1;
+    let frame_area = f.area();
+    let dropdown_x = abs_col.min(frame_area.width.saturating_sub(dropdown_width));
+    let dropdown_y = dropdown_y.min(frame_area.height.saturating_sub(dropdown_height));
+
+    let dropdown_area = Rect::new(dropdown_x, dropdown_y, dropdown_width, dropdown_height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme.border_focused))
+        .style(Style::default().bg(theme.bg_secondary));
+
+    // Construir líneas para cada completion item
+    let lines: Vec<Line<'_>> = completions
+        .iter()
+        .take(max_visible)
+        .enumerate()
+        .map(|(i, item)| {
+            let is_selected = i == selected;
+            let bg = if is_selected {
+                theme.bg_active
+            } else {
+                theme.bg_secondary
+            };
+            let fg = if is_selected {
+                theme.fg_accent
+            } else {
+                theme.fg_primary
+            };
+
+            let mut spans = vec![Span::styled(
+                // CLONE: necesario — label es String en el CompletionItem
+                item.label.clone(),
+                Style::default().fg(fg).bg(bg),
+            )];
+
+            // Agregar kind si existe
+            if let Some(ref kind) = item.kind {
+                spans.push(Span::styled(
+                    format!(" [{kind}]"),
+                    Style::default().fg(theme.fg_secondary).bg(bg),
+                ));
+            }
+
+            Line::from(spans)
+        })
+        .collect();
+
+    // Clear area
+    let clear = Paragraph::new("").style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(clear, dropdown_area);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(theme.bg_secondary));
+
+    f.render_widget(paragraph, dropdown_area);
 }

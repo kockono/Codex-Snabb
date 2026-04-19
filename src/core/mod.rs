@@ -224,6 +224,26 @@ pub enum Action {
     /// Borrar último carácter del mensaje de commit.
     GitCommitDeleteChar,
 
+    // ── LSP ──
+    /// Arrancar el language server para el archivo actual.
+    LspStart,
+    /// Detener el language server activo.
+    LspStop,
+    /// Solicitar hover info en la posición del cursor.
+    LspHover,
+    /// Solicitar go-to-definition en la posición del cursor.
+    LspGotoDefinition,
+    /// Abrir autocompletado LSP en la posición del cursor.
+    LspCompletion,
+    /// Mover selección arriba en la lista de completions.
+    LspCompletionUp,
+    /// Mover selección abajo en la lista de completions.
+    LspCompletionDown,
+    /// Confirmar e insertar el completion seleccionado.
+    LspCompletionConfirm,
+    /// Cerrar la lista de completions.
+    LspCompletionCancel,
+
     // ── Command Palette ──
     /// Mover selección arriba en la palette.
     PaletteUp,

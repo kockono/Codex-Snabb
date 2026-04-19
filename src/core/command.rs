@@ -61,7 +61,7 @@ impl CommandRegistry {
     pub fn register_defaults(&mut self) {
         self.commands.clear();
         // Pre-alocar capacidad conocida — sabemos exactamente cuántos hay
-        self.commands.reserve(18);
+        self.commands.reserve(23);
 
         // ── File ──
         self.register(CommandEntry {
@@ -164,6 +164,43 @@ impl CommandRegistry {
             category: "Git",
             keybinding: None,
             action: Action::OpenGitPanel,
+        });
+
+        // ── LSP ──
+        self.register(CommandEntry {
+            id: "lsp.start",
+            label: "LSP: Start Server",
+            category: "LSP",
+            keybinding: None,
+            action: Action::LspStart,
+        });
+        self.register(CommandEntry {
+            id: "lsp.stop",
+            label: "LSP: Stop Server",
+            category: "LSP",
+            keybinding: None,
+            action: Action::LspStop,
+        });
+        self.register(CommandEntry {
+            id: "lsp.hover",
+            label: "LSP: Show Hover Info",
+            category: "LSP",
+            keybinding: Some("Ctrl+K"),
+            action: Action::LspHover,
+        });
+        self.register(CommandEntry {
+            id: "lsp.goto_definition",
+            label: "LSP: Go to Definition",
+            category: "LSP",
+            keybinding: Some("F12"),
+            action: Action::LspGotoDefinition,
+        });
+        self.register(CommandEntry {
+            id: "lsp.completion",
+            label: "LSP: Trigger Completion",
+            category: "LSP",
+            keybinding: Some("Ctrl+Space"),
+            action: Action::LspCompletion,
         });
 
         // ── Explorer ──

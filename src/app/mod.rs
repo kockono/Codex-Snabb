@@ -31,6 +31,7 @@ use crate::core::command::CommandRegistry;
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::git::GitState;
+use crate::lsp::LspState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::search::SearchState;
 use crate::terminal::TerminalState;
@@ -77,6 +78,8 @@ pub struct AppState {
     pub terminal: TerminalState,
     /// Estado del panel de Git / source control.
     pub git: GitState,
+    /// Estado del subsistema LSP (language server protocol).
+    pub lsp: LspState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -132,6 +135,7 @@ impl AppState {
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
+            lsp: LspState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
@@ -193,6 +197,7 @@ impl AppState {
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
+            lsp: LspState::new(),
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
@@ -257,6 +262,7 @@ fn keymap(
     quick_open_visible: bool,
     search_visible: bool,
     git_state: &GitState,
+    lsp_completion_visible: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -286,6 +292,22 @@ fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── LSP Completion visible: captura navegación, Enter, Esc ──
+    if lsp_completion_visible && focused_panel == PanelId::Editor {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => return Action::LspCompletionCancel,
+            (KeyCode::Enter, KeyModifiers::NONE) => return Action::LspCompletionConfirm,
+            (KeyCode::Up, KeyModifiers::NONE) => return Action::LspCompletionUp,
+            (KeyCode::Down, KeyModifiers::NONE) => return Action::LspCompletionDown,
+            // Tab = confirmar (estilo VS Code)
+            (KeyCode::Tab, KeyModifiers::NONE) => return Action::LspCompletionConfirm,
+            // Otros caracteres: cerrar completions y dejar pasar la acción normal
+            _ => {
+                // No capturar — caer al flujo normal para que chars se inserten
+            }
+        }
     }
 
     // ── Quick Open abierto: captura TODO el input ──
@@ -477,6 +499,14 @@ fn keymap(
         },
 
         PanelId::Editor => match (key.code, key.modifiers) {
+            // ── LSP ──
+            // Ctrl+Space → autocompletado
+            (KeyCode::Char(' '), KeyModifiers::CONTROL) => Action::LspCompletion,
+            // F12 → go-to-definition
+            (KeyCode::F(12), KeyModifiers::NONE) => Action::LspGotoDefinition,
+            // Ctrl+K → hover (info de tipo)
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => Action::LspHover,
+
             // Movimiento de cursor
             (KeyCode::Up, KeyModifiers::NONE) => Action::MoveCursor(Direction::Up),
             (KeyCode::Down, KeyModifiers::NONE) => Action::MoveCursor(Direction::Down),
@@ -568,23 +598,36 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
 
         // ── Acciones de editor ──
         Action::InsertChar(ch) => {
+            // Si hay completions visibles y el char no es alfanumérico, cerrar
+            if state.lsp.completion_visible && !ch.is_alphanumeric() && *ch != '_' {
+                state.lsp.completion_visible = false;
+                state.lsp.completions.clear();
+            }
             state.editor.insert_char(*ch);
             state.update_status_cache();
+            notify_lsp_change(state);
             vec![]
         }
         Action::DeleteChar => {
             state.editor.delete_char();
             state.update_status_cache();
+            notify_lsp_change(state);
             vec![]
         }
         Action::InsertNewline => {
+            // Cerrar completions al insertar newline
+            state.lsp.completion_visible = false;
+            state.lsp.completions.clear();
             state.editor.insert_newline();
             state.update_status_cache();
+            notify_lsp_change(state);
             vec![]
         }
         Action::MoveCursor(dir) => {
             state.editor.move_cursor(*dir, false);
             state.update_status_cache();
+            // Limpiar hover al mover cursor
+            state.lsp.hover_content = None;
             vec![]
         }
         Action::MoveCursorSelecting(dir) => {
@@ -680,6 +723,13 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                                         state.editor = editor;
                                         state.focused_panel = PanelId::Editor;
                                         state.update_status_cache();
+                                        // Notificar LSP del nuevo archivo abierto
+                                        if state.lsp.has_server() {
+                                            let text = buffer_full_text(&state.editor);
+                                            if let Err(e) = state.lsp.notify_open(&path, &text) {
+                                                tracing::warn!(error = %e, "error en LSP did_open");
+                                            }
+                                        }
                                         tracing::info!(path = %path.display(), "archivo abierto desde explorer");
                                     }
                                     Err(e) => {
@@ -833,6 +883,13 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                         state.editor = editor;
                         state.focused_panel = PanelId::Editor;
                         state.update_status_cache();
+                        // Notificar LSP del nuevo archivo abierto
+                        if state.lsp.has_server() {
+                            let text = buffer_full_text(&state.editor);
+                            if let Err(e) = state.lsp.notify_open(&absolute_path, &text) {
+                                tracing::warn!(error = %e, "error en LSP did_open");
+                            }
+                        }
                         tracing::info!(path = %absolute_path.display(), "archivo abierto desde quick open");
                     }
                     Err(e) => {
@@ -1122,6 +1179,114 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones LSP ──
+        Action::LspStart => {
+            if let Some(path) = state.editor.buffer.file_path() {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if let Some((cmd, args)) = crate::lsp::detect_language_server(ext) {
+                    let root = get_workspace_root(state);
+                    match state.lsp.start_server(cmd, args, &root) {
+                        Ok(()) => {
+                            tracing::info!(cmd, "LSP server arrancado");
+                            // Notificar archivo actualmente abierto
+                            let text = buffer_full_text(&state.editor);
+                            let file_path = state.editor.buffer.file_path()
+                                .map(|p| p.to_path_buf());
+                            if let Some(ref fp) = file_path
+                                && let Err(e) = state.lsp.notify_open(fp, &text)
+                            {
+                                tracing::warn!(error = %e, "error en LSP did_open");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "error arrancando LSP server");
+                        }
+                    }
+                } else {
+                    tracing::info!(ext, "no hay LSP server conocido para esta extensión");
+                }
+            }
+            vec![]
+        }
+        Action::LspStop => {
+            if let Err(e) = state.lsp.stop() {
+                tracing::error!(error = %e, "error deteniendo LSP server");
+            }
+            vec![]
+        }
+        Action::LspHover => {
+            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.editor.cursors.primary().position;
+                if let Err(e) = state.lsp.request_hover(&path, pos.line as u32, pos.col as u32) {
+                    tracing::warn!(error = %e, "error en LSP hover request");
+                }
+            }
+            vec![]
+        }
+        Action::LspGotoDefinition => {
+            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.editor.cursors.primary().position;
+                if let Err(e) = state.lsp.request_definition(&path, pos.line as u32, pos.col as u32) {
+                    tracing::warn!(error = %e, "error en LSP definition request");
+                }
+            }
+            vec![]
+        }
+        Action::LspCompletion => {
+            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.editor.cursors.primary().position;
+                if let Err(e) = state.lsp.request_completion(&path, pos.line as u32, pos.col as u32) {
+                    tracing::warn!(error = %e, "error en LSP completion request");
+                }
+            }
+            vec![]
+        }
+        Action::LspCompletionUp => {
+            if state.lsp.completion_visible && !state.lsp.completions.is_empty() {
+                state.lsp.completion_selected = state
+                    .lsp
+                    .completion_selected
+                    .saturating_sub(1);
+            }
+            vec![]
+        }
+        Action::LspCompletionDown => {
+            if state.lsp.completion_visible && !state.lsp.completions.is_empty() {
+                let max = state.lsp.completions.len().saturating_sub(1);
+                state.lsp.completion_selected = (state.lsp.completion_selected + 1).min(max);
+            }
+            vec![]
+        }
+        Action::LspCompletionConfirm => {
+            if state.lsp.completion_visible {
+                let idx = state.lsp.completion_selected;
+                if let Some(item) = state.lsp.completions.get(idx) {
+                    // CLONE: necesario — insert_text se extrae del Vec antes de mutar editor
+                    let text_to_insert = item
+                        .insert_text
+                        .as_deref()
+                        .unwrap_or(&item.label)
+                        .to_string();
+                    // Insertar cada carácter del texto de completion
+                    for ch in text_to_insert.chars() {
+                        state.editor.insert_char(ch);
+                    }
+                    state.update_status_cache();
+                }
+                state.lsp.completion_visible = false;
+                state.lsp.completions.clear();
+            }
+            vec![]
+        }
+        Action::LspCompletionCancel => {
+            state.lsp.completion_visible = false;
+            state.lsp.completions.clear();
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
@@ -1138,6 +1303,39 @@ fn get_workspace_root(state: &AppState) -> PathBuf {
         .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut state
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Helper: envía notificación LSP did_change si hay server activo.
+///
+/// Usa debounce interno del LspState — no envía en cada keystroke.
+fn notify_lsp_change(state: &mut AppState) {
+    if !state.lsp.has_server() {
+        return;
+    }
+    if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
+        let text = buffer_full_text(&state.editor);
+        if let Err(e) = state.lsp.notify_change(&path, &text) {
+            tracing::warn!(error = %e, "error en LSP did_change");
+        }
+    }
+}
+
+/// Helper: obtiene el texto completo del buffer del editor como un String.
+///
+/// Reconstruye el texto uniendo líneas con `\n`. Se usa para LSP did_open/did_change.
+fn buffer_full_text(editor: &EditorState) -> String {
+    let line_count = editor.buffer.line_count();
+    // Pre-alocar con estimado razonable (80 chars por línea promedio)
+    let mut text = String::with_capacity(line_count * 80);
+    for i in 0..line_count {
+        if i > 0 {
+            text.push('\n');
+        }
+        if let Some(line) = editor.buffer.line(i) {
+            text.push_str(line);
+        }
+    }
+    text
 }
 
 // ─── Search navigation helper ──────────────────────────────────────────────────
@@ -1620,6 +1818,7 @@ async fn event_loop(
                     state.quick_open.visible,
                     state.search.visible,
                     &state.git,
+                    state.lsp.completion_visible,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -1705,6 +1904,54 @@ async fn event_loop(
         //      se muestre en el próximo frame.
         if let Err(e) = state.terminal.poll_output() {
             tracing::warn!(error = %e, "error al poll de output del terminal");
+        }
+
+        // 8.6. Poll de mensajes LSP (non-blocking).
+        //      Procesa diagnósticos, responses a hover/completion/definition.
+        if state.lsp.has_server() {
+            state.lsp.poll();
+
+            // Procesar go-to-definition si hay resultado pendiente
+            if let Some(def_result) = state.lsp.definition_result.take()
+                && let Some(path) = crate::lsp::uri_to_path(&def_result.uri)
+            {
+                match EditorState::open_file(&path) {
+                    Ok(editor) => {
+                        state.editor = editor;
+                        // Posicionar cursor en la definición
+                        let primary = state.editor.cursors.primary_mut();
+                        primary.position.line = def_result.line as usize;
+                        primary.position.col = def_result.col as usize;
+                        primary.sync_desired_col();
+                        primary.clear_selection();
+                        let pos = state.editor.cursors.primary().position;
+                        state.editor.viewport.ensure_cursor_visible(&pos);
+                        state.focused_panel = PanelId::Editor;
+                        state.update_status_cache();
+                        tracing::info!(
+                            path = %path.display(),
+                            line = def_result.line,
+                            col = def_result.col,
+                            "go-to-definition: archivo abierto"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error abriendo archivo de definition");
+                    }
+                }
+            }
+
+            // Actualizar LSP status message para el cursor actual
+            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
+                let cursor_line = state.editor.cursors.primary().position.line as u32;
+                state.lsp.update_status_for_cursor(&path, cursor_line);
+            }
+
+            // Flush de did_change pendiente (debounce)
+            let editor_ref = &state.editor;
+            state.lsp.flush_pending_change(|_uri| {
+                Some(buffer_full_text(editor_ref))
+            });
         }
 
         // 9. Registrar métricas del frame (solo reduce + render, no poll wait)

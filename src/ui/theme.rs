@@ -38,10 +38,8 @@ pub struct Theme {
     /// Acento alternativo — magenta/pink cyberpunk.
     pub fg_accent_alt: Color,
     /// Color de advertencia — amarillo cálido.
-    #[expect(dead_code, reason = "se usará para diagnósticos y warnings")]
     pub fg_warning: Color,
     /// Color de error — rojo brillante.
-    #[expect(dead_code, reason = "se usará para errores y diagnósticos")]
     pub fg_error: Color,
     /// Color de éxito — verde neón.
     #[expect(dead_code, reason = "se usará para estados de éxito")]
