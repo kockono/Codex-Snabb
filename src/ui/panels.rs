@@ -16,6 +16,7 @@ use crate::core::settings::SidebarSection;
 use crate::core::PanelId;
 use crate::editor::cursor::Position;
 use crate::editor::selection::Selection;
+use crate::editor::tabs::TabInfo;
 use crate::editor::EditorState;
 use crate::lsp;
 use crate::ui::theme::Theme;
@@ -315,10 +316,11 @@ fn render_explorer_entry<'a>(
 
 // ─── Editor Area ───────────────────────────────────────────────────────────────
 
-/// Renderiza el área del editor con contenido real del buffer.
+/// Renderiza el área del editor con barra de tabs y contenido real del buffer.
 ///
 /// Si el buffer está vacío y no tiene archivo asociado, muestra un placeholder.
 /// Si hay contenido, renderiza:
+/// - Barra de tabs (1 línea) con pestañas de archivos abiertos
 /// - Gutter con números de línea (ancho dinámico)
 /// - Separador `│`
 /// - Texto del buffer con viewport virtual (solo líneas visibles)
@@ -335,12 +337,28 @@ pub fn render_editor_area(
     focused: bool,
     editor: &EditorState,
     diagnostics: &[lsp::Diagnostic],
+    tab_infos: &[TabInfo],
 ) {
     let block = panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // ── Tab bar: 1 línea de pestañas arriba del contenido ──
+    let (tab_bar_area, content_area) = {
+        let split = Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Fill(1)])
+            .split(inner);
+        (split[0], split[1])
+    };
+    render_tab_bar(f, tab_bar_area, theme, tab_infos);
+
+    let inner = content_area;
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -700,6 +718,105 @@ fn char_style_with_diags(
         return diag_warning_style;
     }
     normal_style
+}
+
+// ─── Tab Bar ───────────────────────────────────────────────────────────────────
+
+/// Renderiza la barra de tabs del editor.
+///
+/// Cada tab muestra: `│ filename.ext ● │` (dirty) o `│ filename.ext × │` (activa, para cerrar).
+/// Tab activa: background `bg_active`, texto `fg_accent`.
+/// Tabs inactivas: background `bg_secondary`, texto `fg_secondary`.
+/// `●` (U+25CF) en `fg_warning` cuando dirty.
+/// `×` (U+00D7) solo en tab activa.
+/// Si las tabs no caben, se trunca con `…` al final.
+///
+/// No aloca strings innecesarios — los nombres vienen pre-computados en `TabInfo`.
+fn render_tab_bar(f: &mut Frame, area: Rect, theme: &Theme, tabs: &[TabInfo]) {
+    if area.width == 0 || tabs.is_empty() {
+        return;
+    }
+
+    let max_width = area.width as usize;
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(tabs.len() * 4);
+    let mut used_width: usize = 0;
+    let mut truncated = false;
+
+    for tab in tabs {
+        // Calcular ancho de esta tab: "│ " + name + " ●" o " ×" + " "
+        // Indicador: dirty → " ●", activa → " ×", limpia+inactiva → nada
+        let indicator = if tab.is_dirty {
+            " \u{25CF}" // " ●"
+        } else if tab.is_active {
+            " \u{00D7}" // " ×"
+        } else {
+            ""
+        };
+        // "│ " (2) + name.len() + indicator.len() + " " (1 padding derecho)
+        let tab_width = 2 + tab.name.len() + indicator.len() + 1;
+
+        // Verificar si cabe — si no, mostrar "…" y cortar
+        if used_width + tab_width + 1 > max_width {
+            // No cabe — agregar "…" si queda espacio
+            if used_width + 2 <= max_width {
+                spans.push(Span::styled(
+                    " \u{2026}",
+                    Style::default()
+                        .fg(theme.fg_secondary)
+                        .bg(theme.bg_secondary),
+                ));
+            }
+            truncated = true;
+            break;
+        }
+
+        let (bg, fg) = if tab.is_active {
+            (theme.bg_active, theme.fg_accent)
+        } else {
+            (theme.bg_secondary, theme.fg_secondary)
+        };
+
+        let tab_style = Style::default().fg(fg).bg(bg);
+        let sep_style = Style::default()
+            .fg(theme.border_unfocused)
+            .bg(theme.bg_secondary);
+
+        // Separador izquierdo
+        spans.push(Span::styled("\u{2502} ", sep_style));
+        // Nombre del archivo
+        spans.push(Span::styled(tab.name.as_str(), tab_style));
+
+        // Indicador dirty/close
+        if tab.is_dirty {
+            spans.push(Span::styled(
+                " \u{25CF}",
+                Style::default().fg(theme.fg_warning).bg(bg),
+            ));
+        } else if tab.is_active {
+            spans.push(Span::styled(
+                " \u{00D7}",
+                Style::default().fg(theme.fg_secondary).bg(bg),
+            ));
+        }
+
+        // Padding derecho
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        used_width += tab_width;
+    }
+
+    // Separador final si no truncamos
+    if !truncated && used_width < max_width {
+        spans.push(Span::styled(
+            "\u{2502}",
+            Style::default()
+                .fg(theme.border_unfocused)
+                .bg(theme.bg_secondary),
+        ));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(paragraph, area);
 }
 
 /// Cuenta la cantidad de dígitos decimales de un número.

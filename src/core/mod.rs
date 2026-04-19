@@ -93,6 +93,17 @@ pub enum Action {
     /// Cerrar el buffer activo.
     CloseBuffer,
 
+    // ── Tabs ──
+    /// Ir a la pestaña siguiente (Ctrl+Tab).
+    NextTab,
+    /// Ir a la pestaña anterior (Ctrl+Shift+Tab).
+    PrevTab,
+    /// Cerrar la pestaña activa (Ctrl+W).
+    CloseTab,
+    /// Cambiar a una pestaña por índice (click de mouse en tab).
+    #[expect(dead_code, reason = "se dispara via mouse click en tabs — no hay keybinding directo")]
+    SwitchTab(usize),
+
     // ── Comandos ──
     /// Abrir el command palette (Alt+Shift+P).
     OpenCommandPalette,

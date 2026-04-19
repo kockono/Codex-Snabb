@@ -123,9 +123,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
 
     // ── Editor area ──
     let editor_focused = focused == PanelId::Editor;
+    let editor = state.tabs.active();
+    // Pre-computar info de tabs para la barra de pestañas
+    let tab_infos = state.tabs.tab_info();
     // Obtener diagnósticos para el archivo actual (si hay LSP activo)
-    let current_diagnostics = state
-        .editor
+    let current_diagnostics = editor
         .buffer
         .file_path()
         .map(|p| state.lsp.diagnostics_for(p))
@@ -135,8 +137,9 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         layout.editor_area,
         theme,
         editor_focused,
-        &state.editor,
+        editor,
         current_diagnostics,
+        &tab_infos,
     );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
@@ -148,21 +151,24 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
-        // Inner area del editor (descontar bordes del Block)
+        // Inner area del editor (descontar bordes del Block + tab bar)
         let inner_x = layout.editor_area.x + 1;
-        let inner_y = layout.editor_area.y + 1;
-        let inner_h = layout.editor_area.height.saturating_sub(2) as usize;
+        // +1 borde superior, +1 tab bar = +2 desde editor_area.y
+        let tab_bar_offset: u16 = 1; // La barra de tabs ocupa 1 línea
+        let inner_y = layout.editor_area.y + 1 + tab_bar_offset;
+        let inner_h = layout.editor_area.height.saturating_sub(2 + tab_bar_offset) as usize;
 
-        let scroll = state.editor.viewport.scroll_offset;
-        let cursor_line = state.editor.cursors.primary().position.line;
-        let cursor_col = state.editor.cursors.primary().position.col;
+        let editor = state.tabs.active();
+        let scroll = editor.viewport.scroll_offset;
+        let cursor_line = editor.cursors.primary().position.line;
+        let cursor_col = editor.cursors.primary().position.col;
 
         // Verificar que el cursor está dentro del viewport visible
         if cursor_line >= scroll && cursor_line < scroll + inner_h {
             let visual_row = (cursor_line - scroll) as u16;
 
             // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
-            let total_lines = state.editor.buffer.line_count();
+            let total_lines = editor.buffer.line_count();
             let gutter_width = panels::digit_count(total_lines).max(4);
             let separator_width: u16 = 2;
             let text_offset = gutter_width as u16 + separator_width;
@@ -226,7 +232,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
-            panels::render_lsp_hover(f, layout.editor_area, theme, hover, &state.editor);
+            panels::render_lsp_hover(f, layout.editor_area, theme, hover, state.tabs.active());
         }
 
         // Completion dropdown
@@ -237,7 +243,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 theme,
                 &state.lsp.completions,
                 state.lsp.completion_selected,
-                &state.editor,
+                state.tabs.active(),
             );
         }
     }

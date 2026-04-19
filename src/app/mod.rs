@@ -31,6 +31,7 @@ use crate::core::command::CommandRegistry;
 use crate::core::settings::{KeybindingsState, SidebarSection};
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
+use crate::editor::tabs::TabState;
 use crate::git::branch_picker::BranchPicker;
 use crate::git::GitState;
 use crate::lsp::LspState;
@@ -64,8 +65,8 @@ pub struct AppState {
     pub sidebar_visible: bool,
     /// Si el bottom panel está visible.
     pub bottom_panel_visible: bool,
-    /// Estado del editor de texto.
-    pub editor: EditorState,
+    /// Estado de tabs/buffers del editor (múltiples archivos abiertos).
+    pub tabs: TabState,
     /// Estado del explorador de archivos.
     pub explorer: Option<ExplorerState>,
     /// Registry central de comandos del sistema.
@@ -133,7 +134,7 @@ impl AppState {
             metrics: Metrics::new(),
             sidebar_visible: true,
             bottom_panel_visible: true,
-            editor: EditorState::new(),
+            tabs: TabState::new(),
             explorer,
             commands,
             palette: PaletteState::new(),
@@ -156,6 +157,7 @@ impl AppState {
     /// uno, o con el directorio de trabajo actual como fallback.
     fn with_file(config: AppConfig, path: &std::path::Path) -> Result<Self> {
         let editor = EditorState::open_file(path)?;
+        let tabs = TabState::with_editor(editor);
         let status_file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -197,7 +199,7 @@ impl AppState {
             metrics: Metrics::new(),
             sidebar_visible: true,
             bottom_panel_visible: true,
-            editor,
+            tabs,
             explorer,
             commands,
             palette: PaletteState::new(),
@@ -223,7 +225,8 @@ impl AppState {
         self.status_line.clear();
         // Escribir sin format!() — usamos write! con buffer reutilizado
         use std::fmt::Write;
-        let primary = self.editor.cursors.primary();
+        let editor = self.tabs.active();
+        let primary = editor.cursors.primary();
         let _ = write!(
             self.status_line,
             "Ln {}, Col {}",
@@ -232,12 +235,12 @@ impl AppState {
         );
 
         // Actualizar nombre de archivo
-        if let Some(path) = self.editor.buffer.file_path() {
+        if let Some(path) = editor.buffer.file_path() {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy())
                 .unwrap_or_default();
-            if self.editor.buffer.is_dirty() {
+            if editor.buffer.is_dirty() {
                 self.status_file.clear();
                 let _ = write!(self.status_file, "{name} [+]");
             } else {
@@ -507,6 +510,16 @@ fn keymap(
     match (key.code, key.modifiers) {
         // Esc: si hay multicursor activo, limpiar; sino, quit
         (KeyCode::Esc, _) => return Action::ClearMultiCursor,
+        // Ctrl+Tab → siguiente pestaña
+        (KeyCode::Tab, KeyModifiers::CONTROL) => return Action::NextTab,
+        // Ctrl+Shift+Tab → pestaña anterior
+        (KeyCode::BackTab, mods)
+            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+        {
+            return Action::PrevTab;
+        }
+        // Ctrl+W → cerrar pestaña activa
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => return Action::CloseTab,
         (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
         (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
@@ -669,13 +682,13 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 state.lsp.completion_visible = false;
                 state.lsp.completions.clear();
             }
-            state.editor.insert_char(*ch);
+            state.tabs.active_mut().insert_char(*ch);
             state.update_status_cache();
             notify_lsp_change(state);
             vec![]
         }
         Action::DeleteChar => {
-            state.editor.delete_char();
+            state.tabs.active_mut().delete_char();
             state.update_status_cache();
             notify_lsp_change(state);
             vec![]
@@ -684,36 +697,36 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             // Cerrar completions al insertar newline
             state.lsp.completion_visible = false;
             state.lsp.completions.clear();
-            state.editor.insert_newline();
+            state.tabs.active_mut().insert_newline();
             state.update_status_cache();
             notify_lsp_change(state);
             vec![]
         }
         Action::MoveCursor(dir) => {
-            state.editor.move_cursor(*dir, false);
+            state.tabs.active_mut().move_cursor(*dir, false);
             state.update_status_cache();
             // Limpiar hover al mover cursor
             state.lsp.hover_content = None;
             vec![]
         }
         Action::MoveCursorSelecting(dir) => {
-            state.editor.move_cursor(*dir, true);
+            state.tabs.active_mut().move_cursor(*dir, true);
             state.update_status_cache();
             vec![]
         }
         Action::SelectNextOccurrence => {
-            state.editor.select_next_occurrence();
+            state.tabs.active_mut().select_next_occurrence();
             state.update_status_cache();
             vec![]
         }
         Action::ClearMultiCursor => {
-            if state.editor.has_multicursors() {
+            if state.tabs.active_mut().has_multicursors() {
                 // Con multicursores activos, Esc limpia los secundarios
-                state.editor.clear_multicursors();
+                state.tabs.active_mut().clear_multicursors();
                 vec![]
-            } else if state.editor.cursors.primary().has_selection() {
+            } else if state.tabs.active_mut().cursors.primary().has_selection() {
                 // Con selección activa, Esc limpia la selección
-                state.editor.cursors.primary_mut().clear_selection();
+                state.tabs.active_mut().cursors.primary_mut().clear_selection();
                 vec![]
             } else {
                 // Sin multicursor ni selección, Esc = Quit
@@ -722,37 +735,37 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             }
         }
         Action::MoveToLineStart => {
-            state.editor.move_to_line_start();
+            state.tabs.active_mut().move_to_line_start();
             state.update_status_cache();
             vec![]
         }
         Action::MoveToLineEnd => {
-            state.editor.move_to_line_end();
+            state.tabs.active_mut().move_to_line_end();
             state.update_status_cache();
             vec![]
         }
         Action::MoveToBufferStart => {
-            state.editor.move_to_buffer_start();
+            state.tabs.active_mut().move_to_buffer_start();
             state.update_status_cache();
             vec![]
         }
         Action::MoveToBufferEnd => {
-            state.editor.move_to_buffer_end();
+            state.tabs.active_mut().move_to_buffer_end();
             state.update_status_cache();
             vec![]
         }
         Action::Undo => {
-            state.editor.undo();
+            state.tabs.active_mut().undo();
             state.update_status_cache();
             vec![]
         }
         Action::Redo => {
-            state.editor.redo();
+            state.tabs.active_mut().redo();
             state.update_status_cache();
             vec![]
         }
         Action::SaveFile => {
-            match state.editor.save() {
+            match state.tabs.active_mut().save() {
                 Ok(()) => {
                     tracing::info!("archivo guardado");
                     state.update_status_cache();
@@ -782,16 +795,15 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 match explorer.toggle_selected() {
                     Ok(is_file) => {
                         if is_file {
-                            // Abrir archivo en el editor
+                            // Abrir archivo en una tab del editor
                             if let Some(path) = explorer.selected_path() {
-                                match EditorState::open_file(&path) {
-                                    Ok(editor) => {
-                                        state.editor = editor;
+                                match state.tabs.open_file(&path) {
+                                    Ok(()) => {
                                         state.focused_panel = PanelId::Editor;
                                         state.update_status_cache();
                                         // Notificar LSP del nuevo archivo abierto
                                         if state.lsp.has_server() {
-                                            let text = buffer_full_text(&state.editor);
+                                            let text = buffer_full_text(state.tabs.active());
                                             if let Err(e) = state.lsp.notify_open(&path, &text) {
                                                 tracing::warn!(error = %e, "error en LSP did_open");
                                             }
@@ -944,14 +956,13 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     relative_path
                 };
 
-                match EditorState::open_file(&absolute_path) {
-                    Ok(editor) => {
-                        state.editor = editor;
+                match state.tabs.open_file(&absolute_path) {
+                    Ok(()) => {
                         state.focused_panel = PanelId::Editor;
                         state.update_status_cache();
                         // Notificar LSP del nuevo archivo abierto
                         if state.lsp.has_server() {
-                            let text = buffer_full_text(&state.editor);
+                            let text = buffer_full_text(state.tabs.active());
                             if let Err(e) = state.lsp.notify_open(&absolute_path, &text) {
                                 tracing::warn!(error = %e, "error en LSP did_open");
                             }
@@ -1247,7 +1258,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
 
         // ── Acciones LSP ──
         Action::LspStart => {
-            if let Some(path) = state.editor.buffer.file_path() {
+            if let Some(path) = state.tabs.active().buffer.file_path() {
                 let ext = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -1258,8 +1269,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                         Ok(()) => {
                             tracing::info!(cmd, "LSP server arrancado");
                             // Notificar archivo actualmente abierto
-                            let text = buffer_full_text(&state.editor);
-                            let file_path = state.editor.buffer.file_path()
+                            let text = buffer_full_text(state.tabs.active());
+                            let file_path = state.tabs.active().buffer.file_path()
                                 .map(|p| p.to_path_buf());
                             if let Some(ref fp) = file_path
                                 && let Err(e) = state.lsp.notify_open(fp, &text)
@@ -1284,8 +1295,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::LspHover => {
-            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
-                let pos = state.editor.cursors.primary().position;
+            if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.tabs.active().cursors.primary().position;
                 if let Err(e) = state.lsp.request_hover(&path, pos.line as u32, pos.col as u32) {
                     tracing::warn!(error = %e, "error en LSP hover request");
                 }
@@ -1293,8 +1304,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::LspGotoDefinition => {
-            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
-                let pos = state.editor.cursors.primary().position;
+            if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.tabs.active().cursors.primary().position;
                 if let Err(e) = state.lsp.request_definition(&path, pos.line as u32, pos.col as u32) {
                     tracing::warn!(error = %e, "error en LSP definition request");
                 }
@@ -1302,8 +1313,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::LspCompletion => {
-            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
-                let pos = state.editor.cursors.primary().position;
+            if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
+                let pos = state.tabs.active().cursors.primary().position;
                 if let Err(e) = state.lsp.request_completion(&path, pos.line as u32, pos.col as u32) {
                     tracing::warn!(error = %e, "error en LSP completion request");
                 }
@@ -1338,7 +1349,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                         .to_string();
                     // Insertar cada carácter del texto de completion
                     for ch in text_to_insert.chars() {
-                        state.editor.insert_char(ch);
+                        state.tabs.active_mut().insert_char(ch);
                     }
                     state.update_status_cache();
                 }
@@ -1494,11 +1505,36 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de tabs ──
+        Action::NextTab => {
+            state.tabs.next_tab();
+            state.update_status_cache();
+            tracing::debug!(tab = state.tabs.active_index(), "tab siguiente");
+            vec![]
+        }
+        Action::PrevTab => {
+            state.tabs.prev_tab();
+            state.update_status_cache();
+            tracing::debug!(tab = state.tabs.active_index(), "tab anterior");
+            vec![]
+        }
+        Action::CloseTab | Action::CloseBuffer => {
+            state.tabs.close_active();
+            state.update_status_cache();
+            tracing::debug!(tabs = state.tabs.tab_count(), "tab cerrada");
+            vec![]
+        }
+        Action::SwitchTab(index) => {
+            state.tabs.switch_to(*index);
+            state.update_status_cache();
+            tracing::debug!(tab = *index, "switch a tab");
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
-        | Action::OpenFile(_)
-        | Action::CloseBuffer => vec![],
+        | Action::OpenFile(_) => vec![],
     }
 }
 
@@ -1519,8 +1555,8 @@ fn notify_lsp_change(state: &mut AppState) {
     if !state.lsp.has_server() {
         return;
     }
-    if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
-        let text = buffer_full_text(&state.editor);
+    if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
+        let text = buffer_full_text(state.tabs.active());
         if let Err(e) = state.lsp.notify_change(&path, &text) {
             tracing::warn!(error = %e, "error en LSP did_change");
         }
@@ -1569,13 +1605,12 @@ fn navigate_to_search_match(state: &mut AppState) {
     let target_col = m.match_start;
 
     // Verificar si necesitamos abrir otro archivo
-    let needs_open = state.editor.buffer.file_path()
+    let needs_open = state.tabs.active().buffer.file_path()
         .is_none_or(|current| current != abs_path);
 
     if needs_open {
-        match EditorState::open_file(&abs_path) {
-            Ok(editor) => {
-                state.editor = editor;
+        match state.tabs.open_file(&abs_path) {
+            Ok(()) => {
                 tracing::info!(path = %abs_path.display(), "archivo abierto desde search");
             }
             Err(e) => {
@@ -1586,18 +1621,19 @@ fn navigate_to_search_match(state: &mut AppState) {
     }
 
     // Posicionar cursor
-    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let max_line = state.tabs.active().buffer.line_count().saturating_sub(1);
     let clamped_line = target_line.min(max_line);
-    let max_col = state.editor.buffer.line_len(clamped_line);
+    let max_col = state.tabs.active().buffer.line_len(clamped_line);
     let clamped_col = target_col.min(max_col);
 
-    let primary = state.editor.cursors.primary_mut();
+    let editor = state.tabs.active_mut();
+    let primary = editor.cursors.primary_mut();
     primary.position.line = clamped_line;
     primary.position.col = clamped_col;
     primary.sync_desired_col();
     primary.clear_selection();
-    let pos = state.editor.cursors.primary().position;
-    state.editor.viewport.ensure_cursor_visible(&pos);
+    let pos = state.tabs.active().cursors.primary().position;
+    state.tabs.active_mut().viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 }
 
@@ -1803,10 +1839,9 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
             tracing::error!(error = %e, "error en toggle de explorer por mouse");
         }
     } else {
-        // Abrir archivo en el editor
-        match EditorState::open_file(&entry_path) {
-            Ok(editor) => {
-                state.editor = editor;
+        // Abrir archivo en una tab del editor
+        match state.tabs.open_file(&entry_path) {
+            Ok(()) => {
                 state.focused_panel = PanelId::Editor;
                 state.update_status_cache();
                 tracing::info!(path = %entry_path.display(), "archivo abierto por mouse click");
@@ -1818,7 +1853,7 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
     }
 }
 
-/// Procesa click en el editor — mover cursor a la posición clickeada.
+/// Procesa click en el editor — mover cursor o cambiar tab.
 fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
     // Calcular inner area del editor (descontar bordes del Block)
     let inner_y = layout.editor_area.y + 1;
@@ -1829,12 +1864,27 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
         return; // Click en borde
     }
 
-    // Línea en el buffer = viewport offset + fila visual
-    let visual_row = (row - inner_y) as usize;
-    let target_line = state.editor.viewport.scroll_offset + visual_row;
+    // ── Click en la barra de tabs (primera fila del inner area) ──
+    let tab_bar_row = inner_y;
+    if row == tab_bar_row {
+        resolve_tab_click(state, col, inner_x);
+        return;
+    }
+
+    // Ajustar coordenadas: el contenido empieza 1 fila después de la tab bar
+    let content_y = inner_y + 1;
+    if row < content_y {
+        return;
+    }
+
+    let editor = state.tabs.active_mut();
+
+    // Línea en el buffer = viewport offset + fila visual (relativa al contenido, no al inner)
+    let visual_row = (row - content_y) as usize;
+    let target_line = editor.viewport.scroll_offset + visual_row;
 
     // Columna en el buffer = col relativo al inner area - gutter dinámico
-    let gutter = editor_gutter_width(state.editor.buffer.line_count());
+    let gutter = editor_gutter_width(editor.buffer.line_count());
     let text_x = inner_x + gutter;
     let target_col = if col >= text_x {
         (col - text_x) as usize
@@ -1843,14 +1893,14 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
     };
 
     // Clampear a límites del buffer
-    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let max_line = editor.buffer.line_count().saturating_sub(1);
     let clamped_line = target_line.min(max_line);
-    let max_col = state.editor.buffer.line_len(clamped_line);
+    let max_col = editor.buffer.line_len(clamped_line);
     let clamped_col = target_col.min(max_col);
 
     // Limpiar cursores secundarios al hacer click
-    state.editor.cursors.clear_secondary();
-    let primary = state.editor.cursors.primary_mut();
+    editor.cursors.clear_secondary();
+    let primary = editor.cursors.primary_mut();
     primary.position.line = clamped_line;
     primary.position.col = clamped_col;
     primary.sync_desired_col();
@@ -1862,11 +1912,53 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
         col: clamped_col,
     };
     primary.selection = Some(crate::editor::selection::Selection::new(click_pos, click_pos));
-    let pos = state.editor.cursors.primary().position;
-    state.editor.viewport.ensure_cursor_visible(&pos);
+    let pos = editor.cursors.primary().position;
+    editor.viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 
     tracing::debug!(line = clamped_line, col = clamped_col, "mouse click → cursor editor");
+}
+
+/// Resuelve qué tab fue clickeada y ejecuta la acción correspondiente.
+///
+/// Recorre las tabs pre-computadas calculando los anchos acumulados
+/// para determinar cuál tab contiene la columna clickeada.
+/// Click en `×` de tab activa → cerrar tab.
+/// Click en cualquier parte de una tab → cambiar a esa tab.
+fn resolve_tab_click(state: &mut AppState, col: u16, inner_x: u16) {
+    let tab_infos = state.tabs.tab_info();
+    let click_col = col.saturating_sub(inner_x) as usize;
+
+    let mut accumulated: usize = 0;
+    for (i, tab) in tab_infos.iter().enumerate() {
+        // Mismo cálculo que render_tab_bar:
+        // "│ " (2) + name.len() + indicator.len() + " " (1)
+        let has_indicator = tab.is_dirty || tab.is_active;
+        let indicator_len: usize = if has_indicator { 2 } else { 0 };
+        let tab_width = 2 + tab.name.len() + indicator_len + 1;
+
+        if click_col >= accumulated && click_col < accumulated + tab_width {
+            // Click cayó en esta tab
+            if tab.is_active && !tab.is_dirty {
+                // Verificar si clickeó en la zona del "×" (últimos 2 chars antes del padding)
+                let close_start = accumulated + 2 + tab.name.len();
+                if click_col >= close_start && click_col < close_start + 2 {
+                    // Click en el ×: cerrar tab
+                    state.tabs.close_active();
+                    state.update_status_cache();
+                    tracing::debug!("tab cerrada via mouse click");
+                    return;
+                }
+            }
+            // Cambiar a esta tab
+            state.tabs.switch_to(i);
+            state.update_status_cache();
+            tracing::debug!(tab = i, "tab seleccionada via mouse click");
+            return;
+        }
+
+        accumulated += tab_width;
+    }
 }
 
 /// Procesa drag del mouse — selección de texto arrastrando.
@@ -1890,21 +1982,23 @@ fn reduce_mouse_drag(state: &mut AppState, col: u16, row: u16) {
 
 /// Procesa drag en el editor — extiende selección desde anchor hasta posición del drag.
 fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
-    // Calcular inner area del editor (descontar bordes del Block)
-    let inner_y = layout.editor_area.y + 1;
+    // Calcular inner area del editor (descontar bordes del Block + tab bar)
+    let inner_y = layout.editor_area.y + 1 + 1; // +1 borde, +1 tab bar
     let inner_x = layout.editor_area.x + 1;
-    let inner_height = layout.editor_area.height.saturating_sub(2);
+    let inner_height = layout.editor_area.height.saturating_sub(3); // bordes + tab bar
 
     // Clampear row al rango visible del editor para permitir scroll
     // cuando el drag sale por arriba o abajo del viewport
     let clamped_row = row.clamp(inner_y, inner_y + inner_height.saturating_sub(1));
 
+    let editor = state.tabs.active_mut();
+
     // Línea en el buffer = viewport offset + fila visual
     let visual_row = (clamped_row - inner_y) as usize;
-    let target_line = state.editor.viewport.scroll_offset + visual_row;
+    let target_line = editor.viewport.scroll_offset + visual_row;
 
     // Columna en el buffer = col relativo al inner area - gutter dinámico
-    let gutter = editor_gutter_width(state.editor.buffer.line_count());
+    let gutter = editor_gutter_width(editor.buffer.line_count());
     let text_x = inner_x + gutter;
     let target_col = if col >= text_x {
         (col - text_x) as usize
@@ -1913,12 +2007,12 @@ fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, 
     };
 
     // Clampear a límites del buffer
-    let max_line = state.editor.buffer.line_count().saturating_sub(1);
+    let max_line = editor.buffer.line_count().saturating_sub(1);
     let clamped_line = target_line.min(max_line);
-    let max_col = state.editor.buffer.line_len(clamped_line);
+    let max_col = editor.buffer.line_len(clamped_line);
     let clamped_col = target_col.min(max_col);
 
-    let primary = state.editor.cursors.primary_mut();
+    let primary = editor.cursors.primary_mut();
 
     // Verificar que hay una selección activa (seteada por el click previo)
     if primary.selection.is_none() {
@@ -1932,8 +2026,8 @@ fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, 
     primary.extend_selection();
 
     // Scroll automático si el drag lleva el cursor fuera del viewport
-    let pos = state.editor.cursors.primary().position;
-    state.editor.viewport.ensure_cursor_visible(&pos);
+    let pos = editor.cursors.primary().position;
+    editor.viewport.ensure_cursor_visible(&pos);
     state.update_status_cache();
 
     tracing::trace!(line = clamped_line, col = clamped_col, "mouse drag → selección editor");
@@ -1984,16 +2078,17 @@ fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: Scro
             }
         }
         PanelId::Editor => {
-            let line_count = state.editor.buffer.line_count();
+            let editor = state.tabs.active_mut();
+            let line_count = editor.buffer.line_count();
             match direction {
                 ScrollDirection::Up => {
-                    state.editor.viewport.scroll_offset =
-                        state.editor.viewport.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    editor.viewport.scroll_offset =
+                        editor.viewport.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                 }
                 ScrollDirection::Down => {
                     let max_scroll = line_count.saturating_sub(1);
-                    state.editor.viewport.scroll_offset =
-                        (state.editor.viewport.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                    editor.viewport.scroll_offset =
+                        (editor.viewport.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
                 }
             }
         }
@@ -2179,12 +2274,16 @@ async fn event_loop(
 
         // 7.5. Actualizar viewport del editor con el tamaño real del editor area.
         //      Se hace ANTES del render para que ensure_cursor_visible funcione
-        //      con dimensiones correctas. Descontar bordes (2) + gutter dinámico.
+        //      con dimensiones correctas. Descontar bordes (2) + tab bar (1) + gutter dinámico.
         {
-            let editor_inner_h = layout.editor_area.height.saturating_sub(2) as usize;
+            // Restar 1 línea para la barra de tabs (siempre visible)
+            let tab_bar_lines: usize = 1;
+            let editor_inner_h = (layout.editor_area.height.saturating_sub(2) as usize)
+                .saturating_sub(tab_bar_lines);
             let editor_inner_w = layout.editor_area.width.saturating_sub(2) as usize;
             // Gutter width dinámico: dígitos del total de líneas (mín 4) + 2 (separador)
-            let total_lines = state.editor.buffer.line_count();
+            let editor = state.tabs.active_mut();
+            let total_lines = editor.buffer.line_count();
             let gutter_digits = {
                 let mut count = 0usize;
                 let mut val = total_lines;
@@ -2195,7 +2294,7 @@ async fn event_loop(
             };
             let gutter_total = gutter_digits.max(4) + 2; // gutter + separator
             let text_width = editor_inner_w.saturating_sub(gutter_total);
-            state.editor.viewport.update_size(text_width, editor_inner_h);
+            editor.viewport.update_size(text_width, editor_inner_h);
         }
 
         // 8. Render frame actual
@@ -2219,17 +2318,16 @@ async fn event_loop(
             if let Some(def_result) = state.lsp.definition_result.take()
                 && let Some(path) = crate::lsp::uri_to_path(&def_result.uri)
             {
-                match EditorState::open_file(&path) {
-                    Ok(editor) => {
-                        state.editor = editor;
+                match state.tabs.open_file(&path) {
+                    Ok(()) => {
                         // Posicionar cursor en la definición
-                        let primary = state.editor.cursors.primary_mut();
+                        let primary = state.tabs.active_mut().cursors.primary_mut();
                         primary.position.line = def_result.line as usize;
                         primary.position.col = def_result.col as usize;
                         primary.sync_desired_col();
                         primary.clear_selection();
-                        let pos = state.editor.cursors.primary().position;
-                        state.editor.viewport.ensure_cursor_visible(&pos);
+                        let pos = state.tabs.active().cursors.primary().position;
+                        state.tabs.active_mut().viewport.ensure_cursor_visible(&pos);
                         state.focused_panel = PanelId::Editor;
                         state.update_status_cache();
                         tracing::info!(
@@ -2246,13 +2344,13 @@ async fn event_loop(
             }
 
             // Actualizar LSP status message para el cursor actual
-            if let Some(path) = state.editor.buffer.file_path().map(|p| p.to_path_buf()) {
-                let cursor_line = state.editor.cursors.primary().position.line as u32;
+            if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
+                let cursor_line = state.tabs.active().cursors.primary().position.line as u32;
                 state.lsp.update_status_for_cursor(&path, cursor_line);
             }
 
             // Flush de did_change pendiente (debounce)
-            let editor_ref = &state.editor;
+            let editor_ref = state.tabs.active();
             state.lsp.flush_pending_change(|_uri| {
                 Some(buffer_full_text(editor_ref))
             });
