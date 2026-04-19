@@ -220,3 +220,199 @@
 11. LSP austero
 
 Ese orden no es capricho. Protege el corazón del sistema: primero control del costo, después edición, después productividad, después profundidad.
+
+---
+
+## Features estilo VS Code (Post-MVP Enhancement)
+
+> Estas épicas mejoran la UX visual y funcional del IDE para acercarlo a la experiencia VS Code.
+> Priorizadas por impacto visual y complejidad.
+
+---
+
+### Épica 12 — Syntax Highlighting (Post-MVP — Impacto Alto)
+
+El cambio visual más grande. Sin colores, parece Notepad.
+
+- [ ] Evaluar crate de highlighting: `tree-sitter` vs `syntect` (benchmark RAM/CPU)
+- [ ] Implementar tokenización por línea con cache
+- [ ] Mapear tokens a colores del theme cyberpunk
+- [ ] Soportar lenguajes iniciales: Rust, Python, TypeScript, JSON, TOML, Markdown
+- [ ] Renderizar tokens coloreados en el viewport del editor
+- [ ] Invalidar cache de tokens solo en líneas modificadas
+- [ ] Asegurar que no se tokeniza fuera del viewport visible
+- [ ] Respetar budgets: tokenización NO debe exceder 5ms por frame
+
+**Depende de:** Épica 2
+
+---
+
+### Épica 13 — Indent Guides y Bracket Matching (Post-MVP — Impacto Alto)
+
+- [ ] Renderizar líneas verticales `│` grises en cada nivel de indentación
+- [ ] Detectar nivel de indentación por línea (tabs vs spaces, configurable)
+- [ ] Highlight del par de bracket cuando el cursor está sobre `{`, `(`, `[`, `}`, `)`, `]`
+- [ ] Buscar el bracket matching hacia adelante y atrás en el buffer
+- [ ] Resaltar ambos brackets con color accent
+- [ ] Indicar bracket sin par con color de error
+
+**Depende de:** Épica 2
+
+---
+
+### Épica 14 — Auto-close y Auto-indent (Post-MVP — Impacto Alto)
+
+- [ ] Auto-close de brackets: `(` → `()`, `{` → `{}`, `[` → `[]`
+- [ ] Auto-close de quotes: `"` → `""`, `'` → `''`, `` ` `` → `` ` `` `` ` ``
+- [ ] No auto-close si el siguiente carácter ya es el cierre
+- [ ] Auto-indent en Enter: mantener indentación de la línea anterior
+- [ ] Indent extra después de `{`, `:`, `(` al final de línea
+- [ ] Dedent en `}` → reducir indentación automáticamente
+- [ ] Tab key: insertar indentación (spaces o tabs según config)
+- [ ] Shift+Tab: dedent de la línea/selección actual
+
+**Depende de:** Épica 2
+
+---
+
+### Épica 15 — Breadcrumbs y File Icons (Post-MVP — Impacto Alto)
+
+- [ ] Renderizar breadcrumbs debajo de las tabs: `src > ui > panels.rs`
+- [ ] Parsear el path del archivo activo y mostrarlo como segmentos
+- [ ] Cada segmento clickeable (futuro: navegar al directorio)
+- [ ] Iconos por extensión en el explorer:
+  - `.rs` → `🦀` o char representativo
+  - `.toml` → `⚙`
+  - `.md` → `📝`
+  - `.json` → `{}`
+  - `.py` → `🐍`
+  - `.ts`/`.js` → `TS`/`JS`
+  - Carpetas: `📁` (cerrada) / `📂` (abierta)
+  - Default: `📄`
+- [ ] Iconos en las tabs también (al lado del nombre del archivo)
+
+**Depende de:** Épica 3, Épica (tabs)
+
+---
+
+### Épica 16 — Git Decorations en Explorer (Post-MVP — Impacto Medio)
+
+- [ ] Colorear archivos modificados en el explorer según estado Git
+- [ ] Modificados: amarillo/naranja
+- [ ] Nuevos/untracked: verde
+- [ ] Eliminados: rojo (tachado o dimmed)
+- [ ] Ignorados: gris dimmed
+- [ ] Indicar en el nombre del directorio si contiene archivos modificados
+- [ ] Refrescar decoraciones al cambiar de branch o después de stage/commit
+
+**Depende de:** Épica 3, Épica 9
+
+---
+
+### Épica 17 — Ctrl+H Find & Replace en archivo + Ctrl+G Go to Line (Post-MVP — Impacto Medio)
+
+- [ ] Ctrl+H: abrir barra de búsqueda/replace dentro del archivo actual (no global)
+- [ ] Búsqueda inline con highlight de matches en el editor
+- [ ] Match case, whole word, regex toggles (reusar lógica de search global)
+- [ ] Replace por match y replace all
+- [ ] Ctrl+G: modal "Go to Line..." con input numérico
+- [ ] Enter → mover cursor a esa línea y centrar viewport
+- [ ] Validar rango (1 a line_count)
+
+**Depende de:** Épica 2, Épica 6
+
+---
+
+### Épica 18 — Problems Panel y Notifications (Post-MVP — Impacto Medio)
+
+- [ ] Panel de problemas en el bottom panel (tab junto a Terminal)
+- [ ] Listar errores y warnings del LSP agrupados por archivo
+- [ ] Click en un problema → abrir archivo y mover cursor a la línea
+- [ ] Contador de errores/warnings en la status bar
+- [ ] Sistema de notificaciones/toasts en esquina inferior derecha
+- [ ] "File saved" → toast 2 segundos
+- [ ] "Branch switched to X" → toast 2 segundos
+- [ ] "LSP: rust-analyzer started" → toast
+- [ ] Auto-dismiss después de timeout configurable
+
+**Depende de:** Épica 10, Épica 7
+
+---
+
+### Épica 19 — Outline/Symbols Panel (Post-MVP — Impacto Medio)
+
+- [ ] Panel de outline en sidebar (nuevo icono en activity bar)
+- [ ] Listar símbolos del archivo actual: funciones, structs, enums, traits, etc.
+- [ ] Obtener símbolos del LSP (`textDocument/documentSymbol`)
+- [ ] Click en símbolo → mover cursor a su posición
+- [ ] Buscar/filtrar símbolos
+- [ ] Jerarquía: métodos dentro de structs/impls
+
+**Depende de:** Épica 10
+
+---
+
+### Épica 20 — Code Folding (Futuro — Impacto Medio)
+
+- [ ] Detectar regiones plegables por bloques `{}`, indentación, o marcadores
+- [ ] Indicador en el gutter: `▸` (colapsado) / `▾` (expandido)
+- [ ] Click en indicador o shortcut para colapsar/expandir
+- [ ] Ctrl+Shift+[ → colapsar bloque actual
+- [ ] Ctrl+Shift+] → expandir bloque actual
+- [ ] Colapsar muestra: `fn main() { ... }` (primera línea + `...`)
+- [ ] El viewport debe respetar líneas colapsadas
+
+**Depende de:** Épica 2, Épica 12
+
+---
+
+### Épica 21 — Split Editor (Futuro — Impacto Medio)
+
+- [ ] Dividir editor en 2 paneles lado a lado
+- [ ] Ctrl+\ → split horizontal
+- [ ] Cada panel tiene su propio tab bar y editor state
+- [ ] Click o Tab cambia foco entre splits
+- [ ] Abrir el mismo archivo en dos splits (views, no copies)
+- [ ] Cerrar un split restaura el layout single
+
+**Depende de:** Épica 2, Épica (tabs)
+
+---
+
+### Épica 22 — Word Wrap, Scrollbar y Pulido Visual (Futuro — Impacto Bajo)
+
+- [ ] Toggle word wrap (Alt+Z)
+- [ ] Scrollbar visual (indicador de posición en el borde derecho del editor)
+- [ ] Relative line numbers (toggle en settings)
+- [ ] Pin tabs (no se cierran con Ctrl+W)
+- [ ] Panel tabs en bottom panel (Terminal | Problems | Output)
+
+**Depende de:** Épica 2
+
+---
+
+### Épica 23 — Welcome Page y Context Menu (Futuro — Impacto Bajo)
+
+- [ ] Pantalla de bienvenida cuando no hay archivo abierto
+- [ ] Mostrar: nombre del IDE, shortcuts principales, archivos recientes, proyecto actual
+- [ ] Click derecho (context menu) en editor: cut, copy, paste, go to definition, find references
+- [ ] Click derecho en explorer: new file, new folder, rename, delete, copy path
+
+**Depende de:** Épica 2, Épica 3
+
+---
+
+### Orden recomendado de implementación post-MVP
+
+1. Syntax highlighting (Épica 12) — cambio visual más grande
+2. Indent guides + bracket matching (Épica 13) — fácil, impacto visual enorme
+3. Auto-close brackets + auto-indent (Épica 14) — se siente como IDE
+4. Breadcrumbs + file icons (Épica 15) — UX visual inmediata
+5. Git decorations en explorer (Épica 16) — colores en archivos
+6. Find/Replace en archivo + Go to Line (Épica 17) — funcionalidad esperada
+7. Problems panel + notifications (Épica 18) — feedback profesional
+8. Outline panel (Épica 19) — navegación de código
+9. Code folding (Épica 20) — para archivos grandes
+10. Split editor (Épica 21) — productividad avanzada
+11. Word wrap y pulido (Épica 22)
+12. Welcome page y context menu (Épica 23)
