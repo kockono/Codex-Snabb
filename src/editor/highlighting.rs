@@ -365,8 +365,18 @@ impl HighlightCache {
     ///
     /// Retorna `None` si la línea no está en el cache (fuera del viewport,
     /// dirty, o engine aún cargando). El caller renderiza texto plano como fallback.
-    pub fn get_line(&self, line: usize) -> Option<&[HighlightToken]> {
-        self.lines.get(&line).map(Vec::as_slice)
+    ///
+    /// Líneas marcadas como dirty (>= `dirty_from`) retornan `None` aunque tengan
+    /// tokens stale en cache. Esto fuerza al render a usar texto plano inmediatamente
+    /// durante el debounce, eliminando el lag perceptible al tipear.
+    pub fn get_line(&self, line_idx: usize) -> Option<&[HighlightToken]> {
+        // Si la línea está dirty, retornar None para que el render use plain text.
+        // Esto elimina el lag de 150ms: el carácter aparece inmediatamente en plain
+        // text, y los colores vuelven cuando syntect re-procesa tras el debounce.
+        if self.dirty_from.is_some_and(|from| line_idx >= from) {
+            return None;
+        }
+        self.lines.get(&line_idx).map(Vec::as_slice)
     }
 
     /// Si el cache está válido (no dirty en ninguna línea).
