@@ -17,30 +17,6 @@ La propuesta no es “meter VS Code entero en una TTY”. La propuesta es más d
 
 En otras palabras: una **TUI seria para trabajo diario**, hecha en Rust, donde performance y predictibilidad importan tanto como la UX.
 
-## Mockup ASCII
-
-```text
-┌ IDE-Rust ───────────────────────────────────────────────────────────────────────────┐
-│ Explorer                  │ editor.rs                                               │
-├───────────────────────────┬─────────────────────────────────────────────────────────┤
-│ ▸ src/                    │  12 fn reduce(state: &mut AppState, action: Action) {   │
-│   ▸ app/                  │  13     match action {                                  │
-│   ▸ core/                 │  14         Action::OpenPalette => { ... }              │
-│   ▸ ui/                   │  15         Action::ToggleSidebar => { ... }            │
-│ ▸ Cargo.toml              │  16     }                                               │
-│ ▸ architecture.md         │                                                         │
-│ ▸ roadmap.md              │  42 // viewport virtualizado + render incremental       │
-│                           │                                                         │
-├───────────────────────────┴─────────────────────────────────────────────────────────┤
-│ Search / Terminal / Git / Problems                                                  │
-│ > cargo test                                                                        │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│ NORMAL | editor.rs [+] | Ln 42, Col 7 | main | UTF-8                                │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-Ese layout no es marketing: coincide con la dirección visible del proyecto (`src/ui/layout.rs`, `src/ui/mod.rs`) y con la arquitectura documentada.
-
 ## Problema que intenta resolver
 
 Muchas herramientas de terminal son potentes, pero el flujo completo suele quedar repartido entre varios programas o interfaces austeras al punto de romper continuidad.
@@ -67,10 +43,6 @@ Todo eso sin aceptar como “normal” un consumo excesivo de RAM, CPU o renders
 - **anyhow** + **thiserror** para manejo de errores
 
 Referencia: `Cargo.toml`.
-
-## Arquitectura resumida
-
-La arquitectura objetivo está documentada en `architecture.md` y ya se refleja parcialmente en la estructura actual del proyecto.
 
 ### Flujo central
 
