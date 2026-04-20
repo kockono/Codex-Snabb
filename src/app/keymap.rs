@@ -32,6 +32,7 @@ pub(super) fn keymap(
     focused_panel: PanelId,
     palette_visible: bool,
     quick_open_visible: bool,
+    go_to_line_visible: bool,
     branch_picker_visible: bool,
     search_visible: bool,
     git_state: &GitState,
@@ -94,6 +95,17 @@ pub(super) fn keymap(
         };
     }
 
+    // ── Go to Line visible: captura dígitos, Enter, Esc ──
+    if go_to_line_visible {
+        return match key.code {
+            KeyCode::Esc => Action::GoToLineClose,
+            KeyCode::Enter => Action::GoToLineConfirm,
+            KeyCode::Backspace => Action::GoToLineDeleteChar,
+            KeyCode::Char(ch) if ch.is_ascii_digit() => Action::GoToLineInsertChar(ch),
+            _ => Action::Noop,
+        };
+    }
+
     // ── LSP Completion visible: captura navegación, Enter, Esc ──
     if lsp_completion_visible && focused_panel == PanelId::Editor {
         match (key.code, key.modifiers) {
@@ -140,6 +152,8 @@ pub(super) fn keymap(
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::QuickOpenUp,
             (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::QuickOpenDown,
             (KeyCode::Backspace, _) => Action::QuickOpenDeleteChar,
+            // ':' en Quick Open → switch a Go to Line mode
+            (KeyCode::Char(':'), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::OpenGoToLine,
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 Action::QuickOpenInsertChar(ch)
             }
@@ -312,6 +326,8 @@ pub(super) fn keymap(
         {
             return Action::OpenQuickOpen;
         }
+        // Ctrl+G abre Go to Line.
+        (KeyCode::Char('g'), KeyModifiers::CONTROL) => return Action::OpenGoToLine,
         _ => {}
     }
 
@@ -434,6 +450,7 @@ mod tests {
             PanelId::Editor,
             false, // palette
             false, // quick_open
+            false, // go_to_line
             false, // branch_picker
             false, // search
             &GitState::new(),
@@ -452,6 +469,7 @@ mod tests {
         let action = keymap(
             &event,
             PanelId::Editor,
+            false,
             false,
             false,
             false,
@@ -479,6 +497,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &GitState::new(),
             false,
             false,
@@ -495,6 +514,7 @@ mod tests {
         let action = keymap(
             &event,
             PanelId::Search,
+            false,
             false,
             false,
             false,
@@ -519,6 +539,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &GitState::new(),
             false,
             false,
@@ -539,6 +560,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &GitState::new(),
             false,
             false,
@@ -546,5 +568,110 @@ mod tests {
             &commands,
         );
         assert_eq!(action, Action::PaletteConfirm);
+    }
+
+    #[test]
+    fn ctrl_g_returns_open_go_to_line() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+        );
+        assert_eq!(action, Action::OpenGoToLine);
+    }
+
+    #[test]
+    fn colon_in_quick_open_returns_open_go_to_line() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char(':'), KeyModifiers::SHIFT);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            true, // quick_open_visible
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+        );
+        assert_eq!(action, Action::OpenGoToLine);
+    }
+
+    #[test]
+    fn digit_in_go_to_line_returns_insert_char() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('5'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            true, // go_to_line_visible
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+        );
+        assert_eq!(action, Action::GoToLineInsertChar('5'));
+    }
+
+    #[test]
+    fn enter_in_go_to_line_returns_confirm() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            true, // go_to_line_visible
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+        );
+        assert_eq!(action, Action::GoToLineConfirm);
+    }
+
+    #[test]
+    fn esc_in_go_to_line_returns_close() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            true, // go_to_line_visible
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+        );
+        assert_eq!(action, Action::GoToLineClose);
     }
 }

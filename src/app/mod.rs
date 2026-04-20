@@ -41,6 +41,7 @@ use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
 use crate::workspace::ExplorerState;
 use crate::workspace::QuickOpenState;
+use crate::workspace::quick_open::GoToLineState;
 
 // ─── AppState ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,8 @@ pub struct AppState {
     pub palette: PaletteState,
     /// Estado del quick open (overlay Ctrl+P).
     pub quick_open: QuickOpenState,
+    /// Estado del modal Go to Line (Ctrl+G).
+    pub go_to_line: GoToLineState,
     /// Estado del panel de búsqueda global (Ctrl+Shift+F).
     pub search: SearchState,
     /// Estado de la terminal integrada (PTY + scrollback).
@@ -150,6 +153,7 @@ impl AppState {
             commands,
             palette: PaletteState::new(),
             quick_open,
+            go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
@@ -221,6 +225,7 @@ impl AppState {
             commands,
             palette: PaletteState::new(),
             quick_open,
+            go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
             git,
@@ -621,6 +626,39 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Acciones de Go to Line ──
+        Action::OpenGoToLine => {
+            // Cerrar quick open si estaba abierto
+            state.quick_open.close();
+            let total = state.tabs.active().buffer.line_count();
+            state.go_to_line.open(total);
+            tracing::debug!("go to line abierto");
+            vec![]
+        }
+        Action::GoToLineInsertChar(ch) => {
+            state.go_to_line.push_char(*ch);
+            vec![]
+        }
+        Action::GoToLineDeleteChar => {
+            state.go_to_line.pop_char();
+            vec![]
+        }
+        Action::GoToLineConfirm => {
+            if let Some(line_1indexed) = state.go_to_line.parsed_line() {
+                // go_to_line usa 1-indexed; cursor es 0-indexed
+                let target = line_1indexed.saturating_sub(1);
+                state.tabs.active_mut().go_to_line(target);
+                state.update_status_cache();
+            }
+            state.go_to_line.close();
+            vec![]
+        }
+        Action::GoToLineClose => {
+            state.go_to_line.close();
+            tracing::debug!("go to line cerrado");
+            vec![]
+        }
+
         // ── Acciones de búsqueda global ──
         Action::OpenGlobalSearch => {
             // Abrir panel de búsqueda: hacer sidebar visible, foco en Search
@@ -931,6 +969,20 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::GitCommitDeleteChar => {
             state.git.commit_input.pop();
+            vec![]
+        }
+        Action::GitFetch => {
+            let root = get_workspace_root(state);
+            match crate::git::commands::fetch(&root) {
+                Ok(()) => {
+                    // Re-fetch ahead/behind después del fetch
+                    state.git.refresh(&root);
+                    tracing::info!("git fetch completado");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "git fetch falló");
+                }
+            }
             vec![]
         }
 
@@ -1378,6 +1430,7 @@ async fn event_loop(
                     state.focused_panel,
                     state.palette.visible,
                     state.quick_open.visible,
+                    state.go_to_line.visible,
                     state.branch_picker.visible,
                     state.search.visible,
                     &state.git,
