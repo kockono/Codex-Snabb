@@ -9,7 +9,7 @@
 //! Stateless renderer — recibe datos pre-computados, no aloca en render.
 
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use crate::core::settings::KeybindingsState;
+use crate::ui::layout::{self, IdeLayout};
 use crate::ui::theme::Theme;
 
 /// Renderiza el overlay de settings (keybindings editor).
@@ -27,18 +28,19 @@ use crate::ui::theme::Theme;
 /// - Footer con atajos contextuales
 ///
 /// No aloca strings en el render — usa referencias y literales.
-pub fn render_settings(f: &mut Frame, area: Rect, state: &KeybindingsState, theme: &Theme) {
+pub fn render_settings(f: &mut Frame, layout: &IdeLayout, state: &KeybindingsState, theme: &Theme) {
     if !state.visible {
         return;
     }
 
-    // ── Calcular dimensiones del overlay (80% × 70%) ──
-    let overlay_width = (area.width * 80 / 100).min(area.width).max(40);
-    let overlay_height = (area.height * 70 / 100).min(area.height).max(10);
-    let overlay_x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
-    let overlay_y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
-
-    let overlay_area = Rect::new(overlay_x, overlay_y, overlay_width, overlay_height);
+    // ── Calcular dimensiones del overlay via modal_rect ──
+    // Settings es más alto — usa la mayor parte del espacio vertical (max 30 líneas)
+    let modal_height = (layout
+        .status_bar
+        .y
+        .saturating_sub(layout.title_bar.bottom()))
+    .clamp(10, 30);
+    let overlay_area = layout::modal_rect(layout, modal_height);
 
     // Clear el área bajo el overlay
     f.render_widget(Clear, overlay_area);
