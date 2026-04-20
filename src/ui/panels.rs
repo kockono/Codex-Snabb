@@ -12,6 +12,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::editor::highlighting::HighlightToken;
+
 use crate::core::settings::SidebarSection;
 use crate::core::PanelId;
 use crate::editor::cursor::Position;
@@ -519,6 +521,9 @@ pub fn render_editor_area(
                     })
                     .collect();
 
+                // Obtener tokens de highlighting cacheados (si existen)
+                let highlight_tokens = editor.highlight_cache.get_line(buf_line_idx);
+
                 let text_spans = render_line_with_selections(
                     display_text,
                     buf_line_idx,
@@ -530,6 +535,9 @@ pub fn render_editor_area(
                     secondary_cursor_style,
                     diag_error_style,
                     diag_warning_style,
+                    highlight_tokens,
+                    is_cursor_line,
+                    active_line_bg,
                 );
                 spans.extend(text_spans);
             }
@@ -550,11 +558,24 @@ pub fn render_editor_area(
     f.render_widget(paragraph, inner);
 }
 
-/// Renderiza una línea de texto con highlights de selección, cursores y diagnósticos.
+/// Convierte un color de syntect a un color de ratatui.
 ///
-/// Divide la línea en segmentos según las selecciones activas, posiciones
-/// de cursores secundarios y rangos de diagnósticos. Cada segmento recibe
-/// el estilo apropiado. No usa `format!()` — construye spans directamente.
+/// Mapeo directo RGB → RGB. No aloca.
+fn syntect_color_to_ratatui(color: syntect::highlighting::Color) -> Color {
+    Color::Rgb(color.r, color.g, color.b)
+}
+
+/// Renderiza una línea de texto con syntax highlighting, selecciones, cursores y diagnósticos.
+///
+/// Capas de estilo (de fondo a frente):
+/// 1. **Syntax highlighting** (foreground del token) — base visual
+/// 2. **Línea activa** (background sutil) — indica cursor
+/// 3. **Selección** (background de selección) — override de bg
+/// 4. **Diagnósticos** (underline con color de severidad) — se agrega al estilo
+/// 5. **Cursores secundarios** (reversed) — prioridad visual máxima
+///
+/// Divide la línea en segmentos según cambios de estilo y los emite como spans.
+/// No usa `format!()` — construye spans directamente.
 #[expect(
     clippy::too_many_arguments,
     reason = "render helper — pasar struct de estilos agregaría complejidad sin beneficio"
@@ -570,6 +591,9 @@ fn render_line_with_selections<'a>(
     cursor_style: Style,
     diag_error_style: Style,
     diag_warning_style: Style,
+    highlight_tokens: Option<&[HighlightToken]>,
+    is_cursor_line: bool,
+    active_line_bg: Color,
 ) -> Vec<Span<'a>> {
     let text_len = text.len();
     if text_len == 0 {
@@ -577,13 +601,11 @@ fn render_line_with_selections<'a>(
     }
 
     // Determinar qué columnas están seleccionadas y cuáles tienen cursor secundario
-    // Usar un enfoque eficiente: construir rangos de selección en esta línea
     let mut selected_ranges: Vec<(usize, usize)> = Vec::new();
     for sel in selections {
         let start = sel.start();
         let end = sel.end();
 
-        // Verificar si esta selección toca esta línea
         if start.line <= line_idx && end.line >= line_idx {
             let sel_start_col = if start.line == line_idx { start.col } else { 0 };
             let sel_end_col = if end.line == line_idx {
@@ -604,17 +626,35 @@ fn render_line_with_selections<'a>(
         .map(|p| p.col)
         .collect();
 
-    // Si no hay selecciones, cursores secundarios, ni diagnósticos, renderizar normal
-    if selected_ranges.is_empty() && cursor_cols.is_empty() && diagnostics.is_empty() {
-        // CLONE: necesario — text es un slice del buffer, Span toma ownership
+    let has_overlays =
+        !selected_ranges.is_empty() || !cursor_cols.is_empty() || !diagnostics.is_empty();
+
+    // ── Fast path: highlight tokens sin overlays ──
+    // Renderizar directamente los tokens coloreados sin char-by-char iteration.
+    if !has_overlays {
+        if let Some(tokens) = highlight_tokens {
+            return render_highlight_tokens_fast(
+                tokens,
+                text_len,
+                is_cursor_line,
+                active_line_bg,
+                normal_style,
+            );
+        }
+        // Sin highlight ni overlays — color uniforme
+        // CLONE: necesario — text es slice del buffer, Span toma ownership
         return vec![Span::styled(text.to_string(), normal_style)];
     }
 
-    // Construir spans divididos por selección, cursores y diagnósticos.
-    // Estrategia: recorrer por char boundaries (byte offsets válidos),
-    // agrupar segmentos contiguos con el mismo estilo para minimizar spans.
-    // IMPORTANTE: iterar por char_indices() garantiza que nunca cortamos
-    // en medio de un carácter multi-byte (UTF-8 de 2-4 bytes).
+    // ── Slow path: char-by-char con overlays + syntax highlight ──
+    // Pre-computar lookup de colores de syntax por byte offset.
+    // Construye un mapa (byte_offset → foreground_color) de los tokens.
+    let syntax_colors: Vec<(usize, Color)> = if let Some(tokens) = highlight_tokens {
+        build_syntax_color_ranges(tokens)
+    } else {
+        Vec::new()
+    };
+
     let mut result: Vec<Span<'a>> = Vec::with_capacity(8);
 
     // Recopilar byte offsets de char boundaries
@@ -625,34 +665,38 @@ fn render_line_with_selections<'a>(
     }
 
     let mut current_start = 0;
-    let mut current_style = char_style_with_diags(
+    let mut current_style = char_style_with_highlight(
         0,
         &selected_ranges,
         &cursor_cols,
         diagnostics,
+        &syntax_colors,
         normal_style,
         selection_style,
         cursor_style,
         diag_error_style,
         diag_warning_style,
+        is_cursor_line,
+        active_line_bg,
     );
 
-    // Iterar desde el segundo char boundary hasta el final
     for &byte_offset in char_boundaries.iter().skip(1) {
-        let style = char_style_with_diags(
+        let style = char_style_with_highlight(
             byte_offset,
             &selected_ranges,
             &cursor_cols,
             diagnostics,
+            &syntax_colors,
             normal_style,
             selection_style,
             cursor_style,
             diag_error_style,
             diag_warning_style,
+            is_cursor_line,
+            active_line_bg,
         );
 
         if style != current_style {
-            // Flush segmento actual — current_start y byte_offset son char boundaries
             let segment = &text[current_start..byte_offset];
             if !segment.is_empty() {
                 // CLONE: necesario — segment es slice del buffer
@@ -663,7 +707,7 @@ fn render_line_with_selections<'a>(
         }
     }
 
-    // Flush final: desde current_start hasta el final del string
+    // Flush final
     if current_start < text_len {
         let segment = &text[current_start..];
         if !segment.is_empty() {
@@ -675,49 +719,162 @@ fn render_line_with_selections<'a>(
     result
 }
 
-/// Determina el estilo de un carácter en una columna dada.
+/// Fast path: renderizar tokens de highlight directamente como spans.
 ///
-/// Prioridad: cursor secundario > selección > diagnóstico > normal.
+/// Solo se usa cuando no hay selecciones, cursores secundarios ni diagnósticos.
+/// Mucho más eficiente que la iteración char-by-char.
+fn render_highlight_tokens_fast<'a>(
+    tokens: &[HighlightToken],
+    text_len: usize,
+    is_cursor_line: bool,
+    active_line_bg: Color,
+    normal_style: Style,
+) -> Vec<Span<'a>> {
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut consumed = 0;
+
+    let bg = if is_cursor_line {
+        active_line_bg
+    } else {
+        // Extraer bg del normal_style — mantener consistencia
+        normal_style.bg.unwrap_or(Color::Reset)
+    };
+
+    for token in tokens {
+        if consumed >= text_len {
+            break;
+        }
+        let token_text = &token.text;
+        if token_text.is_empty() {
+            continue;
+        }
+
+        // Truncar token al espacio restante del display_text
+        let available = text_len - consumed;
+        let display = if token_text.len() > available {
+            crate::ui::truncate_str(token_text, available)
+        } else {
+            token_text.as_str()
+        };
+
+        let fg = syntect_color_to_ratatui(token.style.foreground);
+        let style = Style::default().fg(fg).bg(bg);
+        // CLONE: necesario — display puede ser slice del cache, Span toma ownership
+        result.push(Span::styled(display.to_string(), style));
+        consumed += display.len();
+    }
+
+    result
+}
+
+/// Construye un mapa de rangos (byte_offset_start, fg_color) desde tokens de highlight.
+///
+/// Cada entrada indica: "desde este byte offset, el foreground es este color".
+/// Se usa para lookup rápido en la iteración char-by-char.
+fn build_syntax_color_ranges(tokens: &[HighlightToken]) -> Vec<(usize, Color)> {
+    let mut ranges = Vec::with_capacity(tokens.len());
+    let mut offset = 0;
+
+    for token in tokens {
+        if !token.text.is_empty() {
+            let fg = syntect_color_to_ratatui(token.style.foreground);
+            ranges.push((offset, fg));
+            offset += token.text.len();
+        }
+    }
+
+    ranges
+}
+
+/// Busca el color de syntax para una posición (byte offset) dada.
+///
+/// Busca el último rango cuyo offset_start <= col. O(n) pero
+/// los tokens por línea son pocos (típicamente < 20).
+fn syntax_fg_at(col: usize, syntax_colors: &[(usize, Color)]) -> Option<Color> {
+    // Buscar el último rango que empieza en o antes de col
+    let mut result = None;
+    for &(start, color) in syntax_colors {
+        if start <= col {
+            result = Some(color);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Determina el estilo compuesto de un carácter en una columna dada.
+///
+/// Prioridad de capas:
+/// 1. **Cursor secundario** (REVERSED) — máxima prioridad
+/// 2. **Selección** — override de background, mantiene fg de syntax
+/// 3. **Diagnóstico** — agrega underline al estilo base
+/// 4. **Syntax highlight** — foreground del token
+/// 5. **Normal** — estilo base (fg_primary + bg_primary/active_line)
 #[expect(
     clippy::too_many_arguments,
     reason = "render helper — pasar struct de estilos agregaría complejidad sin beneficio"
 )]
-fn char_style_with_diags(
+fn char_style_with_highlight(
     col: usize,
     selected_ranges: &[(usize, usize)],
     cursor_cols: &[usize],
     diagnostics: &[(usize, usize, &lsp::DiagnosticSeverity)],
+    syntax_colors: &[(usize, Color)],
     normal_style: Style,
     selection_style: Style,
     cursor_style: Style,
     diag_error_style: Style,
     diag_warning_style: Style,
+    is_cursor_line: bool,
+    active_line_bg: Color,
 ) -> Style {
     // Cursor secundario tiene prioridad visual máxima
     if cursor_cols.contains(&col) {
         return cursor_style;
     }
-    // Selección
+
+    // Base: syntax highlight o normal
+    let base_fg = syntax_fg_at(col, syntax_colors);
+    let base_bg = if is_cursor_line {
+        active_line_bg
+    } else {
+        normal_style.bg.unwrap_or(Color::Reset)
+    };
+    let mut style = if let Some(fg) = base_fg {
+        Style::default().fg(fg).bg(base_bg)
+    } else {
+        normal_style
+    };
+
+    // Selección: override background, mantener foreground (syntax)
     for &(start, end) in selected_ranges {
         if col >= start && col < end {
-            return selection_style;
+            style = style.bg(selection_style.bg.unwrap_or(Color::Reset));
+            return style;
         }
     }
-    // Diagnóstico (error tiene prioridad sobre warning)
-    let mut has_warning = false;
+
+    // Diagnóstico: agregar underline al estilo existente
     for &(start, end, severity) in diagnostics {
         if col >= start && col < end {
             match severity {
-                lsp::DiagnosticSeverity::Error => return diag_error_style,
-                lsp::DiagnosticSeverity::Warning => has_warning = true,
+                lsp::DiagnosticSeverity::Error => {
+                    return style
+                        .fg(diag_error_style.fg.unwrap_or(Color::Reset))
+                        .add_modifier(Modifier::UNDERLINED);
+                }
+                lsp::DiagnosticSeverity::Warning => {
+                    return style
+                        .fg(diag_warning_style.fg.unwrap_or(Color::Reset))
+                        .add_modifier(Modifier::UNDERLINED);
+                }
                 _ => {}
             }
         }
     }
-    if has_warning {
-        return diag_warning_style;
-    }
-    normal_style
+
+    style
 }
 
 // ─── Tab Bar ───────────────────────────────────────────────────────────────────

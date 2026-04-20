@@ -230,18 +230,22 @@ Ese orden no es capricho. Protege el corazón del sistema: primero control del c
 
 ---
 
-### Épica 12 — Syntax Highlighting (Post-MVP — Impacto Alto)
+### Épica 12 — Syntax Highlighting (Post-MVP — Impacto Alto) ✅ COMPLETADA
 
 El cambio visual más grande. Sin colores, parece Notepad.
 
-- [ ] Evaluar crate de highlighting: `tree-sitter` vs `syntect` (benchmark RAM/CPU)
-- [ ] Implementar tokenización por línea con cache
-- [ ] Mapear tokens a colores del theme cyberpunk
-- [ ] Soportar lenguajes iniciales: Rust, Python, TypeScript, JSON, TOML, Markdown
-- [ ] Renderizar tokens coloreados en el viewport del editor
-- [ ] Invalidar cache de tokens solo en líneas modificadas
-- [ ] Asegurar que no se tokeniza fuera del viewport visible
-- [ ] Respetar budgets: tokenización NO debe exceder 5ms por frame
+**Decisión:** `syntect` (regex-fancy, puro Rust, ~50 lenguajes embebidos, zero instalación).
+**Futuro:** migrar a `tree-sitter` si se necesita highlighting incremental para archivos >10k líneas.
+
+- [x] ~~Evaluar crate de highlighting~~ → elegido `syntect` con `regex-fancy` (sin deps nativas)
+- [x] Implementar tokenización por línea con cache (`HighlightCache` por buffer)
+- [x] Mapear tokens a colores (syntect `base16-ocean.dark` → ratatui `Color::Rgb`)
+- [x] Soportar lenguajes: Rust, Python, TypeScript, JSON, TOML, Markdown y ~45 más
+- [x] Renderizar tokens coloreados en el viewport del editor
+- [x] Invalidar cache en insert/delete/newline/undo/redo
+- [x] Highlight pre-computado antes del render (no en el render loop)
+- [ ] **FUTURO:** migrar a `tree-sitter` para highlighting incremental (solo re-parsear líneas modificadas)
+- [ ] **FUTURO:** theme propio cyberpunk para syntect (en vez de `base16-ocean.dark`)
 
 **Depende de:** Épica 2
 

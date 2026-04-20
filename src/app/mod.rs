@@ -31,6 +31,7 @@ use crate::core::command::CommandRegistry;
 use crate::core::settings::{KeybindingsState, SidebarSection};
 use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
 use crate::editor::EditorState;
+use crate::editor::highlighting::HighlightEngine;
 use crate::editor::tabs::TabState;
 use crate::git::branch_picker::BranchPicker;
 use crate::git::GitState;
@@ -94,6 +95,9 @@ pub struct AppState {
     /// Layout del último frame renderizado, para resolver posiciones de mouse.
     /// Se actualiza cada frame antes del render. `IdeLayout` es Copy (struct de Rects).
     pub last_layout: Option<IdeLayout>,
+    /// Motor de syntax highlighting — singleton, ~2MB inmutable.
+    /// Se carga UNA VEZ al inicio. Se pasa por referencia a los editores.
+    pub highlight_engine: HighlightEngine,
 }
 
 impl AppState {
@@ -148,6 +152,7 @@ impl AppState {
             status_line: String::from("Ln 1, Col 1"),
             status_file: String::from("[no file]"),
             last_layout: None,
+            highlight_engine: HighlightEngine::new(),
         }
     }
 
@@ -156,7 +161,9 @@ impl AppState {
     /// El explorer se inicializa con el directorio del archivo si tiene
     /// uno, o con el directorio de trabajo actual como fallback.
     fn with_file(config: AppConfig, path: &std::path::Path) -> Result<Self> {
-        let editor = EditorState::open_file(path)?;
+        let highlight_engine = HighlightEngine::new();
+        let mut editor = EditorState::open_file(path)?;
+        editor.init_highlighting(&highlight_engine);
         let tabs = TabState::with_editor(editor);
         let status_file = path
             .file_name()
@@ -213,6 +220,7 @@ impl AppState {
             status_line: String::from("Ln 1, Col 1"),
             status_file,
             last_layout: None,
+            highlight_engine,
         })
     }
 
@@ -799,6 +807,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                             if let Some(path) = explorer.selected_path() {
                                 match state.tabs.open_file(&path) {
                                     Ok(()) => {
+                                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
                                         state.focused_panel = PanelId::Editor;
                                         state.update_status_cache();
                                         // Notificar LSP del nuevo archivo abierto
@@ -958,6 +967,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
 
                 match state.tabs.open_file(&absolute_path) {
                     Ok(()) => {
+                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
                         state.focused_panel = PanelId::Editor;
                         state.update_status_cache();
                         // Notificar LSP del nuevo archivo abierto
@@ -1611,6 +1621,7 @@ fn navigate_to_search_match(state: &mut AppState) {
     if needs_open {
         match state.tabs.open_file(&abs_path) {
             Ok(()) => {
+                state.tabs.active_mut().init_highlighting(&state.highlight_engine);
                 tracing::info!(path = %abs_path.display(), "archivo abierto desde search");
             }
             Err(e) => {
@@ -1842,6 +1853,7 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
         // Abrir archivo en una tab del editor
         match state.tabs.open_file(&entry_path) {
             Ok(()) => {
+                state.tabs.active_mut().init_highlighting(&state.highlight_engine);
                 state.focused_panel = PanelId::Editor;
                 state.update_status_cache();
                 tracing::info!(path = %entry_path.display(), "archivo abierto por mouse click");
@@ -2297,6 +2309,14 @@ async fn event_loop(
             editor.viewport.update_size(text_width, editor_inner_h);
         }
 
+        // 7.6. Ensure syntax highlight cache está actualizado ANTES del render.
+        //      Se hace acá para NO alocar dentro del render loop.
+        {
+            let engine = &state.highlight_engine;
+            let editor = state.tabs.active_mut();
+            editor.highlight_cache.ensure_highlighted(&editor.buffer, engine);
+        }
+
         // 8. Render frame actual
         terminal.draw(|frame| {
             ui::render(frame, &state, theme);
@@ -2320,6 +2340,7 @@ async fn event_loop(
             {
                 match state.tabs.open_file(&path) {
                     Ok(()) => {
+                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
                         // Posicionar cursor en la definición
                         let primary = state.tabs.active_mut().cursors.primary_mut();
                         primary.position.line = def_result.line as usize;
