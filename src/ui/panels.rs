@@ -231,7 +231,15 @@ pub fn render_sidebar(
         return;
     };
 
-    let flat = explorer.flatten();
+    // Usar flat cache si disponible (pre-computado antes del render), fallback a flatten()
+    let owned_flat;
+    let flat: &[FlatEntry] = match explorer.cached_flat() {
+        Some(cached) => cached,
+        None => {
+            owned_flat = explorer.flatten();
+            &owned_flat
+        }
+    };
     let visible_height = inner.height as usize;
     let scroll = explorer.scroll_offset;
 
