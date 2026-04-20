@@ -176,6 +176,14 @@ impl TabState {
         infos
     }
 
+    /// Iterador mutable sobre todos los editores.
+    ///
+    /// Se usa para operaciones que afectan a todas las tabs, como
+    /// invalidar caches de highlighting cuando el engine termina de cargar.
+    pub fn all_editors_mut(&mut self) -> &mut [EditorState] {
+        &mut self.editors
+    }
+
     /// Índice de la tab activa.
     pub fn active_index(&self) -> usize {
         self.active_index

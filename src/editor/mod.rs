@@ -127,7 +127,9 @@ impl EditorState {
             self.cursors.cursors[i].sync_desired_col();
             self.cursors.cursors[i].clear_selection();
         }
-        self.highlight_cache.invalidate();
+        // Invalidar solo desde la línea editada en adelante
+        let edited_line = self.cursors.primary().position.line;
+        self.highlight_cache.invalidate_from(edited_line);
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -181,7 +183,9 @@ impl EditorState {
             }
             self.cursors.cursors[i].clear_selection();
         }
-        self.highlight_cache.invalidate();
+        // Invalidar desde la línea más temprana editada
+        let edited_line = self.cursors.primary().position.line;
+        self.highlight_cache.invalidate_from(edited_line);
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -208,7 +212,9 @@ impl EditorState {
             self.cursors.cursors[i].sync_desired_col();
             self.cursors.cursors[i].clear_selection();
         }
-        self.highlight_cache.invalidate();
+        // Newline cambia estructura de líneas — invalidar desde la línea editada
+        let edited_line = self.cursors.primary().position.line.saturating_sub(1);
+        self.highlight_cache.invalidate_from(edited_line);
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -584,7 +590,9 @@ impl EditorState {
         primary.clear_selection();
         // Limpiar cursores secundarios en undo
         self.cursors.clear_secondary();
-        self.highlight_cache.invalidate();
+        // Invalidar desde la línea afectada por el undo
+        let undo_line = self.cursors.primary().position.line;
+        self.highlight_cache.invalidate_from(undo_line);
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -625,7 +633,9 @@ impl EditorState {
         primary.sync_desired_col();
         primary.clear_selection();
         self.cursors.clear_secondary();
-        self.highlight_cache.invalidate();
+        // Invalidar desde la línea afectada por el redo
+        let redo_line = self.cursors.primary().position.line;
+        self.highlight_cache.invalidate_from(redo_line);
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }

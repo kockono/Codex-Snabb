@@ -2309,12 +2309,34 @@ async fn event_loop(
             editor.viewport.update_size(text_width, editor_inner_h);
         }
 
-        // 7.6. Ensure syntax highlight cache está actualizado ANTES del render.
+        // 7.6. Ensure syntax highlight — carga lazy del engine + viewport-aware cache.
         //      Se hace acá para NO alocar dentro del render loop.
         {
-            let engine = &state.highlight_engine;
-            let editor = state.tabs.active_mut();
-            editor.highlight_cache.ensure_highlighted(&editor.buffer, engine);
+            // Intentar inicializar el engine si la carga en background terminó.
+            // Si se inicializó en este frame, marcar caches de todas las tabs como dirty.
+            let just_loaded = state.highlight_engine.try_init();
+            if just_loaded {
+                // El engine acaba de cargar — marcar todas las tabs como dirty
+                // para que sus caches se re-procesen con colores
+                for editor in state.tabs.all_editors_mut() {
+                    editor.highlight_cache.invalidate();
+                }
+                tracing::info!("highlight engine listo — re-highlighting todos los buffers");
+            }
+
+            // Solo procesar highlight si el engine está listo
+            if state.highlight_engine.is_ready() {
+                let engine = &state.highlight_engine;
+                let editor = state.tabs.active_mut();
+                let vp_start = editor.viewport.scroll_offset;
+                let vp_height = editor.viewport.height;
+                editor.highlight_cache.ensure_viewport_highlighted(
+                    &editor.buffer,
+                    engine,
+                    vp_start,
+                    vp_height,
+                );
+            }
         }
 
         // 8. Render frame actual
