@@ -4,9 +4,11 @@
 //! El `EditorState` es el punto de entrada para todas las operaciones
 //! de edición — coordina buffer, multicursor, viewport y undo stack.
 
+pub mod brackets;
 pub mod buffer;
 pub mod cursor;
 pub mod highlighting;
+pub mod indent;
 pub mod multicursor;
 pub mod search;
 pub mod selection;
