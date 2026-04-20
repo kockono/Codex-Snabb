@@ -7,6 +7,7 @@
 
 pub mod branch_picker;
 pub mod git_panel;
+pub mod go_to_line;
 pub mod icons;
 pub mod layout;
 pub mod palette;
@@ -160,6 +161,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && state.cursor_visible
         && !state.palette.visible
         && !state.quick_open.visible
+        && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
@@ -205,30 +207,39 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Status bar ──
-    // Datos pre-computados desde AppState — sin allocaciones acá
-    // Branch real del repo git (o fallback si no es repo)
-    let branch_display = if state.git.is_repo && !state.git.branch.is_empty() {
-        &state.git.branch
-    } else if state.git.is_repo {
-        "(detached)"
+    // Datos pre-computados desde AppState — sin allocaciones en render
+    // Pre-format git status string: "⎇ main ↑2 ↓1 ⟳" — una vez por frame, fuera del render loop
+    use std::fmt::Write;
+    let git_status_str: String = if state.git.is_repo {
+        let branch = if state.git.branch.is_empty() {
+            "(detached)"
+        } else {
+            &state.git.branch
+        };
+        let mut s = String::with_capacity(32);
+        s.push_str("\u{2387} "); // ⎇
+        s.push_str(branch);
+        if state.git.ahead > 0 {
+            s.push_str(" \u{2191}"); // ↑
+            let _ = write!(s, "{}", state.git.ahead);
+        }
+        if state.git.behind > 0 {
+            s.push_str(" \u{2193}"); // ↓
+            let _ = write!(s, "{}", state.git.behind);
+        }
+        s.push_str(" \u{27F3}"); // ⟳
+        s
     } else {
-        "no git"
+        String::from("no git")
     };
-    // Si hay un mensaje de diagnóstico LSP, mostrarlo como file_name override
-    let file_display = state
-        .lsp
-        .status_message
-        .as_deref()
-        .unwrap_or(&state.status_file);
     let status_data = StatusBarData {
         mode: if state.lsp.has_server() {
             "LSP"
         } else {
             "NORMAL"
         },
-        file_name: file_display,
         cursor_pos: &state.status_line,
-        branch: branch_display,
+        git_status: &git_status_str,
         encoding: "UTF-8",
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
@@ -239,6 +250,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     if editor_focused
         && !state.palette.visible
         && !state.quick_open.visible
+        && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
@@ -261,16 +273,22 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Overlays ──
-    // Prioridad: Settings > Branch picker > Quick open > Palette.
+    // Prioridad: Go to Line > Settings > Branch picker > Quick open > Palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
-    if state.keybindings.visible {
-        settings_panel::render_settings(f, area, &state.keybindings, theme);
+    if state.go_to_line.visible {
+        // Pre-format hint fuera del render — evitar format!() en render
+        use std::fmt::Write as FmtWrite;
+        let mut go_to_line_hint = String::with_capacity(16);
+        let _ = write!(go_to_line_hint, "1 \u{2013} {}", state.go_to_line.total_lines);
+        go_to_line::render_go_to_line(f, &layout, &state.go_to_line, theme, &go_to_line_hint);
+    } else if state.keybindings.visible {
+        settings_panel::render_settings(f, &layout, &state.keybindings, theme);
     } else if state.branch_picker.visible {
-        branch_picker::render_branch_picker(f, area, &state.branch_picker, theme);
+        branch_picker::render_branch_picker(f, &layout, &state.branch_picker, theme);
     } else if state.quick_open.visible {
-        quick_open::render_quick_open(f, area, &state.quick_open, theme);
+        quick_open::render_quick_open(f, &layout, &state.quick_open, theme);
     } else if state.palette.visible {
-        palette::render_palette(f, area, &state.palette, &state.commands, theme);
+        palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
     }
 }
 
