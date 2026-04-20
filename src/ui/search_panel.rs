@@ -356,15 +356,8 @@ fn render_match_line<'a>(
         .bg(bg)
         .add_modifier(Modifier::BOLD);
 
-    // Pre-computar "Ln N: " — owned string necesario
-    let mut ln_prefix = String::with_capacity(12);
-    use std::fmt::Write;
-    let _ = write!(ln_prefix, " Ln {}: ", m.line_number);
-
-    let ln_style = Style::default().fg(theme.fg_secondary).bg(bg);
-
     // Truncar contenido de línea para el ancho disponible — char-safe para multi-byte
-    let prefix_len = indicator.len() + ln_prefix.len();
+    let prefix_len = indicator.len() + 1; // indicator + 1 espacio
     let content_max = max_width.saturating_sub(prefix_len);
     let display_content = if m.line_content.chars().count() > content_max {
         let truncated = crate::ui::truncate_str(&m.line_content, content_max.saturating_sub(3));
@@ -390,7 +383,7 @@ fn render_match_line<'a>(
 
             return Line::from(vec![
                 Span::styled(indicator, indicator_style),
-                Span::styled(ln_prefix, ln_style),
+                Span::styled(" ", content_style),
                 Span::styled(before.to_string(), content_style),
                 Span::styled(matched.to_string(), match_style),
                 Span::styled(after.to_string(), content_style),
@@ -401,7 +394,7 @@ fn render_match_line<'a>(
     // Fallback: sin highlight de match
     Line::from(vec![
         Span::styled(indicator, indicator_style),
-        Span::styled(ln_prefix, ln_style),
+        Span::styled(" ", content_style),
         Span::styled(display_content, content_style),
     ])
 }
