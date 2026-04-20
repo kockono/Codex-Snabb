@@ -79,28 +79,25 @@ fn panel_block<'a>(title: &'a str, focused: bool, theme: &'a Theme) -> Block<'a>
 
 // ─── Title Bar ─────────────────────────────────────────────────────────────────
 
-/// Renderiza la barra de título del IDE.
+/// Renderiza la barra de menú del IDE estilo VS Code.
 ///
-/// Muestra el nombre del IDE con estilo cyberpunk. Sin bordes, 1 línea.
+/// Muestra opciones de menú: File, Edit, Selection, View, Go, Run, Terminal, Help.
+/// Son labels estáticos por ahora — la interactividad (click → dropdown) es futuro.
 /// No aloca — usa literales y estilos estáticos.
 pub fn render_title_bar(f: &mut Frame, area: Rect, theme: &Theme) {
-    let title = Line::from(vec![
-        Span::styled(
-            " ⚡ ",
-            Style::default()
-                .fg(theme.fg_accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "IDE TUI",
-            Style::default()
-                .fg(theme.fg_accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" — RAM/CPU First", Style::default().fg(theme.fg_accent_alt)),
+    let normal = Style::default().fg(theme.fg_secondary);
+    let bar_items = Line::from(vec![
+        Span::styled(" File ", normal),
+        Span::styled(" Edit ", normal),
+        Span::styled(" Selection ", normal),
+        Span::styled(" View ", normal),
+        Span::styled(" Go ", normal),
+        Span::styled(" Run ", normal),
+        Span::styled(" Terminal ", normal),
+        Span::styled(" Help ", normal),
     ]);
 
-    let bar = Paragraph::new(title).style(Style::default().bg(theme.bg_status));
+    let bar = Paragraph::new(bar_items).style(Style::default().bg(theme.bg_status));
 
     f.render_widget(bar, area);
 }
