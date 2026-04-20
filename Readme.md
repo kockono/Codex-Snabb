@@ -2,7 +2,7 @@
 
 > IDE TUI en Rust, inspirado en flujos tipo VS Code, con una restricción central NO negociable: **RAM/CPU first**.
 
-![Vista conceptual del proyecto](img/image.png)
+![Vista conceptual del proyecto](image.png)
 
 ## ¿Qué es?
 
