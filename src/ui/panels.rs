@@ -271,19 +271,19 @@ fn render_explorer_entry<'a>(
     // Indentación: 2 espacios por nivel de profundidad
     let indent_width = entry.depth * 2;
 
-    // Icono de directorio (▸/▾) o file icon por extensión
-    let (dir_indicator, file_icon_str, icon_color) = if entry.is_dir {
-        let indicator = if entry.expanded { "\u{25BE} " } else { "\u{25B8} " };
-        let dir_ico = icons::dir_icon(entry.expanded);
-        (indicator, dir_ico, icons::dir_icon_color())
+    // Icono: emoji de carpeta (📁/📂, 2 celdas) o file icon (2 chars) por extensión.
+    // Directorios ya NO usan indicador ▸/▾ separado — el emoji es suficiente.
+    let (file_icon_str, icon_color, icon_display_width) = if entry.is_dir {
+        // Emoji ocupa 2 celdas en terminal, pero el str tiene 4 bytes UTF-8
+        (icons::dir_icon(entry.expanded), icons::dir_icon_color(), 2_usize)
     } else {
-        // Archivos: sin indicator de directorio, con file icon
-        ("", icons::file_icon(&entry.name), icons::icon_color(&entry.name))
+        // File icons ASCII: siempre 2 bytes = 2 celdas
+        (icons::file_icon(&entry.name), icons::icon_color(&entry.name), 2_usize)
     };
 
     // Calcular cuánto espacio queda para el nombre
-    // dir_indicator (2 o 0) + file_icon (2) + " " (1) + nombre
-    let icon_total_len = dir_indicator.len() + file_icon_str.len() + 1; // +1 espacio después del icono
+    // icon (icon_display_width) + " " (1) + nombre
+    let icon_total_len = icon_display_width + 1; // +1 espacio después del icono
     let prefix_len = indent_width + icon_total_len;
     let name_max = max_width.saturating_sub(prefix_len);
     let display_name = crate::ui::truncate_str(&entry.name, name_max);
@@ -312,14 +312,12 @@ fn render_explorer_entry<'a>(
 
     // CLONE: necesario en display_name.to_string() — Span::styled toma ownership
     // de String, y display_name es un slice de entry.name que no podemos mover
-    let mut spans = Vec::with_capacity(5);
-    spans.push(Span::styled(indent_str, indent_style));
-    if !dir_indicator.is_empty() {
-        spans.push(Span::styled(dir_indicator, name_style));
-    }
-    spans.push(Span::styled(file_icon_str, icon_style));
-    spans.push(Span::styled(" ", indent_style));
-    spans.push(Span::styled(display_name.to_string(), name_style));
+    let spans = vec![
+        Span::styled(indent_str, indent_style),
+        Span::styled(file_icon_str, icon_style),
+        Span::styled(" ", indent_style),
+        Span::styled(display_name.to_string(), name_style),
+    ];
 
     Line::from(spans)
 }

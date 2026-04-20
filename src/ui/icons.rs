@@ -67,14 +67,15 @@ pub fn file_icon(filename: &str) -> &'static str {
     }
 }
 
-/// Retorna un icono para directorios según estado de expansión.
+/// Retorna un icono emoji para directorios según estado de expansión.
 ///
-/// No aloca — retorna literal estático de 2 caracteres.
+/// No aloca — retorna literal estático. Los emojis 📂/📁 ocupan 2 celdas
+/// en la mayoría de terminales — el caller debe considerar eso en el padding.
 pub fn dir_icon(expanded: bool) -> &'static str {
     if expanded {
-        "v "
+        "\u{1F4C2}" // 📂 — carpeta abierta
     } else {
-        "> "
+        "\u{1F4C1}" // 📁 — carpeta cerrada
     }
 }
 
