@@ -98,6 +98,10 @@ pub struct AppState {
     /// Motor de syntax highlighting — singleton, ~2MB inmutable.
     /// Se carga UNA VEZ al inicio. Se pasa por referencia a los editores.
     pub highlight_engine: HighlightEngine,
+    /// Par de brackets matching pre-computado para el cursor actual.
+    /// Se actualiza en cada movimiento de cursor — no en cada frame.
+    /// `(bracket_pos, matching_bracket_pos)` o `None` si no hay match.
+    pub bracket_match: Option<(crate::editor::cursor::Position, crate::editor::cursor::Position)>,
 }
 
 impl AppState {
@@ -153,6 +157,7 @@ impl AppState {
             status_file: String::from("[no file]"),
             last_layout: None,
             highlight_engine: HighlightEngine::new(),
+            bracket_match: None,
         }
     }
 
@@ -221,13 +226,15 @@ impl AppState {
             status_file,
             last_layout: None,
             highlight_engine,
+            bracket_match: None,
         })
     }
 
-    /// Actualiza los strings pre-computados de la status bar.
+    /// Actualiza los strings pre-computados de la status bar y bracket match.
     ///
     /// Se llama después de cualquier acción que modifique el cursor o el buffer.
     /// Reutiliza la capacidad existente del String para minimizar allocaciones.
+    /// También re-computa el bracket match para la posición actual del cursor.
     fn update_status_cache(&mut self) {
         // Actualizar posición del cursor primario (1-indexed para display)
         self.status_line.clear();
@@ -241,6 +248,11 @@ impl AppState {
             primary.position.line + 1,
             primary.position.col + 1
         );
+
+        // Actualizar bracket match — solo re-computar cuando cursor cambia
+        let cursor_pos = primary.position;
+        self.bracket_match =
+            crate::editor::brackets::compute_bracket_match(&editor.buffer, cursor_pos);
 
         // Actualizar nombre de archivo
         if let Some(path) = editor.buffer.file_path() {

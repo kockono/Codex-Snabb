@@ -140,6 +140,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         editor,
         current_diagnostics,
         &tab_infos,
+        state.bracket_match,
     );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──

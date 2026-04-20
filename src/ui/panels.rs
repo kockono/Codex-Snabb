@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use crate::editor::highlighting::HighlightToken;
+use crate::editor::indent;
 
 use crate::core::settings::SidebarSection;
 use crate::core::PanelId;
@@ -332,6 +333,10 @@ fn render_explorer_entry<'a>(
 /// posicionado por `f.set_cursor_position()` en `ui::render()`.
 ///
 /// No aloca strings en el render — usa slices `&str` del buffer directamente.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render entry point — bracket_match es pre-computado, no tiene sentido crear struct wrapper"
+)]
 pub fn render_editor_area(
     f: &mut Frame,
     area: Rect,
@@ -340,6 +345,7 @@ pub fn render_editor_area(
     editor: &EditorState,
     diagnostics: &[lsp::Diagnostic],
     tab_infos: &[TabInfo],
+    bracket_match: Option<(Position, Position)>,
 ) {
     let block = panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
 
@@ -453,6 +459,47 @@ pub fn render_editor_area(
         .fg(theme.fg_warning)
         .add_modifier(Modifier::UNDERLINED);
 
+    // ── Pre-computar indent guides para el viewport ──
+    let tab_width: usize = 4; // configurable en el futuro
+    let viewport_lines: Vec<Option<&str>> = (0..view_height)
+        .map(|i| {
+            let idx = scroll + i;
+            if idx < total_lines {
+                editor.buffer.line(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let viewport_indents = indent::compute_viewport_indents(&viewport_lines, tab_width);
+
+    // Estilo para indent guides
+    let indent_guide_style = Style::default()
+        .fg(theme.border_unfocused)
+        .bg(theme.bg_primary);
+    let indent_guide_active_style = Style::default().fg(theme.fg_secondary).bg(theme.bg_primary);
+    // Estilo para indent guides en línea activa (con bg de línea activa)
+    let indent_guide_cursor_style = Style::default()
+        .fg(theme.border_unfocused)
+        .bg(active_line_bg);
+    let indent_guide_active_cursor_style =
+        Style::default().fg(theme.fg_secondary).bg(active_line_bg);
+
+    // ── Pre-computar estilos de bracket match ──
+    let bracket_style = Style::default()
+        .fg(theme.fg_accent)
+        .add_modifier(Modifier::BOLD);
+    let bracket_unmatched_style = Style::default()
+        .fg(theme.fg_error)
+        .add_modifier(Modifier::BOLD);
+
+    // Columna del cursor para indent guide "activo" (nivel del cursor)
+    let cursor_col = editor.cursors.primary().position.col;
+    let cursor_indent_level = {
+        // Redondear hacia abajo al múltiplo de tab_width más cercano
+        (cursor_col / tab_width) * tab_width
+    };
+
     // Buffer pre-alocado para el padding del gutter
     // Máximo 10 dígitos (más que suficiente para cualquier archivo razonable)
     const SPACES: &str = "          "; // 10 espacios
@@ -464,7 +511,7 @@ pub fn render_editor_area(
     // ── Construir líneas del viewport ──
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(view_height);
 
-    for i in 0..view_height {
+    for (i, &line_indent_val) in viewport_indents.iter().enumerate().take(view_height) {
         let buf_line_idx = scroll + i;
 
         if buf_line_idx < total_lines {
@@ -501,45 +548,239 @@ pub fn render_editor_area(
             let display_text = crate::ui::truncate_str(line_content, text_width);
 
             // Construir spans para esta línea
-            let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
+            let mut spans: Vec<Span<'_>> = Vec::with_capacity(12);
             spans.push(Span::styled(pad_str, gutter_num_style));
             // CLONE: necesario — num_buf se reutiliza en cada iteración del loop,
             // Span toma ownership del String para mantenerlo vivo en el Line
             spans.push(Span::styled(num_buf.clone(), gutter_num_style));
             spans.push(Span::styled("\u{2502} ", separator_style));
 
-            // ── Renderizar texto con selecciones, cursores y diagnósticos ──
+            // ── Indent guides: reemplazar espacios por `│` en posiciones de guía ──
+            let line_indent = line_indent_val;
+            let guide_cols = indent::guide_positions(line_indent, tab_width);
+
+            // Determinar si esta línea tiene bracket match(es) que renderizar
+            let bracket_at: Option<(usize, bool)> = bracket_match.and_then(|(a, b)| {
+                if a.line == buf_line_idx {
+                    Some((a.col, true)) // matched
+                } else if b.line == buf_line_idx {
+                    Some((b.col, true)) // matched
+                } else {
+                    None
+                }
+            });
+            // Detectar bracket sin par: cursor sobre bracket pero sin match
+            let unmatched_bracket_at: Option<usize> = if bracket_match.is_none() {
+                // Verificar si el cursor está en esta línea y sobre un bracket
+                if buf_line_idx == primary_cursor_line {
+                    let ch = line_content.chars().nth(cursor_col);
+                    if ch.is_some_and(crate::editor::brackets::is_bracket) {
+                        Some(cursor_col)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let has_guides = !guide_cols.is_empty();
+            let has_brackets = bracket_at.is_some() || unmatched_bracket_at.is_some();
+
+            // ── Renderizar texto con selecciones, cursores, diagnósticos, guides y brackets ──
             if !display_text.is_empty() {
-                // Recopilar rangos de diagnósticos para esta línea
-                let line_diags: Vec<(usize, usize, &lsp::DiagnosticSeverity)> = diagnostics
-                    .iter()
-                    .filter(|d| d.line == buf_line_idx as u32)
-                    .map(|d| {
-                        let start = (d.col_start as usize).min(display_text.len());
-                        let end = (d.col_end as usize).min(display_text.len());
-                        (start, end, &d.severity)
-                    })
-                    .collect();
+                // Si hay indent guides, producir spans para la zona de indentación
+                // y luego el resto del texto. Los guides reemplazan espacios por `│`.
+                if has_guides || has_brackets {
+                    let indent_end = line_indent.min(display_text.len());
 
-                // Obtener tokens de highlighting cacheados (si existen)
-                let highlight_tokens = editor.highlight_cache.get_line(buf_line_idx);
+                    // Renderizar zona de indentación con guides intercalados
+                    if has_guides && indent_end > 0 {
+                        let mut col = 0;
+                        for &guide_col in &guide_cols {
+                            if guide_col >= indent_end || guide_col >= text_width {
+                                break;
+                            }
+                            // Espacios antes del guide
+                            if col < guide_col {
+                                let space_count = guide_col - col;
+                                // Usar slice de SPACES para los espacios intermedios
+                                const INDENT_SPACES: &str =
+                                    "                                        ";
+                                let space_str =
+                                    &INDENT_SPACES[..space_count.min(INDENT_SPACES.len())];
+                                spans.push(Span::styled(space_str, line_bg_style));
+                            }
+                            // El guide `│` — activo si es el nivel del cursor
+                            let is_active_guide =
+                                guide_col == cursor_indent_level && is_cursor_line;
+                            let guide_style = if is_cursor_line {
+                                if is_active_guide {
+                                    indent_guide_active_cursor_style
+                                } else {
+                                    indent_guide_cursor_style
+                                }
+                            } else if guide_col == cursor_indent_level {
+                                indent_guide_active_style
+                            } else {
+                                indent_guide_style
+                            };
+                            spans.push(Span::styled("\u{2502}", guide_style));
+                            col = guide_col + 1;
+                        }
+                        // Espacios restantes hasta el fin de la indentación
+                        if col < indent_end {
+                            let remaining = indent_end - col;
+                            const INDENT_SPACES: &str = "                                        ";
+                            let space_str = &INDENT_SPACES[..remaining.min(INDENT_SPACES.len())];
+                            spans.push(Span::styled(space_str, line_bg_style));
+                        }
 
-                let text_spans = render_line_with_selections(
-                    display_text,
-                    buf_line_idx,
-                    &selections,
-                    &secondary_cursor_positions,
-                    &line_diags,
-                    line_bg_style,
-                    selection_style,
-                    secondary_cursor_style,
-                    diag_error_style,
-                    diag_warning_style,
-                    highlight_tokens,
-                    is_cursor_line,
-                    active_line_bg,
-                );
-                spans.extend(text_spans);
+                        // Resto del texto después de la indentación (con highlighting)
+                        let rest = &display_text[indent_end..];
+                        if !rest.is_empty() {
+                            // Recopilar rangos de diagnósticos para esta línea
+                            let line_diags: Vec<(usize, usize, &lsp::DiagnosticSeverity)> =
+                                diagnostics
+                                    .iter()
+                                    .filter(|d| d.line == buf_line_idx as u32)
+                                    .map(|d| {
+                                        let start = (d.col_start as usize)
+                                            .saturating_sub(indent_end)
+                                            .min(rest.len());
+                                        let end = (d.col_end as usize)
+                                            .saturating_sub(indent_end)
+                                            .min(rest.len());
+                                        (start, end, &d.severity)
+                                    })
+                                    .collect();
+
+                            let highlight_tokens = editor.highlight_cache.get_line(buf_line_idx);
+
+                            let text_spans = render_line_with_selections(
+                                rest,
+                                buf_line_idx,
+                                &selections,
+                                &secondary_cursor_positions,
+                                &line_diags,
+                                line_bg_style,
+                                selection_style,
+                                secondary_cursor_style,
+                                diag_error_style,
+                                diag_warning_style,
+                                highlight_tokens,
+                                is_cursor_line,
+                                active_line_bg,
+                                indent_end,
+                                bracket_at,
+                                unmatched_bracket_at,
+                                bracket_style,
+                                bracket_unmatched_style,
+                            );
+                            spans.extend(text_spans);
+                        }
+                    } else {
+                        // Sin guides pero con brackets — renderizar texto completo
+                        let line_diags: Vec<(usize, usize, &lsp::DiagnosticSeverity)> = diagnostics
+                            .iter()
+                            .filter(|d| d.line == buf_line_idx as u32)
+                            .map(|d| {
+                                let start = (d.col_start as usize).min(display_text.len());
+                                let end = (d.col_end as usize).min(display_text.len());
+                                (start, end, &d.severity)
+                            })
+                            .collect();
+
+                        let highlight_tokens = editor.highlight_cache.get_line(buf_line_idx);
+
+                        let text_spans = render_line_with_selections(
+                            display_text,
+                            buf_line_idx,
+                            &selections,
+                            &secondary_cursor_positions,
+                            &line_diags,
+                            line_bg_style,
+                            selection_style,
+                            secondary_cursor_style,
+                            diag_error_style,
+                            diag_warning_style,
+                            highlight_tokens,
+                            is_cursor_line,
+                            active_line_bg,
+                            0,
+                            bracket_at,
+                            unmatched_bracket_at,
+                            bracket_style,
+                            bracket_unmatched_style,
+                        );
+                        spans.extend(text_spans);
+                    }
+                } else {
+                    // Sin guides ni brackets — renderizar texto normal
+                    let line_diags: Vec<(usize, usize, &lsp::DiagnosticSeverity)> = diagnostics
+                        .iter()
+                        .filter(|d| d.line == buf_line_idx as u32)
+                        .map(|d| {
+                            let start = (d.col_start as usize).min(display_text.len());
+                            let end = (d.col_end as usize).min(display_text.len());
+                            (start, end, &d.severity)
+                        })
+                        .collect();
+
+                    let highlight_tokens = editor.highlight_cache.get_line(buf_line_idx);
+
+                    let text_spans = render_line_with_selections(
+                        display_text,
+                        buf_line_idx,
+                        &selections,
+                        &secondary_cursor_positions,
+                        &line_diags,
+                        line_bg_style,
+                        selection_style,
+                        secondary_cursor_style,
+                        diag_error_style,
+                        diag_warning_style,
+                        highlight_tokens,
+                        is_cursor_line,
+                        active_line_bg,
+                        0,
+                        None,
+                        None,
+                        bracket_style,
+                        bracket_unmatched_style,
+                    );
+                    spans.extend(text_spans);
+                }
+            } else if has_guides {
+                // Línea vacía con indent guides del contexto
+                let mut col = 0;
+                for &guide_col in &guide_cols {
+                    if guide_col >= text_width {
+                        break;
+                    }
+                    if col < guide_col {
+                        let space_count = guide_col - col;
+                        const INDENT_SPACES: &str = "                                        ";
+                        let space_str = &INDENT_SPACES[..space_count.min(INDENT_SPACES.len())];
+                        spans.push(Span::styled(space_str, line_bg_style));
+                    }
+                    let is_active_guide = guide_col == cursor_indent_level;
+                    let guide_style = if is_cursor_line {
+                        if is_active_guide {
+                            indent_guide_active_cursor_style
+                        } else {
+                            indent_guide_cursor_style
+                        }
+                    } else if is_active_guide {
+                        indent_guide_active_style
+                    } else {
+                        indent_guide_style
+                    };
+                    spans.push(Span::styled("\u{2502}", guide_style));
+                    col = guide_col + 1;
+                }
             }
 
             lines.push(Line::from(spans));
@@ -565,14 +806,19 @@ fn syntect_color_to_ratatui(color: syntect::highlighting::Color) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
-/// Renderiza una línea de texto con syntax highlighting, selecciones, cursores y diagnósticos.
+/// Renderiza una línea de texto con syntax highlighting, selecciones, cursores,
+/// diagnósticos y bracket matching.
 ///
 /// Capas de estilo (de fondo a frente):
 /// 1. **Syntax highlighting** (foreground del token) — base visual
 /// 2. **Línea activa** (background sutil) — indica cursor
 /// 3. **Selección** (background de selección) — override de bg
 /// 4. **Diagnósticos** (underline con color de severidad) — se agrega al estilo
-/// 5. **Cursores secundarios** (reversed) — prioridad visual máxima
+/// 5. **Bracket match** (accent + bold) — resaltado de bracket par
+/// 6. **Cursores secundarios** (reversed) — prioridad visual máxima
+///
+/// `col_offset`: offset de columna para ajustar las coordenadas cuando
+/// el texto empieza después de la zona de indentación (indent guides).
 ///
 /// Divide la línea en segmentos según cambios de estilo y los emite como spans.
 /// No usa `format!()` — construye spans directamente.
@@ -594,13 +840,21 @@ fn render_line_with_selections<'a>(
     highlight_tokens: Option<&[HighlightToken]>,
     is_cursor_line: bool,
     active_line_bg: Color,
+    col_offset: usize,
+    bracket_at: Option<(usize, bool)>,
+    unmatched_bracket_at: Option<usize>,
+    bracket_style: Style,
+    bracket_unmatched_style: Style,
 ) -> Vec<Span<'a>> {
     let text_len = text.len();
     if text_len == 0 {
         return vec![];
     }
 
-    // Determinar qué columnas están seleccionadas y cuáles tienen cursor secundario
+    // Determinar qué columnas están seleccionadas y cuáles tienen cursor secundario.
+    // Las coordenadas de selección/cursor son absolutas (columna en el buffer),
+    // pero `text` puede empezar en `col_offset` (después de indent guides).
+    // Ajustar restando col_offset para mapear a posición dentro de `text`.
     let mut selected_ranges: Vec<(usize, usize)> = Vec::new();
     for sel in selections {
         let start = sel.start();
@@ -611,23 +865,47 @@ fn render_line_with_selections<'a>(
             let sel_end_col = if end.line == line_idx {
                 end.col
             } else {
-                text_len
+                col_offset + text_len
             };
-            if sel_start_col < sel_end_col {
-                selected_ranges.push((sel_start_col.min(text_len), sel_end_col.min(text_len)));
+            // Ajustar al espacio local del texto (restar col_offset)
+            let local_start = sel_start_col.saturating_sub(col_offset).min(text_len);
+            let local_end = sel_end_col.saturating_sub(col_offset).min(text_len);
+            if local_start < local_end {
+                selected_ranges.push((local_start, local_end));
             }
         }
     }
 
-    // Columnas con cursores secundarios
+    // Columnas con cursores secundarios (ajustadas a espacio local)
     let cursor_cols: Vec<usize> = secondary_cursors
         .iter()
-        .filter(|p| p.line == line_idx && p.col < text_len)
-        .map(|p| p.col)
+        .filter(|p| p.line == line_idx && p.col >= col_offset && p.col < col_offset + text_len)
+        .map(|p| p.col - col_offset)
         .collect();
 
-    let has_overlays =
-        !selected_ranges.is_empty() || !cursor_cols.is_empty() || !diagnostics.is_empty();
+    // Columna de bracket match en esta línea (ajustada a espacio local)
+    let local_bracket_col: Option<(usize, Style)> = bracket_at
+        .and_then(|(col, _matched)| {
+            if col >= col_offset && col < col_offset + text_len {
+                Some((col - col_offset, bracket_style))
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            unmatched_bracket_at.and_then(|col| {
+                if col >= col_offset && col < col_offset + text_len {
+                    Some((col - col_offset, bracket_unmatched_style))
+                } else {
+                    None
+                }
+            })
+        });
+
+    let has_overlays = !selected_ranges.is_empty()
+        || !cursor_cols.is_empty()
+        || !diagnostics.is_empty()
+        || local_bracket_col.is_some();
 
     // ── Fast path: highlight tokens sin overlays ──
     // Renderizar directamente los tokens coloreados sin char-by-char iteration.
@@ -635,10 +913,11 @@ fn render_line_with_selections<'a>(
         if let Some(tokens) = highlight_tokens {
             return render_highlight_tokens_fast(
                 tokens,
-                text_len,
+                col_offset + text_len,
                 is_cursor_line,
                 active_line_bg,
                 normal_style,
+                col_offset,
             );
         }
         // Sin highlight ni overlays — color uniforme
@@ -667,6 +946,7 @@ fn render_line_with_selections<'a>(
     let mut current_start = 0;
     let mut current_style = char_style_with_highlight(
         0,
+        col_offset,
         &selected_ranges,
         &cursor_cols,
         diagnostics,
@@ -678,11 +958,13 @@ fn render_line_with_selections<'a>(
         diag_warning_style,
         is_cursor_line,
         active_line_bg,
+        local_bracket_col,
     );
 
     for &byte_offset in char_boundaries.iter().skip(1) {
         let style = char_style_with_highlight(
             byte_offset,
+            col_offset,
             &selected_ranges,
             &cursor_cols,
             diagnostics,
@@ -694,6 +976,7 @@ fn render_line_with_selections<'a>(
             diag_warning_style,
             is_cursor_line,
             active_line_bg,
+            local_bracket_col,
         );
 
         if style != current_style {
@@ -721,17 +1004,22 @@ fn render_line_with_selections<'a>(
 
 /// Fast path: renderizar tokens de highlight directamente como spans.
 ///
-/// Solo se usa cuando no hay selecciones, cursores secundarios ni diagnósticos.
-/// Mucho más eficiente que la iteración char-by-char.
+/// Solo se usa cuando no hay selecciones, cursores secundarios, diagnósticos
+/// ni bracket matches. Mucho más eficiente que la iteración char-by-char.
+///
+/// `col_offset`: byte offset del inicio de `text` en la línea completa.
+/// Cuando hay indent guides, el texto empieza después de la zona de
+/// indentación, así que los tokens de highlight deben ajustarse.
 fn render_highlight_tokens_fast<'a>(
     tokens: &[HighlightToken],
-    text_len: usize,
+    total_len: usize,
     is_cursor_line: bool,
     active_line_bg: Color,
     normal_style: Style,
+    col_offset: usize,
 ) -> Vec<Span<'a>> {
     let mut result = Vec::with_capacity(tokens.len());
-    let mut consumed = 0;
+    let mut consumed: usize = 0;
 
     let bg = if is_cursor_line {
         active_line_bg
@@ -741,7 +1029,7 @@ fn render_highlight_tokens_fast<'a>(
     };
 
     for token in tokens {
-        if consumed >= text_len {
+        if consumed >= total_len {
             break;
         }
         let token_text = &token.text;
@@ -749,19 +1037,33 @@ fn render_highlight_tokens_fast<'a>(
             continue;
         }
 
-        // Truncar token al espacio restante del display_text
-        let available = text_len - consumed;
-        let display = if token_text.len() > available {
-            crate::ui::truncate_str(token_text, available)
+        let token_end = consumed + token_text.len();
+
+        // Si el token termina antes del col_offset, saltarlo
+        if token_end <= col_offset {
+            consumed = token_end;
+            continue;
+        }
+
+        // Si el token empieza antes del col_offset, recortar el inicio
+        let start_in_token = col_offset.saturating_sub(consumed);
+        let display_full = &token_text[start_in_token..];
+
+        // Truncar al espacio restante
+        let available = total_len.saturating_sub(consumed + start_in_token);
+        let display = if display_full.len() > available {
+            crate::ui::truncate_str(display_full, available)
         } else {
-            token_text.as_str()
+            display_full
         };
 
-        let fg = syntect_color_to_ratatui(token.style.foreground);
-        let style = Style::default().fg(fg).bg(bg);
-        // CLONE: necesario — display puede ser slice del cache, Span toma ownership
-        result.push(Span::styled(display.to_string(), style));
-        consumed += display.len();
+        if !display.is_empty() {
+            let fg = syntect_color_to_ratatui(token.style.foreground);
+            let style = Style::default().fg(fg).bg(bg);
+            // CLONE: necesario — display puede ser slice del cache, Span toma ownership
+            result.push(Span::styled(display.to_string(), style));
+        }
+        consumed = token_end;
     }
 
     result
@@ -807,16 +1109,22 @@ fn syntax_fg_at(col: usize, syntax_colors: &[(usize, Color)]) -> Option<Color> {
 ///
 /// Prioridad de capas:
 /// 1. **Cursor secundario** (REVERSED) — máxima prioridad
-/// 2. **Selección** — override de background, mantiene fg de syntax
-/// 3. **Diagnóstico** — agrega underline al estilo base
-/// 4. **Syntax highlight** — foreground del token
-/// 5. **Normal** — estilo base (fg_primary + bg_primary/active_line)
+/// 2. **Bracket match** (accent + bold) — resaltado de bracket par
+/// 3. **Selección** — override de background, mantiene fg de syntax
+/// 4. **Diagnóstico** — agrega underline al estilo base
+/// 5. **Syntax highlight** — foreground del token
+/// 6. **Normal** — estilo base (fg_primary + bg_primary/active_line)
+///
+/// `col`: byte offset dentro del texto local (puede empezar en `col_offset`).
+/// `col_offset`: offset de la zona de indentación para ajustar syntax lookups.
+/// `local_bracket_col`: columna local del bracket match (si existe) con su estilo.
 #[expect(
     clippy::too_many_arguments,
     reason = "render helper — pasar struct de estilos agregaría complejidad sin beneficio"
 )]
 fn char_style_with_highlight(
     col: usize,
+    col_offset: usize,
     selected_ranges: &[(usize, usize)],
     cursor_cols: &[usize],
     diagnostics: &[(usize, usize, &lsp::DiagnosticSeverity)],
@@ -828,14 +1136,24 @@ fn char_style_with_highlight(
     diag_warning_style: Style,
     is_cursor_line: bool,
     active_line_bg: Color,
+    local_bracket_col: Option<(usize, Style)>,
 ) -> Style {
     // Cursor secundario tiene prioridad visual máxima
     if cursor_cols.contains(&col) {
         return cursor_style;
     }
 
+    // Bracket match: prioridad alta (debajo de cursor secundario)
+    if let Some((bracket_col, bstyle)) = local_bracket_col
+        && col == bracket_col
+    {
+        return bstyle;
+    }
+
     // Base: syntax highlight o normal
-    let base_fg = syntax_fg_at(col, syntax_colors);
+    // Ajustar col con col_offset para buscar en syntax_colors (que usa offsets absolutos)
+    let abs_col = col + col_offset;
+    let base_fg = syntax_fg_at(abs_col, syntax_colors);
     let base_bg = if is_cursor_line {
         active_line_bg
     } else {
