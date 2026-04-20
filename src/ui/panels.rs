@@ -12,6 +12,8 @@ use ratatui::{
     Frame,
 };
 
+use std::path::Path;
+
 use crate::editor::highlighting::HighlightToken;
 use crate::editor::indent;
 
@@ -258,6 +260,7 @@ pub fn render_sidebar(
 
 /// Renderiza una entrada del explorer como una `Line` de ratatui.
 ///
+/// Incluye icono por extensión con color semántico antes del nombre.
 /// No aloca `format!()` — construye spans directamente.
 /// El highlight de selección usa `bg_active` del theme.
 fn render_explorer_entry<'a>(
@@ -266,22 +269,25 @@ fn render_explorer_entry<'a>(
     max_width: usize,
     theme: &'a Theme,
 ) -> Line<'a> {
+    use crate::ui::icons;
+
     // Indentación: 2 espacios por nivel de profundidad
     let indent_width = entry.depth * 2;
 
-    // Icono: directorios `▸`/`▾`, archivos espacio
-    let icon = if entry.is_dir {
-        if entry.expanded {
-            "▾ "
-        } else {
-            "▸ "
-        }
+    // Icono de directorio (▸/▾) o file icon por extensión
+    let (dir_indicator, file_icon_str, icon_color) = if entry.is_dir {
+        let indicator = if entry.expanded { "\u{25BE} " } else { "\u{25B8} " };
+        let dir_ico = icons::dir_icon(entry.expanded);
+        (indicator, dir_ico, icons::dir_icon_color())
     } else {
-        "  "
+        // Archivos: sin indicator de directorio, con file icon
+        ("", icons::file_icon(&entry.name), icons::icon_color(&entry.name))
     };
 
     // Calcular cuánto espacio queda para el nombre
-    let prefix_len = indent_width + icon.len();
+    // dir_indicator (2 o 0) + file_icon (2) + " " (1) + nombre
+    let icon_total_len = dir_indicator.len() + file_icon_str.len() + 1; // +1 espacio después del icono
+    let prefix_len = indent_width + icon_total_len;
     let name_max = max_width.saturating_sub(prefix_len);
     let display_name = crate::ui::truncate_str(&entry.name, name_max);
 
@@ -297,8 +303,9 @@ fn render_explorer_entry<'a>(
         theme.fg_primary
     };
 
-    let style = Style::default().fg(fg).bg(bg);
+    let name_style = Style::default().fg(fg).bg(bg);
     let indent_style = Style::default().bg(bg);
+    let icon_style = Style::default().fg(icon_color).bg(bg);
 
     // Construir indent string — pre-allocated con capacidad conocida
     // Usar un literal de espacios y tomar un slice es más eficiente
@@ -308,11 +315,14 @@ fn render_explorer_entry<'a>(
 
     // CLONE: necesario en display_name.to_string() — Span::styled toma ownership
     // de String, y display_name es un slice de entry.name que no podemos mover
-    let spans = vec![
-        Span::styled(indent_str, indent_style),
-        Span::styled(icon, style),
-        Span::styled(display_name.to_string(), style),
-    ];
+    let mut spans = Vec::with_capacity(5);
+    spans.push(Span::styled(indent_str, indent_style));
+    if !dir_indicator.is_empty() {
+        spans.push(Span::styled(dir_indicator, name_style));
+    }
+    spans.push(Span::styled(file_icon_str, icon_style));
+    spans.push(Span::styled(" ", indent_style));
+    spans.push(Span::styled(display_name.to_string(), name_style));
 
     Line::from(spans)
 }
@@ -346,6 +356,8 @@ pub fn render_editor_area(
     diagnostics: &[lsp::Diagnostic],
     tab_infos: &[TabInfo],
     bracket_match: Option<(Position, Position)>,
+    file_path: Option<&Path>,
+    workspace_root: Option<&Path>,
 ) {
     let block = panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
 
@@ -356,15 +368,20 @@ pub fn render_editor_area(
         return;
     }
 
-    // ── Tab bar: 1 línea de pestañas arriba del contenido ──
-    let (tab_bar_area, content_area) = {
+    // ── Tab bar (1) + Breadcrumbs (1) + Content (resto) ──
+    let (tab_bar_area, breadcrumbs_area, content_area) = {
         let split = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Fill(1)])
+            .constraints([
+                Constraint::Length(1), // tab bar
+                Constraint::Length(1), // breadcrumbs
+                Constraint::Fill(1),   // editor content
+            ])
             .split(inner);
-        (split[0], split[1])
+        (split[0], split[1], split[2])
     };
     render_tab_bar(f, tab_bar_area, theme, tab_infos);
+    render_breadcrumbs(f, breadcrumbs_area, theme, file_path, workspace_root);
 
     let inner = content_area;
     if inner.height == 0 || inner.width == 0 {
@@ -1199,7 +1216,7 @@ fn char_style_with_highlight(
 
 /// Renderiza la barra de tabs del editor.
 ///
-/// Cada tab muestra: `│ filename.ext ● │` (dirty) o `│ filename.ext × │` (activa, para cerrar).
+/// Cada tab muestra: `│ Rs filename.ext ● │` con icono por extensión.
 /// Tab activa: background `bg_active`, texto `fg_accent`.
 /// Tabs inactivas: background `bg_secondary`, texto `fg_secondary`.
 /// `●` (U+25CF) en `fg_warning` cuando dirty.
@@ -1208,17 +1225,23 @@ fn char_style_with_highlight(
 ///
 /// No aloca strings innecesarios — los nombres vienen pre-computados en `TabInfo`.
 fn render_tab_bar(f: &mut Frame, area: Rect, theme: &Theme, tabs: &[TabInfo]) {
+    use crate::ui::icons;
+
     if area.width == 0 || tabs.is_empty() {
         return;
     }
 
     let max_width = area.width as usize;
-    let mut spans: Vec<Span<'_>> = Vec::with_capacity(tabs.len() * 4);
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(tabs.len() * 5);
     let mut used_width: usize = 0;
     let mut truncated = false;
 
     for tab in tabs {
-        // Calcular ancho de esta tab: "│ " + name + " ●" o " ×" + " "
+        // Obtener icono para esta tab
+        let icon = icons::file_icon(&tab.name);
+        let icon_color = icons::icon_color(&tab.name);
+
+        // Calcular ancho de esta tab: "│ " + icon(2) + " " + name + " ●" o " ×" + " "
         // Indicador: dirty → " ●", activa → " ×", limpia+inactiva → nada
         let indicator = if tab.is_dirty {
             " \u{25CF}" // " ●"
@@ -1227,8 +1250,8 @@ fn render_tab_bar(f: &mut Frame, area: Rect, theme: &Theme, tabs: &[TabInfo]) {
         } else {
             ""
         };
-        // "│ " (2) + name.len() + indicator.len() + " " (1 padding derecho)
-        let tab_width = 2 + tab.name.len() + indicator.len() + 1;
+        // "│ " (2) + icon(2) + " "(1) + name.len() + indicator.len() + " " (1 padding)
+        let tab_width = 2 + icon.len() + 1 + tab.name.len() + indicator.len() + 1;
 
         // Verificar si cabe — si no, mostrar "…" y cortar
         if used_width + tab_width + 1 > max_width {
@@ -1258,6 +1281,9 @@ fn render_tab_bar(f: &mut Frame, area: Rect, theme: &Theme, tabs: &[TabInfo]) {
 
         // Separador izquierdo
         spans.push(Span::styled("\u{2502} ", sep_style));
+        // Icono con color semántico
+        spans.push(Span::styled(icon, Style::default().fg(icon_color).bg(bg)));
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
         // Nombre del archivo
         spans.push(Span::styled(tab.name.as_str(), tab_style));
 
@@ -1291,6 +1317,108 @@ fn render_tab_bar(f: &mut Frame, area: Rect, theme: &Theme, tabs: &[TabInfo]) {
 
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(paragraph, area);
+}
+
+// ─── Breadcrumbs ───────────────────────────────────────────────────────────────
+
+/// Renderiza la barra de breadcrumbs debajo de las tabs.
+///
+/// Muestra el path relativo al workspace root desglosado en segmentos
+/// separados por `>`. El último segmento (archivo) incluye su icono
+/// con color semántico. Los segmentos intermedios (directorios) se
+/// muestran en `fg_secondary`. El separador `>` en color dimmed.
+///
+/// Si no hay archivo abierto, renderiza una fila vacía con el background
+/// de breadcrumbs. No aloca `format!()` — construye spans directamente.
+fn render_breadcrumbs(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    file_path: Option<&Path>,
+    workspace_root: Option<&Path>,
+) {
+    use crate::ui::icons;
+
+    // Background de breadcrumbs: ligeramente diferente al editor
+    let breadcrumb_bg = theme.bg_secondary;
+
+    if area.width == 0 {
+        return;
+    }
+
+    let Some(file_path) = file_path else {
+        // Sin archivo — fila vacía con background
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "",
+            Style::default().bg(breadcrumb_bg),
+        )))
+        .style(Style::default().bg(breadcrumb_bg));
+        f.render_widget(empty, area);
+        return;
+    };
+
+    // Calcular path relativo al workspace root
+    let relative = workspace_root
+        .and_then(|root| file_path.strip_prefix(root).ok())
+        .unwrap_or(file_path);
+
+    // Separar en componentes del path
+    let components: Vec<&str> = relative
+        .iter()
+        .filter_map(|c| c.to_str())
+        .collect();
+
+    if components.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "",
+            Style::default().bg(breadcrumb_bg),
+        )))
+        .style(Style::default().bg(breadcrumb_bg));
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let separator_style = Style::default()
+        .fg(theme.border_unfocused)
+        .bg(breadcrumb_bg);
+    let dir_style = Style::default()
+        .fg(theme.fg_secondary)
+        .bg(breadcrumb_bg);
+
+    let last_idx = components.len() - 1;
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(components.len() * 3 + 1);
+
+    // Padding izquierdo
+    spans.push(Span::styled(" ", Style::default().bg(breadcrumb_bg)));
+
+    for (i, component) in components.iter().enumerate() {
+        if i == last_idx {
+            // Último segmento: archivo con icono + color accent
+            let icon = icons::file_icon(component);
+            let icon_color = icons::icon_color(component);
+            spans.push(Span::styled(
+                icon,
+                Style::default().fg(icon_color).bg(breadcrumb_bg),
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(breadcrumb_bg)));
+            spans.push(Span::styled(
+                *component,
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .bg(breadcrumb_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            // Segmentos intermedios: directorios en color secundario
+            spans.push(Span::styled(*component, dir_style));
+            // Separador ` > `
+            spans.push(Span::styled(" \u{203A} ", separator_style));
+        }
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line).style(Style::default().bg(breadcrumb_bg));
     f.render_widget(paragraph, area);
 }
 

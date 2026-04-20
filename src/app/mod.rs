@@ -1895,8 +1895,14 @@ fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16,
         return;
     }
 
-    // Ajustar coordenadas: el contenido empieza 1 fila después de la tab bar
-    let content_y = inner_y + 1;
+    // ── Click en breadcrumbs (segunda fila del inner area) ──
+    let breadcrumbs_row = inner_y + 1;
+    if row == breadcrumbs_row {
+        return; // Breadcrumbs no son interactivos por ahora
+    }
+
+    // Ajustar coordenadas: el contenido empieza 2 filas después (tab bar + breadcrumbs)
+    let content_y = inner_y + 2;
     if row < content_y {
         return;
     }
@@ -1955,17 +1961,19 @@ fn resolve_tab_click(state: &mut AppState, col: u16, inner_x: u16) {
 
     let mut accumulated: usize = 0;
     for (i, tab) in tab_infos.iter().enumerate() {
-        // Mismo cálculo que render_tab_bar:
-        // "│ " (2) + name.len() + indicator.len() + " " (1)
+        // Mismo cálculo que render_tab_bar (con iconos):
+        // "│ " (2) + icon(2) + " "(1) + name.len() + indicator.len() + " " (1)
+        let icon = crate::ui::icons::file_icon(&tab.name);
         let has_indicator = tab.is_dirty || tab.is_active;
         let indicator_len: usize = if has_indicator { 2 } else { 0 };
-        let tab_width = 2 + tab.name.len() + indicator_len + 1;
+        let tab_width = 2 + icon.len() + 1 + tab.name.len() + indicator_len + 1;
 
         if click_col >= accumulated && click_col < accumulated + tab_width {
             // Click cayó en esta tab
             if tab.is_active && !tab.is_dirty {
                 // Verificar si clickeó en la zona del "×" (últimos 2 chars antes del padding)
-                let close_start = accumulated + 2 + tab.name.len();
+                // "│ "(2) + icon(2) + " "(1) + name = close_start
+                let close_start = accumulated + 2 + icon.len() + 1 + tab.name.len();
                 if click_col >= close_start && click_col < close_start + 2 {
                     // Click en el ×: cerrar tab
                     state.tabs.close_active();
@@ -2006,10 +2014,10 @@ fn reduce_mouse_drag(state: &mut AppState, col: u16, row: u16) {
 
 /// Procesa drag en el editor — extiende selección desde anchor hasta posición del drag.
 fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
-    // Calcular inner area del editor (descontar bordes del Block + tab bar)
-    let inner_y = layout.editor_area.y + 1 + 1; // +1 borde, +1 tab bar
+    // Calcular inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
+    let inner_y = layout.editor_area.y + 1 + 2; // +1 borde, +1 tab bar, +1 breadcrumbs
     let inner_x = layout.editor_area.x + 1;
-    let inner_height = layout.editor_area.height.saturating_sub(3); // bordes + tab bar
+    let inner_height = layout.editor_area.height.saturating_sub(4); // bordes + tab bar + breadcrumbs
 
     // Clampear row al rango visible del editor para permitir scroll
     // cuando el drag sale por arriba o abajo del viewport
@@ -2300,10 +2308,10 @@ async fn event_loop(
         //      Se hace ANTES del render para que ensure_cursor_visible funcione
         //      con dimensiones correctas. Descontar bordes (2) + tab bar (1) + gutter dinámico.
         {
-            // Restar 1 línea para la barra de tabs (siempre visible)
-            let tab_bar_lines: usize = 1;
+            // Restar 2 líneas para la barra de tabs (1) + breadcrumbs (1)
+            let chrome_lines: usize = 2; // tab bar + breadcrumbs
             let editor_inner_h = (layout.editor_area.height.saturating_sub(2) as usize)
-                .saturating_sub(tab_bar_lines);
+                .saturating_sub(chrome_lines);
             let editor_inner_w = layout.editor_area.width.saturating_sub(2) as usize;
             // Gutter width dinámico: dígitos del total de líneas (mín 4) + 2 (separador)
             let editor = state.tabs.active_mut();

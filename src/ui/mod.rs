@@ -7,6 +7,7 @@
 
 pub mod branch_picker;
 pub mod git_panel;
+pub mod icons;
 pub mod layout;
 pub mod palette;
 pub mod panels;
@@ -132,6 +133,9 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         .file_path()
         .map(|p| state.lsp.diagnostics_for(p))
         .unwrap_or(&[]);
+    // Path del archivo activo y workspace root para breadcrumbs
+    let active_file_path = editor.buffer.file_path();
+    let workspace_root = state.explorer.as_ref().map(|e| e.root.as_path());
     panels::render_editor_area(
         f,
         layout.editor_area,
@@ -141,6 +145,8 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         current_diagnostics,
         &tab_infos,
         state.bracket_match,
+        active_file_path,
+        workspace_root,
     );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
@@ -152,12 +158,12 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
-        // Inner area del editor (descontar bordes del Block + tab bar)
+        // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
         let inner_x = layout.editor_area.x + 1;
-        // +1 borde superior, +1 tab bar = +2 desde editor_area.y
-        let tab_bar_offset: u16 = 1; // La barra de tabs ocupa 1 línea
-        let inner_y = layout.editor_area.y + 1 + tab_bar_offset;
-        let inner_h = layout.editor_area.height.saturating_sub(2 + tab_bar_offset) as usize;
+        // +1 borde superior, +1 tab bar, +1 breadcrumbs = +3 desde editor_area.y
+        let chrome_offset: u16 = 2; // tab bar (1) + breadcrumbs (1)
+        let inner_y = layout.editor_area.y + 1 + chrome_offset;
+        let inner_h = layout.editor_area.height.saturating_sub(2 + chrome_offset) as usize;
 
         let editor = state.tabs.active();
         let scroll = editor.viewport.scroll_offset;
