@@ -6,6 +6,7 @@
 
 pub mod buffer;
 pub mod cursor;
+pub mod highlighting;
 pub mod multicursor;
 pub mod search;
 pub mod selection;
@@ -19,6 +20,7 @@ use anyhow::Result;
 
 use buffer::TextBuffer;
 use cursor::Position;
+use highlighting::{HighlightCache, HighlightEngine};
 use multicursor::MultiCursorState;
 use selection::Selection;
 use undo::{EditOperation, UndoStack};
@@ -45,6 +47,8 @@ pub struct EditorState {
     /// Búsqueda local activa (None si no hay búsqueda).
     #[expect(dead_code, reason = "se usará cuando se implemente búsqueda en editor")]
     pub search: Option<search::BufferSearch>,
+    /// Cache de syntax highlighting para este buffer.
+    pub highlight_cache: HighlightCache,
 }
 
 impl EditorState {
@@ -56,10 +60,15 @@ impl EditorState {
             viewport: Viewport::new(),
             undo_stack: UndoStack::new(),
             search: None,
+            highlight_cache: HighlightCache::new(),
         }
     }
 
     /// Abre un archivo y crea un editor con su contenido.
+    ///
+    /// Si se pasa `engine`, detecta la syntax del archivo y prepara
+    /// el cache de highlighting. Si `engine` es `None`, el cache queda
+    /// vacío (sin syntax — el render usará color uniforme).
     pub fn open_file(path: &Path) -> Result<Self> {
         let buffer = TextBuffer::from_file(path)?;
         Ok(Self {
@@ -68,7 +77,21 @@ impl EditorState {
             viewport: Viewport::new(),
             undo_stack: UndoStack::new(),
             search: None,
+            highlight_cache: HighlightCache::new(),
         })
+    }
+
+    /// Inicializa el cache de highlighting con el motor de syntect.
+    ///
+    /// Detecta la syntax por extensión del archivo y crea el cache.
+    /// Se llama después de `open_file` cuando el `HighlightEngine`
+    /// está disponible (vive en `AppState`).
+    pub fn init_highlighting(&mut self, engine: &HighlightEngine) {
+        if let Some(path) = self.buffer.file_path()
+            && let Some(syntax) = engine.detect_syntax(path)
+        {
+            self.highlight_cache = HighlightCache::with_syntax(syntax.name.as_str());
+        }
     }
 
     /// Inserta un carácter en la posición de todos los cursores.
@@ -104,6 +127,7 @@ impl EditorState {
             self.cursors.cursors[i].sync_desired_col();
             self.cursors.cursors[i].clear_selection();
         }
+        self.highlight_cache.invalidate();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -157,6 +181,7 @@ impl EditorState {
             }
             self.cursors.cursors[i].clear_selection();
         }
+        self.highlight_cache.invalidate();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -183,6 +208,7 @@ impl EditorState {
             self.cursors.cursors[i].sync_desired_col();
             self.cursors.cursors[i].clear_selection();
         }
+        self.highlight_cache.invalidate();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -558,6 +584,7 @@ impl EditorState {
         primary.clear_selection();
         // Limpiar cursores secundarios en undo
         self.cursors.clear_secondary();
+        self.highlight_cache.invalidate();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
@@ -598,6 +625,7 @@ impl EditorState {
         primary.sync_desired_col();
         primary.clear_selection();
         self.cursors.clear_secondary();
+        self.highlight_cache.invalidate();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
