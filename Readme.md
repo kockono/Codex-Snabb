@@ -6,7 +6,7 @@
 
 ## ¿Qué es?
 
-**IDE-Rust** busca llevar a terminal una experiencia de trabajo estilo IDE sin arrastrar el costo operativo típico de una app gráfica pesada.
+**IDE-Rust** busca llevar a terminal una experiencia de trabajo estilo IDE agradable sin necesitar una curva de aprendizaje alta y sin el costo de un entorno gráfico pesado a cambio de una curva de aprendizaje baja. Lo mejor de 2 mundos.
 
 La propuesta no es “meter VS Code entero en una TTY”. La propuesta es más disciplinada:
 
@@ -23,20 +23,20 @@ En otras palabras: una **TUI seria para trabajo diario**, hecha en Rust, donde p
 ┌ IDE-Rust ───────────────────────────────────────────────────────────────────────────┐
 │ Explorer                  │ editor.rs                                               │
 ├───────────────────────────┬─────────────────────────────────────────────────────────┤
-│ ▸ src/                    │  12 fn reduce(state: &mut AppState, action: Action) {  │
+│ ▸ src/                    │  12 fn reduce(state: &mut AppState, action: Action) {   │
 │   ▸ app/                  │  13     match action {                                  │
-│   ▸ core/                 │  14         Action::OpenPalette => { ... }             │
-│   ▸ ui/                   │  15         Action::ToggleSidebar => { ... }           │
+│   ▸ core/                 │  14         Action::OpenPalette => { ... }              │
+│   ▸ ui/                   │  15         Action::ToggleSidebar => { ... }            │
 │ ▸ Cargo.toml              │  16     }                                               │
 │ ▸ architecture.md         │                                                         │
 │ ▸ roadmap.md              │  42 // viewport virtualizado + render incremental       │
 │                           │                                                         │
 ├───────────────────────────┴─────────────────────────────────────────────────────────┤
 │ Search / Terminal / Git / Problems                                                  │
-│ > cargo test                                                                         │
-├──────────────────────────────────────────────────────────────────────────────────────┤
+│ > cargo test                                                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
 │ NORMAL | editor.rs [+] | Ln 42, Col 7 | main | UTF-8                                │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Ese layout no es marketing: coincide con la dirección visible del proyecto (`src/ui/layout.rs`, `src/ui/mod.rs`) y con la arquitectura documentada.
