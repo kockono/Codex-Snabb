@@ -29,17 +29,24 @@ use super::buffer::TextBuffer;
 
 /// Margen de líneas extra a tokenizar antes/después del viewport visible.
 /// Suaviza el scroll: al desplazarse, las líneas adyacentes ya están cacheadas.
-const VIEWPORT_MARGIN: usize = 20;
+/// 50 líneas: con scroll de 1 línea por evento, da ~50 eventos de margen.
+const VIEWPORT_MARGIN: usize = 50;
 
 /// Tiempo mínimo entre la última edición y el re-highlight (debounce).
 /// Evita re-tokenizar en cada keystroke durante escritura rápida.
+/// Solo aplica a invalidaciones por edición, NO a scroll.
 const DEBOUNCE_MS: u64 = 150;
 
 /// Intervalo de líneas entre checkpoints de parse state.
 /// Cada N líneas se guarda el estado del parser para poder retomar
 /// desde el checkpoint más cercano al viewport en vez de línea 0.
-/// 50 líneas: balance entre granularidad y uso de memoria.
-const CHECKPOINT_INTERVAL: usize = 50;
+/// 25 líneas: más checkpoints = re-inicio más rápido durante pre-cache.
+const CHECKPOINT_INTERVAL: usize = 25;
+
+/// Cantidad de líneas a pre-cachear por frame en idle.
+/// 200 líneas por tick: a ~60fps idle, un archivo de 12k líneas
+/// se pre-cachea en ~1 segundo sin impactar latencia de input.
+const PRECACHE_CHUNK_SIZE: usize = 200;
 
 // ─── HighlightEngine ──────────────────────────────────────────────────────────
 
@@ -259,6 +266,12 @@ pub struct HighlightCache {
     /// Permite retomar highlighting desde el checkpoint más cercano al viewport
     /// en vez de recorrer desde línea 0.
     checkpoints: HashMap<usize, SavedParseState>,
+    /// Si el pre-cache progresivo del archivo completo está en progreso.
+    /// Se inicia después del primer highlight del viewport y avanza en idle frames.
+    precache_in_progress: bool,
+    /// Hasta qué línea se ha pre-cacheado (exclusivo).
+    /// Avanza en chunks de `PRECACHE_CHUNK_SIZE` por frame idle.
+    precache_cursor: usize,
 }
 
 impl HighlightCache {
@@ -273,6 +286,8 @@ impl HighlightCache {
             buffer_line_count: 0,
             last_edit_time: None,
             checkpoints: HashMap::new(),
+            precache_in_progress: false,
+            precache_cursor: 0,
         }
     }
 
@@ -287,13 +302,16 @@ impl HighlightCache {
             buffer_line_count: 0,
             last_edit_time: None,
             checkpoints: HashMap::new(),
+            precache_in_progress: false,
+            precache_cursor: 0,
         }
     }
 
     /// Marca el cache como dirty desde una línea específica.
     ///
     /// Solo invalida desde `line` en adelante — las líneas anteriores
-    /// mantienen su cache válido. También invalida checkpoints >= line.
+    /// mantienen su cache válido. También invalida checkpoints >= line
+    /// y resetea el pre-cache si la edición afecta líneas ya pre-cacheadas.
     pub fn invalidate_from(&mut self, line: usize) {
         self.last_edit_time = Some(Instant::now());
         match self.dirty_from {
@@ -308,7 +326,14 @@ impl HighlightCache {
         }
         // Invalidar checkpoints desde la línea editada en adelante.
         // Los checkpoints antes de la edición siguen siendo válidos.
-        self.checkpoints.retain(|&checkpoint_line, _| checkpoint_line < line);
+        self.checkpoints
+            .retain(|&checkpoint_line, _| checkpoint_line < line);
+        // Resetear pre-cache: si la edición está antes del cursor de pre-cache,
+        // necesitamos re-procesar desde ahí. Si está después, no afecta.
+        if line < self.precache_cursor {
+            self.precache_cursor = line;
+            self.precache_in_progress = true;
+        }
     }
 
     /// Marca TODO el cache como dirty — para carga inicial o cambio de syntax.
@@ -316,6 +341,9 @@ impl HighlightCache {
         self.last_edit_time = Some(Instant::now());
         self.dirty_from = Some(0);
         self.checkpoints.clear();
+        // Resetear pre-cache completo — todo debe re-procesarse.
+        self.precache_in_progress = false;
+        self.precache_cursor = 0;
     }
 
     /// Si el cache tiene syntax asociada.
@@ -403,7 +431,7 @@ impl HighlightCache {
     ///
     /// Lógica:
     /// 1. Si el engine no está listo: noop (el editor renderiza texto plano)
-    /// 2. Si hay debounce activo (editando rápido): noop
+    /// 2. Si hay debounce activo por EDICIÓN: noop (scroll no tiene debounce)
     /// 3. Si el viewport no cambió y no hay líneas dirty en el rango: noop
     /// 4. Si hay que procesar: buscar checkpoint más cercano al viewport,
     ///    iterar desde checkpoint hasta viewport_end + margen,
@@ -427,11 +455,13 @@ impl HighlightCache {
             return;
         }
 
-        // Debounce: si la última edición fue hace menos de DEBOUNCE_MS, esperar
-        if let Some(edit_time) = self.last_edit_time
+        // Debounce: SOLO si la invalidación fue por edición (dirty_from is Some).
+        // Scroll puro (solo cambio de viewport, dirty_from es None) procesa inmediatamente.
+        if self.dirty_from.is_some()
+            && let Some(edit_time) = self.last_edit_time
             && edit_time.elapsed() < Duration::from_millis(DEBOUNCE_MS)
         {
-            return; // Esperando debounce — no re-tokenizar
+            return; // Esperando debounce de edición — no re-tokenizar
         }
 
         // Calcular rango efectivo del viewport con margen
@@ -446,10 +476,20 @@ impl HighlightCache {
                 dirty_line < effective_end
             }
             None => {
-                // Cache limpio — ¿cambió el viewport?
-                effective_start != self.last_viewport_start
-                    || effective_end != self.last_viewport_end
-                    || line_count != self.buffer_line_count
+                // Cache limpio — ¿cambió el viewport y hay líneas sin cachear?
+                // Si el archivo completo está pre-cacheado, verificar que todas
+                // las líneas del viewport están en cache (cache hit puro).
+                let viewport_fully_cached =
+                    (effective_start..effective_end).all(|line| self.lines.contains_key(&line));
+                if viewport_fully_cached {
+                    // Actualizar metadata sin re-procesar
+                    self.last_viewport_start = effective_start;
+                    self.last_viewport_end = effective_end;
+                    self.buffer_line_count = line_count;
+                    return; // Cache hit puro — 0 trabajo
+                }
+                // Hay líneas sin cachear en el viewport
+                true
             }
         };
 
@@ -479,9 +519,8 @@ impl HighlightCache {
             self.lines.retain(|&line_idx, _| line_idx < dirty_line);
         }
 
-        // Limpiar líneas fuera del rango del viewport actual + margen
-        self.lines
-            .retain(|&line_idx, _| line_idx >= effective_start && line_idx < effective_end);
+        // NO limpiar líneas fuera del viewport — las mantiene el pre-cache.
+        // Solo limpiamos en dirty; scroll no invalida líneas pre-cacheadas.
 
         // ── Determinar punto de inicio usando checkpoints ──
         //
@@ -578,6 +617,165 @@ impl HighlightCache {
         self.last_viewport_end = effective_end;
         self.buffer_line_count = line_count;
         self.dirty_from = None;
+
+        // Iniciar pre-cache progresivo si no está ya en progreso.
+        // Después del primer highlight del viewport, empezar a pre-cachear
+        // el resto del archivo en idle frames.
+        if !self.precache_in_progress && self.precache_cursor < line_count {
+            self.precache_in_progress = true;
+            // Iniciar pre-cache desde el final del viewport actual
+            // (el viewport ya está cacheado, pre-cachear el resto).
+            if self.precache_cursor < effective_end {
+                self.precache_cursor = effective_end;
+            }
+        }
+    }
+
+    /// Pre-cachea un chunk de líneas fuera del viewport actual.
+    ///
+    /// Llamar en cada frame del event loop cuando no hay eventos de usuario.
+    /// Procesa `PRECACHE_CHUNK_SIZE` líneas desde `precache_cursor`,
+    /// guardando tokens y checkpoints. Avanza el cursor para el siguiente frame.
+    ///
+    /// Retorna `true` si todavía hay trabajo pendiente (más líneas por cachear).
+    /// Retorna `false` si el pre-cache terminó o no hay nada que hacer.
+    pub fn precache_chunk(&mut self, buffer: &TextBuffer, engine: &HighlightEngine) -> bool {
+        // Nada que hacer si el pre-cache no está activo
+        if !self.precache_in_progress {
+            return false;
+        }
+
+        // Engine no listo — no pre-cachear
+        if !engine.is_ready() {
+            return false;
+        }
+
+        // Sin syntax — nada que pre-cachear
+        if self.syntax_name.is_empty() {
+            self.precache_in_progress = false;
+            return false;
+        }
+
+        let line_count = buffer.line_count();
+
+        // Ya terminamos — todo el archivo está pre-cacheado
+        if self.precache_cursor >= line_count {
+            self.precache_in_progress = false;
+            tracing::debug!(
+                lines_cached = self.lines.len(),
+                checkpoints = self.checkpoints.len(),
+                "pre-cache completo — archivo entero cacheado"
+            );
+            return false;
+        }
+
+        // Obtener referencia al syntax_set y theme del engine
+        let Some(syntax_set) = engine.syntax_set() else {
+            return false;
+        };
+        let Some(theme) = engine.theme() else {
+            return false;
+        };
+
+        // Buscar la syntax por nombre
+        let Some(syntax) = syntax_set.find_syntax_by_name(&self.syntax_name) else {
+            self.precache_in_progress = false;
+            return false;
+        };
+
+        // Buscar checkpoint más cercano al cursor de pre-cache
+        let (start_line, mut highlighter) = match self
+            .find_nearest_checkpoint(self.precache_cursor)
+            .and_then(|cp_line| {
+                let saved = self.checkpoints.get(&cp_line)?;
+                // CLONE: necesario — from_state consume los states, pero
+                // necesitamos mantener el checkpoint en el HashMap para futuros usos.
+                let hl = HighlightLines::from_state(
+                    theme,
+                    saved.highlight_state.clone(),
+                    saved.parse_state.clone(),
+                );
+                Some((cp_line, hl))
+            }) {
+            Some((cp_line, hl)) => (cp_line, hl),
+            None => {
+                // Sin checkpoints — empezar desde línea 0
+                (0, HighlightLines::new(syntax, theme))
+            }
+        };
+
+        let chunk_end = (self.precache_cursor + PRECACHE_CHUNK_SIZE).min(line_count);
+
+        // Buffer reutilizable para evitar allocation en cada línea
+        let mut line_buf = String::with_capacity(256);
+
+        for i in start_line..chunk_end {
+            let line_text = buffer.line(i).unwrap_or("");
+
+            // Preparar línea con newline para syntect
+            line_buf.clear();
+            line_buf.push_str(line_text);
+            if i < line_count - 1 {
+                line_buf.push('\n');
+            }
+
+            // Highlight la línea
+            let highlight_result = highlighter.highlight_line(&line_buf, syntax_set);
+
+            // Solo cachear si la línea está en el rango del chunk actual
+            // y no está ya cacheada (las líneas entre checkpoint y precache_cursor
+            // solo se procesan para avanzar el parse state).
+            let in_chunk = i >= self.precache_cursor;
+            let already_cached = self.lines.contains_key(&i);
+
+            if in_chunk && !already_cached {
+                let tokens = match highlight_result {
+                    Ok(ranges) => ranges
+                        .into_iter()
+                        .map(|(style, text)| {
+                            let clean_text = text.trim_end_matches('\n');
+                            HighlightToken {
+                                style,
+                                text: clean_text.to_owned(),
+                            }
+                        })
+                        .filter(|t| !t.text.is_empty())
+                        .collect(),
+                    Err(_) => {
+                        vec![HighlightToken {
+                            style: SyntectStyle::default(),
+                            text: line_text.to_owned(),
+                        }]
+                    }
+                };
+                self.lines.insert(i, tokens);
+            }
+
+            // Guardar checkpoint cada CHECKPOINT_INTERVAL líneas
+            let next_line = i + 1;
+            if next_line % CHECKPOINT_INTERVAL == 0
+                && next_line < line_count
+                && !self.checkpoints.contains_key(&next_line)
+            {
+                highlighter = self.save_checkpoint(highlighter, next_line, theme);
+            }
+        }
+
+        // Avanzar cursor de pre-cache
+        self.precache_cursor = chunk_end;
+
+        // ¿Terminamos?
+        if self.precache_cursor >= line_count {
+            self.precache_in_progress = false;
+            tracing::debug!(
+                lines_cached = self.lines.len(),
+                checkpoints = self.checkpoints.len(),
+                "pre-cache completo — archivo entero cacheado"
+            );
+            false
+        } else {
+            true // Hay más trabajo pendiente
+        }
     }
 }
 
@@ -591,6 +789,8 @@ impl std::fmt::Debug for HighlightCache {
             .field("last_viewport_end", &self.last_viewport_end)
             .field("buffer_line_count", &self.buffer_line_count)
             .field("checkpoints_count", &self.checkpoints.len())
+            .field("precache_in_progress", &self.precache_in_progress)
+            .field("precache_cursor", &self.precache_cursor)
             .finish()
     }
 }

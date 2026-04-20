@@ -1680,7 +1680,9 @@ fn editor_gutter_width(line_count: usize) -> u16 {
 }
 
 /// Cantidad de líneas que el scroll del mouse desplaza por evento.
-const MOUSE_SCROLL_LINES: usize = 3;
+/// 1 línea por evento: scroll suave. El usuario controla la velocidad
+/// con la velocidad del wheel (más eventos = más scroll).
+const MOUSE_SCROLL_LINES: usize = 1;
 
 /// Determina en qué panel cayó una posición (col, row) absoluta.
 ///
@@ -2355,6 +2357,22 @@ async fn event_loop(
                     engine,
                     vp_start,
                     vp_height,
+                );
+            }
+        }
+
+        // 7.7. Pre-cache progresivo de highlighting en idle frames.
+        //      Si el último evento fue un tick (no hubo input de usuario),
+        //      usar el tiempo idle para pre-cachear el archivo activo.
+        //      Solo 1 editor por frame para no exceder budget de frame time.
+        {
+            let was_tick = matches!(event, Some(Event::Tick));
+            if was_tick && state.highlight_engine.is_ready() {
+                let engine = &state.highlight_engine;
+                let editor = state.tabs.active_mut();
+                editor.highlight_cache.precache_chunk(
+                    &editor.buffer,
+                    engine,
                 );
             }
         }
