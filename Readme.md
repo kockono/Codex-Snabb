@@ -6,7 +6,7 @@
 
 ## ¿Qué es?
 
-**IDE-Rust** busca llevar a terminal una experiencia de trabajo estilo IDE agradable sin necesitar una curva de aprendizaje alta y sin el costo de un entorno gráfico pesado a cambio de una curva de aprendizaje baja. Lo mejor de 2 mundos.
+**IDE-Rust** busca llevar a termin al una experiencia de trabajo estilo IDE agradable sin necesitar una curva de aprendizaje alta y sin el costo de un entorno gráfico pesado a cambio de una curva de aprendizaje baja. Lo mejor de 2 mundos.
 
 La propuesta no es “meter VS Code entero en una TTY”. La propuesta es más disciplinada:
 
