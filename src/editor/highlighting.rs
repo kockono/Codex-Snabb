@@ -18,8 +18,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style as SyntectStyle, Theme as SyntectTheme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::highlighting::{
+    HighlightState, Style as SyntectStyle, Theme as SyntectTheme, ThemeSet,
+};
+use syntect::parsing::{ParseState, SyntaxReference, SyntaxSet};
 
 use super::buffer::TextBuffer;
 
@@ -32,6 +34,12 @@ const VIEWPORT_MARGIN: usize = 20;
 /// Tiempo mínimo entre la última edición y el re-highlight (debounce).
 /// Evita re-tokenizar en cada keystroke durante escritura rápida.
 const DEBOUNCE_MS: u64 = 150;
+
+/// Intervalo de líneas entre checkpoints de parse state.
+/// Cada N líneas se guarda el estado del parser para poder retomar
+/// desde el checkpoint más cercano al viewport en vez de línea 0.
+/// 50 líneas: balance entre granularidad y uso de memoria.
+const CHECKPOINT_INTERVAL: usize = 50;
 
 // ─── HighlightEngine ──────────────────────────────────────────────────────────
 
@@ -205,12 +213,30 @@ pub struct HighlightToken {
     pub text: String,
 }
 
+/// Estado del parser guardado en un checkpoint.
+///
+/// Contiene `ParseState` y `HighlightState` de syntect clonados en un
+/// punto específico del archivo. Permite retomar el highlighting desde
+/// ese punto sin recorrer desde línea 0.
+struct SavedParseState {
+    /// Estado del parser de syntect (stack de contextos, prototipos).
+    parse_state: ParseState,
+    /// Estado del highlighter (estilos acumulados, scope stack).
+    highlight_state: HighlightState,
+}
+
 /// Cache de highlight por viewport para un buffer.
 ///
 /// Solo cachea tokens de las líneas visibles + margen. Invalidación
 /// parcial: editar línea N solo invalida desde N en adelante.
 /// Debounce: no re-tokenizar hasta que pasen 150ms desde la última edición.
-#[derive(Debug)]
+///
+/// Usa checkpoints de parse state cada `CHECKPOINT_INTERVAL` líneas para
+/// evitar recorrer desde línea 0 en cada scroll. Esto reduce el costo
+/// de scroll de O(viewport_end) a O(CHECKPOINT_INTERVAL + viewport_size).
+///
+/// `Debug` implementado manualmente — `SavedParseState` contiene tipos de
+/// syntect que no necesitan debug detallado, solo mostramos la cantidad.
 pub struct HighlightCache {
     /// Tokens coloreados por línea — solo las líneas cacheadas (viewport + margen).
     /// HashMap<línea_del_buffer, tokens> — disperso, no denso.
@@ -228,6 +254,11 @@ pub struct HighlightCache {
     buffer_line_count: usize,
     /// Timestamp de la última edición — para debounce.
     last_edit_time: Option<Instant>,
+    /// Parse states guardados cada `CHECKPOINT_INTERVAL` líneas.
+    /// Key = número de línea del checkpoint, Value = estado guardado.
+    /// Permite retomar highlighting desde el checkpoint más cercano al viewport
+    /// en vez de recorrer desde línea 0.
+    checkpoints: HashMap<usize, SavedParseState>,
 }
 
 impl HighlightCache {
@@ -241,6 +272,7 @@ impl HighlightCache {
             last_viewport_end: 0,
             buffer_line_count: 0,
             last_edit_time: None,
+            checkpoints: HashMap::new(),
         }
     }
 
@@ -254,13 +286,14 @@ impl HighlightCache {
             last_viewport_end: 0,
             buffer_line_count: 0,
             last_edit_time: None,
+            checkpoints: HashMap::new(),
         }
     }
 
     /// Marca el cache como dirty desde una línea específica.
     ///
     /// Solo invalida desde `line` en adelante — las líneas anteriores
-    /// mantienen su cache válido.
+    /// mantienen su cache válido. También invalida checkpoints >= line.
     pub fn invalidate_from(&mut self, line: usize) {
         self.last_edit_time = Some(Instant::now());
         match self.dirty_from {
@@ -273,12 +306,16 @@ impl HighlightCache {
                 self.dirty_from = Some(line);
             }
         }
+        // Invalidar checkpoints desde la línea editada en adelante.
+        // Los checkpoints antes de la edición siguen siendo válidos.
+        self.checkpoints.retain(|&checkpoint_line, _| checkpoint_line < line);
     }
 
     /// Marca TODO el cache como dirty — para carga inicial o cambio de syntax.
     pub fn invalidate(&mut self) {
         self.last_edit_time = Some(Instant::now());
         self.dirty_from = Some(0);
+        self.checkpoints.clear();
     }
 
     /// Si el cache tiene syntax asociada.
@@ -310,15 +347,67 @@ impl HighlightCache {
         self.dirty_from.is_none()
     }
 
+    /// Busca el checkpoint más cercano ANTES o en `target_line`.
+    ///
+    /// Retorna la línea del checkpoint encontrado, o `None` si no hay
+    /// ningún checkpoint válido antes de `target_line`.
+    fn find_nearest_checkpoint(&self, target_line: usize) -> Option<usize> {
+        // Buscar el checkpoint alineado al intervalo <= target_line.
+        // Empezar desde el checkpoint ideal y bajar hasta encontrar uno que exista.
+        let ideal = (target_line / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+        let mut candidate = ideal;
+        loop {
+            if self.checkpoints.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            if candidate < CHECKPOINT_INTERVAL {
+                return None; // No hay checkpoints antes de target_line
+            }
+            candidate -= CHECKPOINT_INTERVAL;
+        }
+    }
+
+    /// Guarda un checkpoint del parse state en la línea indicada.
+    ///
+    /// Consume el highlighter para extraer el state, lo clona para el
+    /// checkpoint, y reconstruye el highlighter para seguir procesando.
+    ///
+    /// Retorna el highlighter reconstruido.
+    fn save_checkpoint<'a>(
+        &mut self,
+        highlighter: HighlightLines<'a>,
+        line: usize,
+        theme: &'a SyntectTheme,
+    ) -> HighlightLines<'a> {
+        // Consumir highlighter → extraer states
+        let (hl_state, ps_state) = highlighter.state();
+
+        // CLONE: necesario — guardamos una copia en el checkpoint y usamos
+        // los originales para reconstruir el highlighter y seguir procesando.
+        let saved = SavedParseState {
+            parse_state: ps_state.clone(),
+            highlight_state: hl_state.clone(),
+        };
+        self.checkpoints.insert(line, saved);
+
+        // Reconstruir highlighter desde los states originales
+        HighlightLines::from_state(theme, hl_state, ps_state)
+    }
+
     /// Procesa el highlighting solo para las líneas del viewport visible.
+    ///
+    /// Usa checkpoints de parse state para evitar recorrer desde línea 0.
+    /// En cada scroll, busca el checkpoint más cercano al viewport y retoma
+    /// desde ahí, reduciendo el costo de O(viewport_end) a
+    /// O(CHECKPOINT_INTERVAL + viewport_size).
     ///
     /// Lógica:
     /// 1. Si el engine no está listo: noop (el editor renderiza texto plano)
     /// 2. Si hay debounce activo (editando rápido): noop
     /// 3. Si el viewport no cambió y no hay líneas dirty en el rango: noop
-    /// 4. Si hay que procesar: iterar desde línea 0 hasta viewport_end + margen,
-    ///    DESCARTANDO tokens de líneas antes del viewport (solo avanza parse state),
-    ///    y GUARDANDO tokens solo para líneas dentro del viewport + margen.
+    /// 4. Si hay que procesar: buscar checkpoint más cercano al viewport,
+    ///    iterar desde checkpoint hasta viewport_end + margen,
+    ///    guardando tokens del viewport y nuevos checkpoints cada N líneas.
     pub fn ensure_viewport_highlighted(
         &mut self,
         buffer: &TextBuffer,
@@ -385,18 +474,6 @@ impl HighlightCache {
             return;
         };
 
-        // Determinar desde dónde debemos re-tokenizar.
-        // syntect necesita contexto multi-línea: un string abierto en línea 10
-        // afecta las líneas 11+. Debemos procesar desde línea 0 siempre para
-        // mantener el parse state correcto, pero solo GUARDAR tokens del viewport.
-        //
-        // Optimización: si dirty_from > 0 y tenemos cache válido antes de dirty_from,
-        // solo necesitamos invalidar las líneas >= dirty_from.
-        // Sin embargo, el parse state de syntect se propaga, así que siempre
-        // empezamos desde 0 para garantizar correctness.
-
-        let mut highlighter = HighlightLines::new(syntax, theme);
-
         // Limpiar líneas dirty del cache (mantener las clean antes de dirty_from)
         if let Some(dirty_line) = self.dirty_from {
             self.lines.retain(|&line_idx, _| line_idx < dirty_line);
@@ -406,17 +483,49 @@ impl HighlightCache {
         self.lines
             .retain(|&line_idx, _| line_idx >= effective_start && line_idx < effective_end);
 
-        for i in 0..effective_end.min(line_count) {
+        // ── Determinar punto de inicio usando checkpoints ──
+        //
+        // Buscar el checkpoint más cercano ANTES de effective_start.
+        // Si dirty_from existe y está antes del checkpoint, el checkpoint
+        // es inválido (ya fue limpiado en invalidate_from), así que
+        // find_nearest_checkpoint solo encuentra checkpoints válidos.
+        let (start_line, mut highlighter) = match self
+            .find_nearest_checkpoint(effective_start)
+            .and_then(|cp_line| {
+                let saved = self.checkpoints.get(&cp_line)?;
+                // CLONE: necesario — from_state consume los states, pero
+                // necesitamos mantener el checkpoint en el HashMap para futuros usos.
+                let hl = HighlightLines::from_state(
+                    theme,
+                    saved.highlight_state.clone(),
+                    saved.parse_state.clone(),
+                );
+                Some((cp_line, hl))
+            }) {
+            Some((cp_line, hl)) => (cp_line, hl),
+            None => {
+                // Sin checkpoints válidos — empezar desde línea 0
+                (0, HighlightLines::new(syntax, theme))
+            }
+        };
+
+        // Buffer reutilizable para evitar format!() allocation en cada línea.
+        // Capacity 256: línea promedio de código ~80 chars + margen.
+        let mut line_buf = String::with_capacity(256);
+
+        for i in start_line..effective_end.min(line_count) {
             let line_text = buffer.line(i).unwrap_or("");
-            // syntect necesita la línea con newline para tracking de estado
-            let line_with_newline = if i < line_count - 1 {
-                std::borrow::Cow::Owned(format!("{line_text}\n"))
-            } else {
-                std::borrow::Cow::Borrowed(line_text)
-            };
+
+            // Preparar línea con newline usando buffer reutilizable.
+            // syntect necesita newline para tracking de estado multi-línea.
+            line_buf.clear();
+            line_buf.push_str(line_text);
+            if i < line_count - 1 {
+                line_buf.push('\n');
+            }
 
             // Highlight la línea — puede fallar si la regex es inválida
-            let highlight_result = highlighter.highlight_line(&line_with_newline, syntax_set);
+            let highlight_result = highlighter.highlight_line(&line_buf, syntax_set);
 
             // ¿Esta línea está en el rango que necesitamos cachear?
             let in_viewport = i >= effective_start && i < effective_end;
@@ -448,8 +557,20 @@ impl HighlightCache {
                 };
                 self.lines.insert(i, tokens);
             }
-            // Líneas ANTES del viewport: descartamos el resultado de highlight
+            // Líneas entre checkpoint y viewport: descartamos el resultado de highlight
             // pero el parse state de `highlighter` avanza correctamente.
+
+            // Guardar checkpoint cada CHECKPOINT_INTERVAL líneas procesadas.
+            // Solo si la línea siguiente es un múltiplo del intervalo y no tenemos
+            // ya un checkpoint ahí. El checkpoint se guarda DESPUÉS de procesar la
+            // línea (i), así el state incluye el contexto de esa línea.
+            let next_line = i + 1;
+            if next_line % CHECKPOINT_INTERVAL == 0
+                && next_line < line_count
+                && !self.checkpoints.contains_key(&next_line)
+            {
+                highlighter = self.save_checkpoint(highlighter, next_line, theme);
+            }
         }
 
         // Actualizar metadata del cache
@@ -457,6 +578,20 @@ impl HighlightCache {
         self.last_viewport_end = effective_end;
         self.buffer_line_count = line_count;
         self.dirty_from = None;
+    }
+}
+
+impl std::fmt::Debug for HighlightCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HighlightCache")
+            .field("lines_cached", &self.lines.len())
+            .field("syntax_name", &self.syntax_name)
+            .field("dirty_from", &self.dirty_from)
+            .field("last_viewport_start", &self.last_viewport_start)
+            .field("last_viewport_end", &self.last_viewport_end)
+            .field("buffer_line_count", &self.buffer_line_count)
+            .field("checkpoints_count", &self.checkpoints.len())
+            .finish()
     }
 }
 
