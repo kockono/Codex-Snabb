@@ -4,6 +4,11 @@
 //! en la sidebar. Layout: campos de input arriba, resultados agrupados por archivo
 //! abajo, resumen al fondo.
 //!
+//! Resultados estilo VS Code:
+//! - File headers con icono, nombre bold, directorio dimmed, badge de count
+//! - Fold/unfold de file groups (▾/▸)
+//! - Match lines indentadas con highlight del término buscado
+//!
 //! Reglas de render:
 //! - Sin `format!()` dentro de loops
 //! - Sin allocaciones innecesarias
@@ -18,7 +23,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::search::{SearchField, SearchState};
+use crate::search::{FlatSearchItem, SearchField, SearchState};
 use crate::ui::theme::Theme;
 
 /// Renderiza el panel de búsqueda global dentro de la sidebar.
@@ -228,7 +233,11 @@ fn render_field_line(
     f.render_widget(p, area);
 }
 
-/// Renderiza la lista de resultados con viewport virtual.
+/// Renderiza la lista de resultados agrupados con viewport virtual.
+///
+/// Usa la lista aplanada `state.flat_items` para renderizar:
+/// - FileHeader: `▾/▸ Icon filename  dir  count_badge`
+/// - MatchLine: `    contenido con highlight del match`
 fn render_results(f: &mut Frame, area: Rect, state: &SearchState, theme: &Theme) {
     let visible_height = area.height as usize;
     if visible_height == 0 {
@@ -255,89 +264,134 @@ fn render_results(f: &mut Frame, area: Rect, state: &SearchState, theme: &Theme)
         return;
     }
 
-    // Construir display lines: file headers + match lines
-    let display = build_display_lines(results, state.selected_match, area.width as usize, theme);
+    // Viewport virtual sobre la lista aplanada
+    let total = state.flat_items.len();
+    let scroll = state.scroll_offset.min(total.saturating_sub(1));
+    let max_width = area.width as usize;
 
-    // Viewport virtual: solo las líneas visibles
-    let total_lines = display.len();
-    let scroll = state.scroll_offset.min(total_lines.saturating_sub(1));
-    let visible: Vec<Line<'_>> = display
-        .into_iter()
+    // Buffer para el badge de count — reutilizado entre file headers
+    let mut count_buf = String::with_capacity(8);
+
+    let lines: Vec<Line<'_>> = state
+        .flat_items
+        .iter()
+        .enumerate()
         .skip(scroll)
         .take(visible_height)
+        .map(|(flat_idx, item)| {
+            let is_selected = flat_idx == state.selected_flat_index;
+            match *item {
+                FlatSearchItem::FileHeader { group_index } => render_file_header(
+                    &state.file_groups[group_index],
+                    state.is_collapsed(group_index),
+                    is_selected,
+                    max_width,
+                    theme,
+                    &mut count_buf,
+                ),
+                FlatSearchItem::MatchLine { match_index, .. } => {
+                    render_match_line(&results.matches[match_index], is_selected, max_width, theme)
+                }
+            }
+        })
         .collect();
 
-    let p = Paragraph::new(visible).style(Style::default().bg(theme.bg_secondary));
+    let p = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
     f.render_widget(p, area);
 }
 
-/// Construye las líneas de display para los resultados.
+/// Renderiza un file header en la lista de resultados.
 ///
-/// Agrupa matches por archivo con un header por cada archivo.
-fn build_display_lines<'a>(
-    results: &crate::search::engine::SearchResults,
-    selected_idx: usize,
+/// Layout: `▾ Icon filename  dir  badge`
+/// - `▾`/`▸`: indicador de fold (1 char)
+/// - Icono de archivo por extensión (2 chars) con color semántico
+/// - Filename en `fg_primary` + bold
+/// - Directorio en `fg_secondary` (dimmed)
+/// - Badge con count de matches en `fg_accent`
+fn render_file_header<'a>(
+    group: &crate::search::FileGroup,
+    collapsed: bool,
+    selected: bool,
     max_width: usize,
     theme: &'a Theme,
-) -> Vec<Line<'a>> {
-    let mut lines = Vec::with_capacity(results.matches.len() + results.files_matched);
-    let mut current_file: Option<&std::path::Path> = None;
+    count_buf: &mut String,
+) -> Line<'a> {
+    use crate::ui::icons;
 
-    for (i, m) in results.matches.iter().enumerate() {
-        let is_new_file = current_file != Some(m.path.as_path());
-
-        if is_new_file {
-            current_file = Some(&m.path);
-
-            // Contar matches de este archivo
-            let file_match_count = results
-                .matches
-                .iter()
-                .filter(|mm| mm.path == m.path)
-                .count();
-
-            // Header del archivo
-            let path_display = m.path.to_string_lossy();
-            let header_style = Style::default()
-                .fg(theme.fg_accent)
-                .bg(theme.bg_secondary)
-                .add_modifier(Modifier::BOLD);
-            let count_style = Style::default()
-                .fg(theme.fg_secondary)
-                .bg(theme.bg_secondary);
-
-            let count_str = format_match_count(file_match_count);
-
-            lines.push(Line::from(vec![
-                Span::styled(path_display.into_owned(), header_style),
-                Span::styled(" ", Style::default().bg(theme.bg_secondary)),
-                Span::styled(count_str, count_style),
-            ]));
-        }
-
-        // Línea del match
-        let is_selected = i == selected_idx;
-        lines.push(render_match_line(m, is_selected, max_width, theme));
-    }
-
-    lines
-}
-
-/// Pre-computa el string de count de matches para un file header.
-fn format_match_count(count: usize) -> String {
-    let mut s = String::with_capacity(16);
-    s.push('(');
-    use std::fmt::Write;
-    let _ = write!(s, "{count}");
-    if count == 1 {
-        s.push_str(" match)");
+    let bg = if selected {
+        theme.bg_active
     } else {
-        s.push_str(" matches)");
+        theme.bg_secondary
+    };
+
+    // Fold indicator
+    let fold_char = if collapsed { "\u{25B8} " } else { "\u{25BE} " };
+    let fold_style = Style::default().fg(theme.fg_secondary).bg(bg);
+
+    // File icon por extensión
+    let icon = icons::file_icon(&group.filename);
+    let icon_color = icons::icon_color(&group.filename);
+    let icon_style = Style::default().fg(icon_color).bg(bg);
+
+    // Filename bold
+    let name_style = Style::default()
+        .fg(theme.fg_primary)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+
+    // Directorio dimmed
+    let dir_style = Style::default().fg(theme.fg_secondary).bg(bg);
+
+    // Badge de count — reutilizar buffer, sin format!()
+    count_buf.clear();
+    {
+        use std::fmt::Write;
+        let _ = write!(count_buf, "{}", group.match_count);
     }
-    s
+
+    let badge_style = Style::default().fg(theme.fg_accent).bg(bg);
+    let space_style = Style::default().bg(bg);
+
+    // Construir spans — capacidad fija, sin realloc
+    let mut spans = Vec::with_capacity(8);
+    spans.push(Span::styled(fold_char, fold_style));
+    spans.push(Span::styled(icon, icon_style));
+    spans.push(Span::styled(" ", space_style));
+
+    // Truncar filename si es necesario — reservar espacio para dir y badge
+    // fold(2) + icon(2) + space(1) + name + space(2) + dir + space(2) + badge
+    let overhead = 2 + 2 + 1 + 2 + 2 + count_buf.len();
+    let dir_len = group
+        .dir
+        .len()
+        .min(max_width.saturating_sub(overhead + group.filename.len()));
+    let name_max = max_width.saturating_sub(overhead + dir_len);
+    let display_name = crate::ui::truncate_str(&group.filename, name_max);
+    // CLONE: necesario — display_name es slice de group.filename, Span toma ownership
+    spans.push(Span::styled(display_name.to_string(), name_style));
+
+    // Directorio (solo si hay espacio y no está vacío)
+    if !group.dir.is_empty() && dir_len > 0 {
+        spans.push(Span::styled("  ", space_style));
+        let display_dir = crate::ui::truncate_str(&group.dir, dir_len);
+        // CLONE: necesario — display_dir es slice de group.dir
+        spans.push(Span::styled(display_dir.to_string(), dir_style));
+    }
+
+    // Badge de count
+    spans.push(Span::styled("  ", space_style));
+    // CLONE: necesario — count_buf se reutiliza entre headers
+    spans.push(Span::styled(count_buf.clone(), badge_style));
+
+    Line::from(spans)
 }
 
-/// Renderiza una línea de match individual.
+/// Renderiza una línea de match individual (indentada, con highlight).
+///
+/// Layout: `    contenido_con_match_resaltado`
+/// - 4 espacios de indentación
+/// - Contenido de la línea truncado al ancho disponible
+/// - Match resaltado con `search_match` background color
 fn render_match_line<'a>(
     m: &crate::search::engine::SearchMatch,
     selected: bool,
@@ -350,30 +404,28 @@ fn render_match_line<'a>(
         theme.bg_secondary
     };
 
-    let indicator = if selected { " \u{25b8}" } else { "  " };
-    let indicator_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(bg)
-        .add_modifier(Modifier::BOLD);
+    // Indentación de 4 espacios
+    let indent = "    ";
+    let indent_style = Style::default().bg(bg);
 
     // Truncar contenido de línea para el ancho disponible — char-safe para multi-byte
-    let prefix_len = indicator.len() + 1; // indicator + 1 espacio
-    let content_max = max_width.saturating_sub(prefix_len);
-    let display_content = if m.line_content.chars().count() > content_max {
-        let truncated = crate::ui::truncate_str(&m.line_content, content_max.saturating_sub(3));
-        format!("{truncated}...")
-    } else {
-        m.line_content.clone() // CLONE: necesario — Span toma ownership del String
-    };
+    let content_max = max_width.saturating_sub(indent.len());
+    let trimmed_content = m.line_content.trim();
+    let display_content = crate::ui::truncate_str(trimmed_content, content_max);
 
     let content_style = Style::default().fg(theme.fg_primary).bg(bg);
 
+    // Calcular offset del match dentro del contenido trimmed
+    let trim_offset = m.line_content.find(trimmed_content).unwrap_or(0);
+    let adj_start = m.match_start.saturating_sub(trim_offset);
+    let adj_end = m.match_end.saturating_sub(trim_offset);
+
     // Si el match cabe en lo visible, resaltarlo
-    if m.match_start < display_content.len() && m.match_end <= m.line_content.len() {
-        let match_end_clamped = m.match_end.min(display_content.len());
-        if m.match_start < match_end_clamped {
-            let before = &display_content[..m.match_start];
-            let matched = &display_content[m.match_start..match_end_clamped];
+    if adj_start < display_content.len() && adj_end <= trimmed_content.len() {
+        let match_end_clamped = adj_end.min(display_content.len());
+        if adj_start < match_end_clamped {
+            let before = &display_content[..adj_start];
+            let matched = &display_content[adj_start..match_end_clamped];
             let after = &display_content[match_end_clamped..];
 
             let match_style = Style::default()
@@ -382,8 +434,8 @@ fn render_match_line<'a>(
                 .add_modifier(Modifier::BOLD);
 
             return Line::from(vec![
-                Span::styled(indicator, indicator_style),
-                Span::styled(" ", content_style),
+                Span::styled(indent, indent_style),
+                // CLONE: necesario — slices del display_content, Span toma ownership
                 Span::styled(before.to_string(), content_style),
                 Span::styled(matched.to_string(), match_style),
                 Span::styled(after.to_string(), content_style),
@@ -393,9 +445,9 @@ fn render_match_line<'a>(
 
     // Fallback: sin highlight de match
     Line::from(vec![
-        Span::styled(indicator, indicator_style),
-        Span::styled(" ", content_style),
-        Span::styled(display_content, content_style),
+        Span::styled(indent, indent_style),
+        // CLONE: necesario — display_content es slice, Span toma ownership
+        Span::styled(display_content.to_string(), content_style),
     ])
 }
 

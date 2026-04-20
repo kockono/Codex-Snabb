@@ -124,6 +124,7 @@ pub enum Action {
     /// Campo anterior de input en search (Shift+Tab).
     SearchPrevField,
     /// Ejecutar la búsqueda con las opciones actuales.
+    #[expect(dead_code, reason = "disponible via command registry — Enter en search usa SearchSelectAndOpen")]
     SearchExecute,
     /// Navegar al siguiente match en resultados.
     SearchNextMatch,
@@ -141,6 +142,10 @@ pub enum Action {
     SearchReplaceCurrent,
     /// Reemplazar todos los matches del archivo actual.
     SearchReplaceAllInFile,
+    /// Toggle fold del file header seleccionado en resultados agrupados.
+    SearchToggleFold,
+    /// Abrir el match seleccionado y navegar al archivo/línea.
+    SearchSelectAndOpen,
 
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.

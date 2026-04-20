@@ -436,13 +436,20 @@ fn keymap(
     if search_visible && focused_panel == PanelId::Search {
         return match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Action::SearchClose,
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::SearchExecute,
+            // Enter: si foco en campo de input → ejecutar búsqueda;
+            //        si hay resultados → toggle fold / abrir match
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::SearchSelectAndOpen,
             (KeyCode::Tab, KeyModifiers::NONE) => Action::SearchNextField,
             (KeyCode::BackTab, KeyModifiers::SHIFT) => Action::SearchPrevField,
+            // Up/Down navegan por la lista aplanada (headers + matches)
             (KeyCode::Up, KeyModifiers::NONE) => Action::SearchPrevMatch,
             (KeyCode::Down, KeyModifiers::NONE) => Action::SearchNextMatch,
             (KeyCode::F(3), KeyModifiers::NONE) => Action::SearchNextMatch,
             (KeyCode::F(3), mods) if mods.contains(KeyModifiers::SHIFT) => Action::SearchPrevMatch,
+            // Left en FileHeader expandido → colapsar
+            (KeyCode::Left, KeyModifiers::NONE) => Action::SearchToggleFold,
+            // Right en FileHeader colapsado → expandir
+            (KeyCode::Right, KeyModifiers::NONE) => Action::SearchToggleFold,
             (KeyCode::Backspace, _) => Action::SearchDeleteChar,
             // Alt+C → toggle case sensitive
             (KeyCode::Char('c'), KeyModifiers::ALT) => Action::SearchToggleCase,
@@ -1051,14 +1058,11 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::SearchNextMatch => {
-            state.search.next_match();
-            // Navegar al match en el editor
-            navigate_to_search_match(state);
+            state.search.flat_next();
             vec![]
         }
         Action::SearchPrevMatch => {
-            state.search.prev_match();
-            navigate_to_search_match(state);
+            state.search.flat_prev();
             vec![]
         }
         Action::SearchToggleCase => {
@@ -1102,6 +1106,43 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 && let Err(e) = state.search.replace_all_in_file(&root)
             {
                 tracing::error!(error = %e, "error en replace all in file");
+            }
+            vec![]
+        }
+        Action::SearchToggleFold => {
+            // Left/Right: colapsar/expandir file header según estado actual
+            // Si el item seleccionado es un FileHeader, toggle fold
+            if let Some(&crate::search::FlatSearchItem::FileHeader { group_index }) =
+                state.search.selected_item()
+            {
+                state.search.toggle_fold(group_index);
+            }
+            vec![]
+        }
+        Action::SearchSelectAndOpen => {
+            // Enter: si hay resultados y estamos en la lista, actuar según item
+            if state.search.flat_items.is_empty() {
+                // Sin resultados: ejecutar búsqueda
+                let root = state.explorer.as_ref()
+                    .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut self
+                    .or_else(|| std::env::current_dir().ok());
+
+                if let Some(root) = root {
+                    let max = state.config.search_max_results;
+                    state.search.execute_search(&root, max);
+                    tracing::info!(
+                        query = %state.search.options.query,
+                        matches = state.search.results.as_ref().map(|r| r.total_matches).unwrap_or(0),
+                        "búsqueda ejecutada"
+                    );
+                }
+            } else {
+                // Hay resultados: flat_enter maneja toggle fold / abrir match
+                if let Some(match_idx) = state.search.flat_enter() {
+                    // Sincronizar selected_match con el índice del match
+                    state.search.selected_match = match_idx;
+                    navigate_to_search_match(state);
+                }
             }
             vec![]
         }
@@ -1809,7 +1850,8 @@ fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
 
             match panel {
                 PanelId::Search => {
-                    // Click en search panel — no hay acción de click específica por ahora
+                    // Click en search panel — resolver qué flat item fue clickeado
+                    reduce_mouse_click_search(state, &layout, row);
                 }
                 PanelId::Explorer => {
                     reduce_mouse_click_explorer(state, &layout, row);
@@ -1875,6 +1917,48 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
             Err(e) => {
                 tracing::error!(error = %e, "error al abrir archivo por mouse click");
             }
+        }
+    }
+}
+
+/// Procesa click en el search panel — seleccionar item en la lista aplanada.
+fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16) {
+    // Calcular inner area de la sidebar (descontar bordes del Block)
+    let inner_y = layout.sidebar.y + 1; // Borde superior + título
+    let inner_height = layout.sidebar.height.saturating_sub(2); // Bordes
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return;
+    }
+
+    // Calcular cuántas filas de input hay (query + replace? + include + exclude)
+    let input_lines: u16 = if state.search.replace_visible { 4 } else { 3 };
+    // +1 para summary al fondo
+    let results_start = inner_y + input_lines;
+    let results_end = inner_y + inner_height - 1; // última fila es summary
+
+    if row < results_start || row >= results_end {
+        return; // Click en inputs o summary, no en resultados
+    }
+
+    // Índice visual dentro del área de resultados
+    let visual_row = (row - results_start) as usize;
+    let flat_index = state.search.scroll_offset + visual_row;
+
+    if flat_index >= state.search.flat_items.len() {
+        return;
+    }
+
+    state.search.selected_flat_index = flat_index;
+
+    // Ejecutar acción según tipo de item
+    match state.search.flat_items[flat_index] {
+        crate::search::FlatSearchItem::FileHeader { group_index } => {
+            state.search.toggle_fold(group_index);
+        }
+        crate::search::FlatSearchItem::MatchLine { match_index, .. } => {
+            state.search.selected_match = match_index;
+            navigate_to_search_match(state);
         }
     }
 }
@@ -2084,17 +2168,15 @@ fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: Scro
 
     match panel {
         PanelId::Explorer => {
-            // Si search está visible, scrollear resultados de búsqueda
+            // Si search está visible, scrollear resultados de búsqueda (flat items)
             if state.search.visible {
-                let match_count = state.search.results.as_ref()
-                    .map(|r| r.matches.len())
-                    .unwrap_or(0);
+                let flat_count = state.search.flat_items.len();
                 match direction {
                     ScrollDirection::Up => {
                         state.search.scroll_offset = state.search.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
                     }
                     ScrollDirection::Down => {
-                        let max_scroll = match_count.saturating_sub(1);
+                        let max_scroll = flat_count.saturating_sub(1);
                         state.search.scroll_offset = (state.search.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
                     }
                 }
