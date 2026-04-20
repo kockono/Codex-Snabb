@@ -112,50 +112,6 @@ Principios operativos asociados:
 
 Referencias: `architecture.md`, `roadmap.md`.
 
-## Componentes principales confirmados
-
-El repo ya define esta organización de módulos en `src/`:
-
-- `app/` — bootstrap, terminal setup, event loop principal
-- `core/` — tipos compartidos, acciones, efectos, comandos, config
-- `ui/` — layout, theme, panels, quick open, search panel
-- `editor/` — estado del editor y buffer
-- `workspace/` — explorer y quick open
-- `search/` — estado de búsqueda global
-- `terminal/` — terminal integrada / PTY
-- `observe/` — métricas y tracing
-- `git/` — base para source control
-- `lsp/` — base para integración LSP
-
-Importante: que el módulo exista **no significa** que el subsistema ya esté completo. El README describe estructura confirmada del repo, no promesas de feature parity.
-
-## Estado actual del proyecto
-
-Hoy el proyecto está en una etapa **temprana pero ya ejecutable a nivel de base estructural**:
-
-- hay documentación de arquitectura, roadmap y tareas
-- existe una app TUI con event loop principal y layout tipo IDE
-- ya aparecen módulos para editor, explorer, quick open, search, terminal, Git y LSP
-- el roadmap sigue marcando gran parte del producto como trabajo pendiente o en evolución
-
-Si querés ver el alcance planificado vs. implementado, arrancá por:
-
-- `architecture.md`
-- `roadmap.md`
-- `tasks.md`
-
-## Qué NO promete este README
-
-Para mantener precisión técnica, este README **no afirma** que hoy exista un IDE completo con todas estas capacidades listas para producción:
-
-- LSP completo
-- Git estilo GitLens
-- multicursor avanzado
-- indexación global agresiva
-- sistema de plugins maduro
-
-Esas piezas aparecen en documentación y módulos base, pero su madurez real depende del estado de implementación de cada subsistema.
-
 ## Documentación clave
 
 - `architecture.md` — event loop, estado, render pipeline, budgets y tradeoffs
