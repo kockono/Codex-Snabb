@@ -242,6 +242,8 @@ pub enum Action {
     GitCommitInput(char),
     /// Borrar último carácter del mensaje de commit.
     GitCommitDeleteChar,
+    /// Ejecutar git fetch para sincronizar con el remoto.
+    GitFetch,
 
     // ── LSP ──
     /// Arrancar el language server para el archivo actual.
@@ -276,6 +278,18 @@ pub enum Action {
     PaletteConfirm,
     /// Cerrar la command palette.
     PaletteClose,
+
+    // ── Go to Line ──
+    /// Abrir modal Go to Line (Ctrl+G).
+    OpenGoToLine,
+    /// Insertar dígito en Go to Line.
+    GoToLineInsertChar(char),
+    /// Borrar último dígito en Go to Line.
+    GoToLineDeleteChar,
+    /// Confirmar y saltar a la línea.
+    GoToLineConfirm,
+    /// Cancelar Go to Line.
+    GoToLineClose,
 
     // ── Quick Open ──
     /// Mover selección arriba en el quick open.
