@@ -57,18 +57,22 @@ use panels::StatusBarData;
 
 /// Renderiza el frame completo del IDE.
 ///
-/// Computa el layout, determina qué panel tiene foco, y renderiza
-/// cada región. Los datos para la status bar se derivan del estado
-/// ANTES de entrar al render — sin allocaciones dentro del draw.
+/// Usa el layout pre-computado de `state.last_layout` (calculado antes
+/// del render en el event loop). Solo recomputa como fallback si
+/// `last_layout` no existe (primer frame). Los datos para la status bar
+/// se derivan del estado ANTES de entrar al render — sin allocaciones
+/// dentro del draw.
 ///
 /// La función recibe `&AppState` y `&Theme` por referencia.
 /// El theme se crea una vez fuera del event loop.
 pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     let area = f.area();
 
-    // Computar layout — en el futuro se cacheará y solo se recalculará
-    // en resize o toggle de paneles
-    let layout = IdeLayout::compute(area, state.sidebar_visible, state.bottom_panel_visible);
+    // Usar layout pre-computado del event loop. Fallback a recompute solo
+    // en el primer frame antes de que last_layout exista.
+    let layout = state.last_layout.unwrap_or_else(|| {
+        IdeLayout::compute(area, state.sidebar_visible, state.bottom_panel_visible)
+    });
 
     // Determinar qué panel tiene foco
     let focused = state.focused_panel;
@@ -150,9 +154,10 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
-    // Solo cuando el editor tiene foco y no hay overlays activos.
-    // La posición se computa una vez acá — sin allocaciones.
+    // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
+    // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
     if editor_focused
+        && state.cursor_visible
         && !state.palette.visible
         && !state.quick_open.visible
         && !state.branch_picker.visible
