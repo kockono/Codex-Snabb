@@ -336,6 +336,22 @@ impl EditorState {
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
 
+    /// Mueve el cursor primario a una línea específica (0-indexed) y centra el viewport.
+    ///
+    /// Clampea la línea al rango válido del buffer. Cursor va a columna 0.
+    /// El viewport se centra en la línea target para dar contexto visual.
+    pub fn go_to_line(&mut self, line_idx: usize) {
+        let clamped = line_idx.min(self.buffer.line_count().saturating_sub(1));
+        let primary = self.cursors.primary_mut();
+        primary.position.line = clamped;
+        primary.position.col = 0;
+        primary.desired_col = 0;
+        primary.clear_selection();
+        // Centrar viewport en la línea target
+        let half_viewport = self.viewport.height / 2;
+        self.viewport.scroll_offset = clamped.saturating_sub(half_viewport);
+    }
+
     /// Mueve el cursor primario al inicio absoluto del buffer.
     pub fn move_to_buffer_start(&mut self) {
         let primary = self.cursors.primary_mut();
