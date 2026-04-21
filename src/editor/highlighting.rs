@@ -29,13 +29,16 @@ use super::buffer::TextBuffer;
 
 /// Margen de líneas extra a tokenizar antes/después del viewport visible.
 /// Suaviza el scroll: al desplazarse, las líneas adyacentes ya están cacheadas.
-/// 50 líneas: con scroll de 1 línea por evento, da ~50 eventos de margen.
-const VIEWPORT_MARGIN: usize = 50;
+/// 20 líneas: con scroll de 3 líneas por evento, da ~6-7 eventos de margen.
+/// Reducido de 50: menos trabajo por re-process, imperceptible en scroll feel.
+const VIEWPORT_MARGIN: usize = 20;
 
-/// Tiempo mínimo entre la última edición y el re-highlight (debounce).
-/// Evita re-tokenizar en cada keystroke durante escritura rápida.
+/// Tiempo mínimo entre la última edición y el re-highlight contextual (debounce).
+/// Evita re-tokenizar el viewport completo en cada keystroke durante escritura rápida.
 /// Solo aplica a invalidaciones por edición, NO a scroll.
-const DEBOUNCE_MS: u64 = 150;
+/// Reducido de 150ms: con highlight_single_line() inmediato, el debounce solo
+/// controla el re-process contextual de líneas circundantes.
+const DEBOUNCE_MS: u64 = 80;
 
 /// Intervalo de líneas entre checkpoints de parse state.
 /// Cada N líneas se guarda el estado del parser para poder retomar
@@ -337,6 +340,7 @@ impl HighlightCache {
     }
 
     /// Marca TODO el cache como dirty — para carga inicial o cambio de syntax.
+    #[expect(dead_code, reason = "API pública para invalidación masiva — útil si se re-introduce recarga en caliente")]
     pub fn invalidate(&mut self) {
         self.last_edit_time = Some(Instant::now());
         self.dirty_from = Some(0);
@@ -347,10 +351,6 @@ impl HighlightCache {
     }
 
     /// Si el cache tiene syntax asociada.
-    #[expect(
-        dead_code,
-        reason = "se usará para condicionales de rendering y status bar"
-    )]
     pub fn has_syntax(&self) -> bool {
         !self.syntax_name.is_empty()
     }
@@ -430,6 +430,119 @@ impl HighlightCache {
 
         // Reconstruir highlighter desde los states originales
         HighlightLines::from_state(theme, hl_state, ps_state)
+    }
+
+    /// Re-destaca SOLO la línea editada, sin debounce.
+    ///
+    /// Usa el checkpoint más cercano anterior a `line_idx` para obtener el parse
+    /// state y procesa únicamente hasta `line_idx` (inclusive). Actualiza el cache
+    /// para esa línea inmediatamente.
+    ///
+    /// No reemplaza `ensure_viewport_highlighted` — ese sigue manejando la
+    /// re-coloración contextual del viewport completo tras el debounce.
+    /// Este método solo garantiza que la línea actual tenga color correcto
+    /// en el mismo frame en que se editó.
+    pub fn highlight_single_line(
+        &mut self,
+        line_idx: usize,
+        buffer: &TextBuffer,
+        engine: &HighlightEngine,
+    ) {
+        if !engine.is_ready() {
+            return;
+        }
+        if self.syntax_name.is_empty() {
+            return;
+        }
+
+        let Some(syntax_set) = engine.syntax_set() else {
+            return;
+        };
+        let Some(theme) = engine.theme() else {
+            return;
+        };
+        let Some(syntax) = syntax_set.find_syntax_by_name(&self.syntax_name) else {
+            return;
+        };
+
+        let line_count = buffer.line_count();
+        if line_idx >= line_count {
+            return;
+        }
+
+        // Obtener checkpoint más cercano ANTES de line_idx
+        let (start_line, mut highlighter) = match self
+            .find_nearest_checkpoint(line_idx)
+            .and_then(|cp_line| {
+                let saved = self.checkpoints.get(&cp_line)?;
+                // CLONE: necesario — from_state consume los states, pero
+                // necesitamos mantener el checkpoint en el HashMap para futuros usos.
+                let hl = HighlightLines::from_state(
+                    theme,
+                    saved.highlight_state.clone(),
+                    saved.parse_state.clone(),
+                );
+                Some((cp_line, hl))
+            }) {
+            Some((cp_line, hl)) => (cp_line, hl),
+            None => (0, HighlightLines::new(syntax, theme)),
+        };
+
+        // Procesar líneas desde checkpoint hasta line_idx (inclusive).
+        // syntect parse state es incremental — DEBE avanzar por todas las líneas
+        // intermedias aunque no guardemos sus tokens.
+        let mut line_buf = String::with_capacity(256);
+        for i in start_line..=line_idx {
+            let line_text = buffer.line(i).unwrap_or("");
+            line_buf.clear();
+            line_buf.push_str(line_text);
+            if i < line_count - 1 {
+                line_buf.push('\n');
+            }
+
+            let highlight_result = highlighter.highlight_line(&line_buf, syntax_set);
+
+            if i == line_idx {
+                // Solo guardar tokens para la línea editada
+                let tokens = match highlight_result {
+                    Ok(ranges) => ranges
+                        .into_iter()
+                        .map(|(style, text)| {
+                            let clean = text.trim_end_matches('\n');
+                            HighlightToken {
+                                style,
+                                text: clean.to_owned(),
+                            }
+                        })
+                        .filter(|t| !t.text.is_empty())
+                        .collect(),
+                    Err(_) => vec![HighlightToken {
+                        style: SyntectStyle::default(),
+                        text: line_text.to_owned(),
+                    }],
+                };
+                // Insertar directamente en cache
+                self.lines.insert(line_idx, tokens);
+            }
+            // Para líneas intermedias (start_line..line_idx): solo avanzamos el
+            // parse state del highlighter, no guardamos tokens (ya están cacheados
+            // o se re-procesarán en el ensure_viewport_highlighted post-debounce).
+        }
+
+        // Avanzar dirty_from a line_idx + 1 para que get_line() retorne
+        // los tokens recién cacheados de la línea editada.
+        // Las líneas posteriores siguen dirty para el debounce contextual.
+        if let Some(dirty) = self.dirty_from
+            && dirty <= line_idx
+        {
+            let next = line_idx + 1;
+            if next < line_count {
+                self.dirty_from = Some(next);
+            } else {
+                // Era la última línea — todo limpio
+                self.dirty_from = None;
+            }
+        }
     }
 
     /// Procesa el highlighting solo para las líneas del viewport visible.

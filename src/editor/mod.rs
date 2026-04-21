@@ -51,6 +51,11 @@ pub struct EditorState {
     pub search: Option<search::BufferSearch>,
     /// Cache de syntax highlighting para este buffer.
     pub highlight_cache: HighlightCache,
+    /// Si el highlight del viewport fue diferido al próximo frame.
+    ///
+    /// Se activa al abrir un archivo nuevo para no bloquear el frame
+    /// del open con trabajo pesado. El siguiente frame lo procesa normal.
+    pub highlight_deferred: bool,
 }
 
 impl EditorState {
@@ -63,6 +68,7 @@ impl EditorState {
             undo_stack: UndoStack::new(),
             search: None,
             highlight_cache: HighlightCache::new(),
+            highlight_deferred: false,
         }
     }
 
@@ -80,6 +86,9 @@ impl EditorState {
             undo_stack: UndoStack::new(),
             search: None,
             highlight_cache: HighlightCache::new(),
+            // Diferir highlight al siguiente frame — el archivo acaba de abrirse.
+            // Así el frame del open es instantáneo y el highlight corre después.
+            highlight_deferred: true,
         })
     }
 
@@ -94,6 +103,18 @@ impl EditorState {
         {
             self.highlight_cache = HighlightCache::with_syntax(syntax.name.as_str());
         }
+    }
+
+    /// Re-destaca inmediatamente la línea del cursor primario.
+    ///
+    /// Elimina el parpadeo blanco de 80ms al tipear: la línea editada
+    /// se re-colorea en el mismo frame sin esperar al debounce.
+    /// `ensure_viewport_highlighted` sigue manejando el re-process
+    /// contextual del viewport completo.
+    pub fn rehighlight_cursor_line(&mut self, engine: &HighlightEngine) {
+        let line = self.cursors.primary().position.line;
+        self.highlight_cache
+            .highlight_single_line(line, &self.buffer, engine);
     }
 
     /// Inserta un carácter en la posición de todos los cursores.

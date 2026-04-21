@@ -73,6 +73,7 @@ mod tests {
             undo_stack: crate::editor::undo::UndoStack::new(),
             search: None,
             highlight_cache: crate::editor::highlighting::HighlightCache::new(),
+            highlight_deferred: false,
         }
     }
 
