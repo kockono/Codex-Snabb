@@ -118,6 +118,8 @@ pub struct AppState {
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
     pub status_file: String,
+    /// Porcentaje de scroll pre-formateado (ej: "18%"). Bloque naranja en status bar.
+    pub status_pct: String,
     /// Layout del último frame renderizado, para resolver posiciones de mouse.
     /// Se actualiza cada frame antes del render. `IdeLayout` es Copy (struct de Rects).
     pub last_layout: Option<IdeLayout>,
@@ -165,8 +167,9 @@ impl AppState {
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
-            status_line: String::from("Ln 1, Col 1"),
+            status_line: String::from("1:1"),
             status_file: String::from("[no file]"),
+            status_pct: String::from("0%"),
             last_layout: None,
             highlight_engine: HighlightEngine::new(),
             bracket_match: None,
@@ -212,8 +215,9 @@ impl AppState {
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
-            status_line: String::from("Ln 1, Col 1"),
+            status_line: String::from("1:1"),
             status_file,
+            status_pct: String::from("0%"),
             last_layout: None,
             highlight_engine,
             bracket_match: None,
@@ -234,12 +238,16 @@ impl AppState {
         use std::fmt::Write;
         let editor = self.tabs.active();
         let primary = editor.cursors.primary();
-        let _ = write!(
-            self.status_line,
-            "Ln {}, Col {}",
-            primary.position.line + 1,
-            primary.position.col + 1
-        );
+        let line_1 = primary.position.line + 1;
+        let col_1  = primary.position.col + 1;
+        // Formato compacto "línea:col" igual a nvim/VSCode en bloque de posición
+        let _ = write!(self.status_line, "{}:{}", line_1, col_1);
+
+        // Pre-computar porcentaje de scroll: (línea_actual / total_líneas) * 100
+        self.status_pct.clear();
+        let total = editor.buffer.line_count().max(1);
+        let pct = ((primary.position.line * 100) / total).min(100);
+        let _ = write!(self.status_pct, "{}%", pct);
 
         // Actualizar bracket match — solo re-computar cuando cursor cambia
         let cursor_pos = primary.position;

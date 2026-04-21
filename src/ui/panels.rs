@@ -43,6 +43,8 @@ pub struct StatusBarData<'a> {
     pub git_status: &'a str,
     /// Encoding del archivo activo.
     pub encoding: &'a str,
+    /// Porcentaje de scroll en el archivo (ej: "18%"). Pre-formateado fuera del render.
+    pub scroll_pct: &'a str,
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -1542,17 +1544,34 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, theme: &Theme, data: &Status
         ),
     ];
 
+    // Color naranja/amber para el bloque de posición — igual a las imágenes de referencia
+    let amber_bg = ratatui::style::Color::Rgb(229, 165, 10); // #e5a50a
+    let amber_fg = ratatui::style::Color::Rgb(15, 15, 15);   // casi negro — alta legibilidad
+
     let right_spans = vec![
-        Span::styled(
-            data.cursor_pos,
-            Style::default().fg(theme.fg_primary).bg(theme.bg_status),
-        ),
-        Span::styled("  ", Style::default().bg(theme.bg_status)),
         Span::styled(
             data.encoding,
             Style::default().fg(theme.fg_secondary).bg(theme.bg_status),
         ),
-        Span::styled(" ", Style::default().bg(theme.bg_status)),
+        Span::styled("  ", Style::default().bg(theme.bg_status)),
+        // Bloque naranja: "352:34  18%"
+        Span::styled(" ", Style::default().bg(amber_bg)),
+        Span::styled(
+            data.cursor_pos,
+            Style::default()
+                .fg(amber_fg)
+                .bg(amber_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default().bg(amber_bg)),
+        Span::styled(
+            data.scroll_pct,
+            Style::default()
+                .fg(amber_fg)
+                .bg(amber_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().bg(amber_bg)),
     ];
 
     // Layout horizontal: left flush, right flush

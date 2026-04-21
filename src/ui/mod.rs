@@ -241,6 +241,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         cursor_pos: &state.status_line,
         git_status: &git_status_str,
         encoding: "UTF-8",
+        scroll_pct: &state.status_pct,
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
 
