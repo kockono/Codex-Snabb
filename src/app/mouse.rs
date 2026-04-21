@@ -179,6 +179,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                     0 => Some(SidebarSection::Explorer),
                     1 => Some(SidebarSection::Git),
                     2 => Some(SidebarSection::Search),
+                    3 => Some(SidebarSection::Projects),
                     _ => None,
                 };
                 if let Some(section) = section {
@@ -188,11 +189,13 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
             }
         }
         HitTestResult::Panel(panel) => {
-            // Si la sidebar muestra search o git, redirigir foco al panel activo
+            // Si la sidebar muestra search, git o projects, redirigir foco al panel activo
             let panel = if panel == PanelId::Explorer && state.search.visible {
                 PanelId::Search
             } else if panel == PanelId::Explorer && state.git.visible {
                 PanelId::Git
+            } else if panel == PanelId::Explorer && state.projects.visible {
+                PanelId::Projects
             } else {
                 panel
             };

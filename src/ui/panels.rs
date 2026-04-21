@@ -152,6 +152,10 @@ pub fn render_activity_bar(
             " S ",
             active_section == SidebarSection::Search && !settings_active,
         ),
+        (
+            " P ",
+            active_section == SidebarSection::Projects && !settings_active,
+        ),
     ];
 
     // Construir líneas: iconos en la parte superior, settings en la parte inferior
@@ -207,6 +211,7 @@ pub fn render_sidebar(
         PanelId::Explorer => "EXPLORER",
         PanelId::Git => "SOURCE CONTROL",
         PanelId::Search => "SEARCH",
+        PanelId::Projects => "PROJECTS",
         _ => "EXPLORER",
     };
 

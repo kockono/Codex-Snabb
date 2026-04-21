@@ -12,6 +12,7 @@ pub mod icons;
 pub mod layout;
 pub mod palette;
 pub mod panels;
+pub mod projects_panel;
 pub mod quick_open;
 pub mod search_panel;
 pub mod settings_panel;
@@ -88,6 +89,8 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         SidebarSection::Search
     } else if state.git.visible {
         SidebarSection::Git
+    } else if state.projects.visible {
+        SidebarSection::Projects
     } else {
         SidebarSection::Explorer
     };
@@ -100,9 +103,12 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     );
 
     // ── Sidebar ──
-    // Prioridad de paneles en sidebar: search > git > explorer
+    // Prioridad de paneles en sidebar: search > git > projects > explorer
     if layout.sidebar_visible {
-        let sidebar_focused = matches!(focused, PanelId::Explorer | PanelId::Git | PanelId::Search);
+        let sidebar_focused = matches!(
+            focused,
+            PanelId::Explorer | PanelId::Git | PanelId::Search | PanelId::Projects
+        );
         if state.search.visible {
             // Búsqueda activa: renderizar panel de búsqueda en la sidebar
             search_panel::render_search_panel(
@@ -115,6 +121,15 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         } else if state.git.visible {
             // Git activo: renderizar panel de git en la sidebar
             git_panel::render_git_panel(f, layout.sidebar, &state.git, theme, sidebar_focused);
+        } else if state.projects.visible {
+            // Proyectos activo: renderizar panel de proyectos en la sidebar
+            projects_panel::render_projects_panel(
+                f,
+                layout.sidebar,
+                theme,
+                &state.projects,
+                sidebar_focused,
+            );
         } else {
             panels::render_sidebar(
                 f,
@@ -164,6 +179,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
+        && !state.folder_picker.visible
     {
         // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
         let inner_x = layout.editor_area.x + 1;
@@ -254,6 +270,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
+        && !state.folder_picker.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -271,6 +288,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 state.tabs.active(),
             );
         }
+    }
+
+    // ── Folder picker modal (máxima prioridad visual) ──
+    if state.folder_picker.visible {
+        projects_panel::render_folder_picker(f, &layout, theme, &state.folder_picker);
     }
 
     // ── Overlays ──
@@ -457,7 +479,7 @@ pub fn render_loading(
 /// En cualquier otro caso, default a Explorer.
 fn sidebar_active_panel(focused: PanelId) -> PanelId {
     match focused {
-        PanelId::Explorer | PanelId::Git | PanelId::Search => focused,
+        PanelId::Explorer | PanelId::Git | PanelId::Search | PanelId::Projects => focused,
         _ => PanelId::Explorer,
     }
 }

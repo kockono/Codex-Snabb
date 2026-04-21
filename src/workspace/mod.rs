@@ -5,7 +5,9 @@
 //! quick open. Todo con refresh controlado y sin indexación agresiva.
 
 pub mod explorer;
+pub mod folder_picker;
 pub mod project;
+pub mod projects;
 pub mod quick_open;
 pub mod tree;
 

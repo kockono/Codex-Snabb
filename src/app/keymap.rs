@@ -40,6 +40,8 @@ pub(super) fn keymap(
     settings_visible: bool,
     settings_editing: bool,
     commands: &CommandRegistry,
+    folder_picker_visible: bool,
+    projects_selected: usize,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -73,6 +75,19 @@ pub(super) fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Folder picker visible: prioridad máxima (modal) ──
+    if folder_picker_visible {
+        return match key.code {
+            KeyCode::Up => Action::FolderPickerUp,
+            KeyCode::Down => Action::FolderPickerDown,
+            KeyCode::Enter => Action::FolderPickerEnter,
+            KeyCode::Char('s') | KeyCode::Char('S') => Action::FolderPickerConfirm,
+            KeyCode::Backspace => Action::FolderPickerParent,
+            KeyCode::Esc => Action::FolderPickerCancel,
+            _ => Action::Noop,
+        };
     }
 
     // ── Settings overlay visible: prioridad máxima ──
@@ -417,6 +432,23 @@ pub(super) fn keymap(
             _ => Action::Noop,
         },
 
+        PanelId::Projects => match (key.code, key.modifiers) {
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ProjectsMoveUp,
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::ProjectsMoveDown,
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::ProjectsOpen,
+            (KeyCode::Char('+') | KeyCode::Char('a'), KeyModifiers::NONE) => Action::ProjectsAddNew,
+            (KeyCode::Char('l') | KeyCode::Char('L'), KeyModifiers::NONE) => {
+                Action::ProjectsToggleLock(projects_selected)
+            }
+            (KeyCode::Char('d') | KeyCode::Char('D'), KeyModifiers::NONE) => {
+                Action::ProjectsRemove(projects_selected)
+            }
+            (KeyCode::Esc, _) => {
+                Action::ActivityBarSelect(crate::core::settings::SidebarSection::Explorer)
+            }
+            _ => Action::Noop,
+        },
+
         // Otros paneles — sin keybindings específicos aún
         _ => Action::Noop,
     }
@@ -462,6 +494,8 @@ mod tests {
             false, // settings
             false, // settings_editing
             &commands,
+            false, // folder_picker
+            0,     // projects_selected
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -483,6 +517,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -507,6 +543,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -528,6 +566,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -549,6 +589,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -570,6 +612,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -591,6 +635,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -614,6 +660,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -635,6 +683,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -656,6 +706,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -677,6 +729,8 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            0,
         );
         assert_eq!(action, Action::GoToLineClose);
     }

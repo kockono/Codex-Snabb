@@ -358,6 +358,40 @@ pub enum Action {
     // ── Activity Bar ──
     /// Click en un icono de la activity bar para cambiar sección de sidebar.
     ActivityBarSelect(crate::core::settings::SidebarSection),
+
+    // ── Projects panel ──
+    /// Abrir folder picker para agregar nuevo proyecto.
+    ProjectsAddNew,
+    /// Cancelar folder picker sin agregar proyecto.
+    #[expect(dead_code, reason = "disponible via command registry — FolderPickerCancel se usa directamente")]
+    ProjectsCancelAdd,
+    /// Seleccionar un proyecto de la lista (índice).
+    #[expect(dead_code, reason = "disponible para keybinding directo — se usa via ProjectsOpen")]
+    ProjectsSelect(usize),
+    /// Toggle del candado de un proyecto (índice).
+    ProjectsToggleLock(usize),
+    /// Eliminar proyecto de la lista (índice).
+    ProjectsRemove(usize),
+    /// Navegar arriba en la lista de proyectos.
+    ProjectsMoveUp,
+    /// Navegar abajo en la lista de proyectos.
+    ProjectsMoveDown,
+    /// Activar/abrir el proyecto seleccionado (switch workspace).
+    ProjectsOpen,
+
+    // ── Folder picker (modal de selección de carpeta) ──
+    /// Navegar arriba en el folder picker.
+    FolderPickerUp,
+    /// Navegar abajo en el folder picker.
+    FolderPickerDown,
+    /// Expandir/navegar al directorio seleccionado en el picker.
+    FolderPickerEnter,
+    /// Subir al directorio padre en el picker.
+    FolderPickerParent,
+    /// Confirmar directorio actual como proyecto.
+    FolderPickerConfirm,
+    /// Cancelar el folder picker.
+    FolderPickerCancel,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
@@ -487,6 +521,8 @@ pub enum PanelId {
     /// Overlay del quick open.
     #[expect(dead_code, reason = "se usará en épica 5 — quick open")]
     QuickOpen,
+    /// Panel de proyectos guardados.
+    Projects,
 }
 
 impl PanelId {

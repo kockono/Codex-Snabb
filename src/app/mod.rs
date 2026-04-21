@@ -114,6 +114,10 @@ pub struct AppState {
     pub lsp: LspState,
     /// Estado del overlay de settings / keybindings editor.
     pub keybindings: KeybindingsState,
+    /// Panel de proyectos guardados.
+    pub projects: crate::workspace::projects::ProjectsState,
+    /// Folder picker modal para selección de carpeta.
+    pub folder_picker: crate::workspace::folder_picker::FolderPickerState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -167,6 +171,12 @@ impl AppState {
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
+            projects: {
+                let mut ps = crate::workspace::projects::ProjectsState::new();
+                ps.load(); // cargar desde disco al arrancar
+                ps
+            },
+            folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
             status_line: String::from("1:1"),
             status_file: String::from("[no file]"),
             status_pct: String::from("0%"),
@@ -215,6 +225,12 @@ impl AppState {
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
+            projects: {
+                let mut ps = crate::workspace::projects::ProjectsState::new();
+                ps.load(); // cargar desde disco al arrancar
+                ps
+            },
+            folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
             status_line: String::from("1:1"),
             status_file,
             status_pct: String::from("0%"),
@@ -1229,20 +1245,30 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     state.sidebar_visible = true;
                     state.search.close();
                     state.git.visible = false;
+                    state.projects.visible = false;
                     state.focused_panel = PanelId::Explorer;
                 }
                 SidebarSection::Git => {
                     state.sidebar_visible = true;
                     state.search.close();
                     state.git.visible = true;
+                    state.projects.visible = false;
                     state.git.refresh(&get_workspace_root(state));
                     state.focused_panel = PanelId::Git;
                 }
                 SidebarSection::Search => {
                     state.sidebar_visible = true;
                     state.git.visible = false;
+                    state.projects.visible = false;
                     state.search.open();
                     state.focused_panel = PanelId::Search;
+                }
+                SidebarSection::Projects => {
+                    state.sidebar_visible = true;
+                    state.search.close();
+                    state.git.visible = false;
+                    state.projects.visible = true;
+                    state.focused_panel = PanelId::Projects;
                 }
             }
             tracing::debug!(?section, "activity bar: sección seleccionada");
@@ -1272,6 +1298,97 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.tabs.switch_to(*index);
             state.update_status_cache();
             tracing::debug!(tab = *index, "switch a tab");
+            vec![]
+        }
+
+        // ── Projects panel ──
+        Action::ProjectsAddNew => {
+            // Abrir folder picker desde el directorio actual o home
+            let start = state
+                .explorer
+                .as_ref()
+                .map(|e| e.root.clone()) // CLONE: necesario — se mueve al folder_picker
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            state.folder_picker.open(start);
+            tracing::debug!("projects: folder picker abierto");
+            vec![]
+        }
+        Action::ProjectsCancelAdd => {
+            state.folder_picker.close();
+            tracing::debug!("projects: folder picker cancelado");
+            vec![]
+        }
+        Action::ProjectsMoveUp => {
+            state.projects.move_up();
+            vec![]
+        }
+        Action::ProjectsMoveDown => {
+            state.projects.move_down();
+            vec![]
+        }
+        Action::ProjectsToggleLock(idx) => {
+            state.projects.toggle_lock(*idx);
+            tracing::debug!(idx, "projects: toggle lock");
+            vec![]
+        }
+        Action::ProjectsRemove(idx) => {
+            state.projects.remove(*idx);
+            tracing::debug!(idx, "projects: proyecto eliminado");
+            vec![]
+        }
+        Action::ProjectsSelect(idx) => {
+            state.projects.selected = *idx;
+            vec![]
+        }
+        Action::ProjectsOpen => {
+            if let Some(project) = state.projects.selected_project() {
+                if !project.locked {
+                    // Cambiar explorer al root del proyecto
+                    // CLONE: necesario — project es borrow de state.projects, necesitamos path owned
+                    let root = project.path.clone();
+                    state.explorer = crate::workspace::ExplorerState::new(&root).ok();
+                    // Refrescar git
+                    state.git.refresh(&root);
+                    // Refrescar quick open index — silencioso en error
+                    if let Err(e) = state.quick_open.build_index(&root) {
+                        tracing::warn!(error = %e, "error indexando proyecto");
+                    }
+                    tracing::info!(path = %root.display(), "proyecto abierto");
+                }
+                state.projects.active_project = Some(state.projects.selected);
+                state.focused_panel = PanelId::Editor;
+            }
+            vec![]
+        }
+
+        // ── Folder picker ──
+        Action::FolderPickerUp => {
+            state.folder_picker.move_up();
+            vec![]
+        }
+        Action::FolderPickerDown => {
+            state.folder_picker.move_down();
+            vec![]
+        }
+        Action::FolderPickerEnter => {
+            state.folder_picker.enter_selected();
+            vec![]
+        }
+        Action::FolderPickerParent => {
+            state.folder_picker.go_parent();
+            vec![]
+        }
+        Action::FolderPickerConfirm => {
+            state.folder_picker.confirm_selected();
+            if let Some(path) = state.folder_picker.confirmed_path.take() {
+                state.projects.add(path);
+                tracing::debug!("folder picker: proyecto agregado");
+            }
+            vec![]
+        }
+        Action::FolderPickerCancel => {
+            state.folder_picker.close();
+            tracing::debug!("folder picker: cancelado");
             vec![]
         }
 
@@ -1585,6 +1702,8 @@ async fn event_loop(
                     state.keybindings.visible,
                     state.keybindings.editing_index.is_some(),
                     &state.commands,
+                    state.folder_picker.visible,
+                    state.projects.selected,
                 )
             }
             Some(Event::Tick) => Action::Noop,
