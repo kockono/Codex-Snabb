@@ -41,7 +41,9 @@ pub(super) fn keymap(
     settings_editing: bool,
     commands: &CommandRegistry,
     folder_picker_visible: bool,
+    folder_picker_path_focused: bool,
     projects_selected: usize,
+    projects_path_input_focused: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -77,9 +79,40 @@ pub(super) fn keymap(
         return Action::Noop;
     }
 
+    // ── Projects path input enfocado: captura chars antes de atajos globales ──
+    // Solo cuando el panel de proyectos tiene foco Y el input inline está activo.
+    // El folder picker (modal) tiene prioridad mayor — verificar después.
+    if !folder_picker_visible
+        && focused_panel == PanelId::Projects
+        && projects_path_input_focused
+        && let crossterm::event::Event::Key(key) = event
+        && key.kind == crossterm::event::KeyEventKind::Press
+    {
+        return match key.code {
+            KeyCode::Enter => Action::ProjectsPathInputConfirm,
+            KeyCode::Esc => Action::ProjectsPathInputEscape,
+            KeyCode::Backspace => Action::ProjectsPathInputBackspace,
+            KeyCode::Char(ch) => Action::ProjectsPathInputChar(ch),
+            _ => Action::Noop,
+        };
+    }
+
     // ── Folder picker visible: prioridad máxima (modal) ──
     if folder_picker_visible {
+        if folder_picker_path_focused {
+            // Input de path enfocado: capturar chars, backspace, enter, esc, tab
+            return match key.code {
+                KeyCode::Tab => Action::FolderPickerToggleFocus,
+                KeyCode::Enter => Action::FolderPickerPathConfirm,
+                KeyCode::Esc => Action::FolderPickerPathEscape,
+                KeyCode::Backspace => Action::FolderPickerPathBackspace,
+                KeyCode::Char(ch) => Action::FolderPickerPathInput(ch),
+                _ => Action::Noop,
+            };
+        }
+        // Árbol enfocado: navegación + Tab para cambiar a input
         return match key.code {
+            KeyCode::Tab => Action::FolderPickerToggleFocus,
             KeyCode::Up => Action::FolderPickerUp,
             KeyCode::Down => Action::FolderPickerDown,
             KeyCode::Enter => Action::FolderPickerEnter,
@@ -495,7 +528,9 @@ mod tests {
             false, // settings_editing
             &commands,
             false, // folder_picker
+            false, // folder_picker_path_focused
             0,     // projects_selected
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -518,7 +553,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -544,7 +581,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -567,7 +606,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -590,7 +631,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -613,7 +656,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -636,7 +681,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -661,7 +708,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -684,7 +733,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -707,7 +758,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -730,7 +783,9 @@ mod tests {
             false,
             &commands,
             false,
+            false,
             0,
+            false, // projects_path_input_focused
         );
         assert_eq!(action, Action::GoToLineClose);
     }

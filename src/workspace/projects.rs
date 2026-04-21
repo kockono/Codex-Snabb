@@ -48,6 +48,16 @@ pub struct ProjectsState {
     pub visible: bool,
     /// Índice del proyecto actualmente activo (workspace abierto).
     pub active_project: Option<usize>,
+
+    // ── Path input inline (fila 1 del panel) ──
+    /// Texto que el usuario va escribiendo en el input de ruta inline.
+    pub path_input: String,
+    /// Si el input de ruta inline tiene el foco del teclado.
+    pub path_input_focused: bool,
+    /// Si hay un error de ruta no válida activo.
+    pub path_input_error: bool,
+    /// Ticks restantes para mostrar el error efímero (se cuenta hacia 0).
+    pub path_input_error_ticks: u8,
 }
 
 impl ProjectsState {
@@ -58,6 +68,10 @@ impl ProjectsState {
             scroll_offset: 0,
             visible: false,
             active_project: None,
+            path_input: String::new(),
+            path_input_focused: false,
+            path_input_error: false,
+            path_input_error_ticks: 0,
         }
     }
 
@@ -170,5 +184,67 @@ impl ProjectsState {
         } else if self.selected >= self.scroll_offset + MAX_VISIBLE {
             self.scroll_offset = self.selected - MAX_VISIBLE + 1;
         }
+    }
+
+    // ── Path input inline ──────────────────────────────────────────────────────
+
+    /// Agrega un carácter al final del input de ruta inline.
+    pub fn path_input_push(&mut self, ch: char) {
+        self.path_input.push(ch);
+    }
+
+    /// Elimina el último carácter del input de ruta inline (Backspace).
+    pub fn path_input_backspace(&mut self) {
+        self.path_input.pop();
+    }
+
+    /// Intenta confirmar el path escrito.
+    ///
+    /// Si el path existe como directorio → limpia el input, quita el foco,
+    /// y retorna `Some(PathBuf)` con la ruta.
+    ///
+    /// Si el path no existe o está vacío → activa el error efímero y retorna `None`.
+    pub fn path_input_confirm(&mut self) -> Option<PathBuf> {
+        if self.path_input.is_empty() {
+            return None;
+        }
+        // Capturar el path ANTES de mutar self
+        let candidate = PathBuf::from(&self.path_input);
+        if std::path::Path::new(&self.path_input).is_dir() {
+            self.path_input.clear();
+            self.path_input_focused = false;
+            self.path_input_error = false;
+            self.path_input_error_ticks = 0;
+            Some(candidate)
+        } else {
+            // Ruta no válida: activar error efímero (~2s a 20fps = 40 ticks)
+            self.path_input_error = true;
+            self.path_input_error_ticks = 40;
+            None
+        }
+    }
+
+    /// Cancela la edición del path: limpia el input, quita el foco y el error.
+    pub fn path_input_escape(&mut self) {
+        self.path_input.clear();
+        self.path_input_focused = false;
+        self.path_input_error = false;
+        self.path_input_error_ticks = 0;
+    }
+
+    /// Decrementa el contador de error efímero.
+    /// Cuando llega a 0 limpia el estado de error.
+    pub fn path_input_tick(&mut self) {
+        if self.path_input_error_ticks > 0 {
+            self.path_input_error_ticks -= 1;
+            if self.path_input_error_ticks == 0 {
+                self.path_input_error = false;
+            }
+        }
+    }
+
+    /// Da foco al input de ruta inline.
+    pub fn path_input_focus(&mut self) {
+        self.path_input_focused = true;
     }
 }

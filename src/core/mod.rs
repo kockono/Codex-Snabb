@@ -362,6 +362,17 @@ pub enum Action {
     // ── Projects panel ──
     /// Abrir folder picker para agregar nuevo proyecto.
     ProjectsAddNew,
+    /// Insertar un carácter en el input de ruta inline del panel de proyectos.
+    ProjectsPathInputChar(char),
+    /// Borrar el último carácter del input de ruta inline (Backspace).
+    ProjectsPathInputBackspace,
+    /// Confirmar el path escrito en el input inline (Enter).
+    ProjectsPathInputConfirm,
+    /// Cancelar el input inline sin cerrar nada (Esc).
+    ProjectsPathInputEscape,
+    /// Dar foco al input de ruta inline.
+    #[expect(dead_code, reason = "disponible para keybinding futuro — mouse usa path_input_focus() directamente")]
+    ProjectsPathInputFocus,
     /// Cancelar folder picker sin agregar proyecto.
     #[expect(dead_code, reason = "disponible via command registry — FolderPickerCancel se usa directamente")]
     ProjectsCancelAdd,
@@ -392,6 +403,16 @@ pub enum Action {
     FolderPickerConfirm,
     /// Cancelar el folder picker.
     FolderPickerCancel,
+    /// Alternar foco entre el input de path y el árbol en el folder picker.
+    FolderPickerToggleFocus,
+    /// Insertar un carácter en el input de path del folder picker.
+    FolderPickerPathInput(char),
+    /// Borrar último carácter del input de path del folder picker.
+    FolderPickerPathBackspace,
+    /// Confirmar el path escrito en el input (navegar al directorio).
+    FolderPickerPathConfirm,
+    /// Limpiar input de path y devolver foco al árbol (sin cerrar picker).
+    FolderPickerPathEscape,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────

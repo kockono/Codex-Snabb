@@ -216,7 +216,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                     reduce_mouse_click_editor(state, &layout, col, row);
                 }
                 PanelId::Projects => {
-                    reduce_mouse_click_projects(state, &layout, row);
+                    reduce_mouse_click_projects(state, &layout, col, row);
                 }
                 // Terminal y otros: solo cambio de foco por ahora
                 _ => {}
@@ -502,10 +502,14 @@ pub(super) fn reduce_mouse_middle_click(state: &mut AppState, col: u16, row: u16
 /// Procesa click en el panel de proyectos.
 ///
 /// Layout interno del panel (dentro del borde):
-///   - Fila 0: `[+] Nuevo proyecto`  → abre folder picker
-///   - Fila 1: separador             → ignorar
-///   - Filas 2+: lista de proyectos  → seleccionar + abrir
-fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, row: u16) {
+///   - Fila 0: `[+] Nuevo proyecto`    → abre folder picker
+///   - Fila 1: `[+] path input inline` → foco al input de ruta
+///   - Fila 2: separador               → ignorar
+///   - Filas 3+: lista de proyectos    → seleccionar + abrir
+///
+/// En filas 3+, si el click cae en la zona ` [x]` (últimos 4 chars del inner area),
+/// elimina el proyecto inmediatamente sin confirmación.
+fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
     // inner_y = sidebar.y + 1 (borde superior del Block)
     let inner_y = layout.sidebar.y + 1;
     let inner_height = layout.sidebar.height.saturating_sub(2);
@@ -526,15 +530,34 @@ fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, row: u1
             state.folder_picker.open(start);
             tracing::debug!("projects: folder picker abierto via mouse click");
         }
-        1 => { /* separador — ignorar */ }
+        1 => {
+            // Click en la fila del path input inline → dar foco
+            state.projects.path_input_focus();
+            tracing::debug!("projects: foco en path input inline via mouse click");
+        }
+        2 => { /* separador — ignorar */ }
         visual => {
-            // Click en la lista de proyectos (visual 2+ → índice visual - 2)
-            let list_row = visual - 2;
+            // Click en la lista de proyectos (visual 3+ → índice visual - 3)
+            let list_row = visual - 3;
             let idx = state.projects.scroll_offset + list_row;
             if idx >= state.projects.projects.len() {
                 return;
             }
-            if state.projects.selected == idx {
+
+            // Detectar click en el botón " [x]" (últimos 4 chars del inner area).
+            // inner_x = sidebar.x + 1 (borde izquierdo del Block)
+            // inner_width = sidebar.width - 2 (bordes izquierdo y derecho)
+            // Zona de delete: desde (inner_x + inner_width - 4) hasta el borde derecho.
+            let inner_x = layout.sidebar.x + 1;
+            let inner_width = layout.sidebar.width.saturating_sub(2);
+            // delete_btn_width = 4 (" [x]") — debe coincidir con render en projects_panel.rs
+            let delete_zone_start = inner_x + inner_width.saturating_sub(4);
+
+            if col >= delete_zone_start {
+                // Click en [x] → eliminar proyecto inmediatamente (sin confirmación)
+                state.projects.remove(idx);
+                tracing::debug!(idx, "projects: proyecto eliminado via botón [x]");
+            } else if state.projects.selected == idx {
                 // Segundo click en el mismo proyecto → abrir
                 let effects = super::reduce(state, &crate::core::Action::ProjectsOpen);
                 super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());

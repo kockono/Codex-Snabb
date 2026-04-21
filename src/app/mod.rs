@@ -1372,6 +1372,33 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Projects path input inline ──
+        Action::ProjectsPathInputChar(ch) => {
+            state.projects.path_input_push(*ch);
+            vec![]
+        }
+        Action::ProjectsPathInputBackspace => {
+            state.projects.path_input_backspace();
+            vec![]
+        }
+        Action::ProjectsPathInputConfirm => {
+            if let Some(path) = state.projects.path_input_confirm() {
+                state.projects.add(path);
+                tracing::debug!("projects: proyecto agregado via path input inline");
+            }
+            vec![]
+        }
+        Action::ProjectsPathInputEscape => {
+            state.projects.path_input_escape();
+            tracing::debug!("projects: path input inline cancelado");
+            vec![]
+        }
+        Action::ProjectsPathInputFocus => {
+            state.projects.path_input_focus();
+            tracing::debug!("projects: foco dado al path input inline");
+            vec![]
+        }
+
         // ── Folder picker ──
         Action::FolderPickerUp => {
             state.folder_picker.move_up();
@@ -1400,6 +1427,36 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         Action::FolderPickerCancel => {
             state.folder_picker.close();
             tracing::debug!("folder picker: cancelado");
+            vec![]
+        }
+        Action::FolderPickerToggleFocus => {
+            state.folder_picker.toggle_focus();
+            tracing::debug!(
+                path_focused = state.folder_picker.path_input_focused,
+                "folder picker: toggle focus"
+            );
+            vec![]
+        }
+        Action::FolderPickerPathInput(ch) => {
+            state.folder_picker.path_input_push(*ch);
+            vec![]
+        }
+        Action::FolderPickerPathBackspace => {
+            state.folder_picker.path_input_backspace();
+            vec![]
+        }
+        Action::FolderPickerPathConfirm => {
+            let ok = state.folder_picker.try_navigate_to_input();
+            if ok {
+                tracing::debug!("folder picker: navegado a path del input");
+            } else {
+                tracing::debug!("folder picker: path no encontrado");
+            }
+            vec![]
+        }
+        Action::FolderPickerPathEscape => {
+            state.folder_picker.path_input_escape();
+            tracing::debug!("folder picker: input limpiado, foco a árbol");
             vec![]
         }
 
@@ -1714,7 +1771,9 @@ async fn event_loop(
                     state.keybindings.editing_index.is_some(),
                     &state.commands,
                     state.folder_picker.visible,
+                    state.folder_picker.path_input_focused,
                     state.projects.selected,
+                    state.projects.path_input_focused,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -1736,6 +1795,10 @@ async fn event_loop(
                     state.cursor_blink_counter = 0;
                     state.cursor_visible = !state.cursor_visible;
                 }
+                // Tick del error efímero del folder picker
+                state.folder_picker.tick_error();
+                // Tick del error efímero del path input inline de proyectos
+                state.projects.path_input_tick();
             }
             Some(Event::Input(_)) => {
                 // Cualquier input del usuario: cursor visible, reset counter
