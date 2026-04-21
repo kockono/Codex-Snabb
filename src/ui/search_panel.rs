@@ -164,11 +164,8 @@ fn render_query_line(f: &mut Frame, area: Rect, state: &SearchState, theme: &The
     let ab_style = toggle_style(state.options.whole_word, theme);
     let re_style = toggle_style(state.options.use_regex, theme);
 
-    let cursor = if is_active { "_" } else { "" };
-    let cursor_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(theme.bg_secondary)
-        .add_modifier(Modifier::SLOW_BLINK);
+    let cursor = if is_active { "|" } else { "" };
+    let cursor_style = Style::default().fg(theme.fg_accent).bg(theme.bg_secondary);
 
     let query_style = if is_active {
         Style::default().fg(theme.fg_primary).bg(theme.bg_secondary)
@@ -205,11 +202,8 @@ fn render_field_line(
     text: &str,
     is_active: bool,
 ) {
-    let cursor = if is_active { "_" } else { "" };
-    let cursor_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(theme.bg_secondary)
-        .add_modifier(Modifier::SLOW_BLINK);
+    let cursor = if is_active { "|" } else { "" };
+    let cursor_style = Style::default().fg(theme.fg_accent).bg(theme.bg_secondary);
 
     let text_style = if is_active {
         Style::default().fg(theme.fg_primary).bg(theme.bg_secondary)

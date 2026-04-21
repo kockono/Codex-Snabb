@@ -24,6 +24,7 @@ pub fn render_projects_panel(
     theme: &Theme,
     state: &ProjectsState,
     focused: bool,
+    cursor_visible: bool,
 ) {
     let border_color = if focused {
         theme.border_focused
@@ -113,7 +114,7 @@ pub fn render_projects_panel(
     };
     let is_placeholder = state.path_input.is_empty();
     let input_text: &str = if is_placeholder {
-        "C:\\Programs\\proyect (placeholder)"
+        "Agregar por ruta..."
     } else {
         state.path_input.as_str()
     };
@@ -125,8 +126,12 @@ pub fn render_projects_panel(
     } else {
         Style::default().fg(theme.fg_primary).bg(input_bg)
     };
-    // Cursor: "_" con SLOW_BLINK si focused, vacío si no
-    let cursor_indicator = if state.path_input_focused { "_" } else { "" };
+    // Cursor: "|" visible/oculto por cursor_visible (sistema de blink del app state)
+    let cursor_indicator = if state.path_input_focused && cursor_visible {
+        "|"
+    } else {
+        ""
+    };
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -140,10 +145,7 @@ pub fn render_projects_panel(
             Span::styled(input_text, text_style),
             Span::styled(
                 cursor_indicator,
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .bg(input_bg)
-                    .add_modifier(Modifier::SLOW_BLINK),
+                Style::default().fg(theme.fg_accent).bg(input_bg),
             ),
         ]))
         .style(Style::default().bg(input_bg)),

@@ -129,6 +129,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 theme,
                 &state.projects,
                 sidebar_focused,
+                state.cursor_visible,
             );
         } else {
             panels::render_sidebar(
@@ -313,7 +314,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("[sin archivo]");
-        quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name);
+        quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name, state.cursor_visible);
     } else if state.palette.visible {
         palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
     }

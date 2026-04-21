@@ -34,6 +34,7 @@ pub fn render_quick_open(
     state: &QuickOpenState,
     theme: &Theme,
     active_file_name: &str,
+    cursor_visible: bool,
 ) {
     if !state.visible {
         return;
@@ -99,10 +100,8 @@ pub fn render_quick_open(
             ),
             Span::styled(state.input.as_str(), Style::default().fg(theme.fg_primary)),
             Span::styled(
-                "_",
-                Style::default()
-                    .fg(theme.fg_accent_alt)
-                    .add_modifier(Modifier::SLOW_BLINK),
+                if cursor_visible { "|" } else { "" },
+                Style::default().fg(theme.fg_accent_alt),
             ),
         ]);
         let input_paragraph =
@@ -161,10 +160,8 @@ pub fn render_quick_open(
             ),
             Span::styled(state.input.as_str(), Style::default().fg(theme.fg_primary)),
             Span::styled(
-                "_",
-                Style::default()
-                    .fg(theme.fg_accent_alt)
-                    .add_modifier(Modifier::SLOW_BLINK),
+                if cursor_visible { "|" } else { "" },
+                Style::default().fg(theme.fg_accent_alt),
             ),
         ]);
         let input_paragraph =
