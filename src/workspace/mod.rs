@@ -9,6 +9,7 @@ pub mod folder_picker;
 pub mod project;
 pub mod projects;
 pub mod quick_open;
+pub mod save_as;
 pub mod tree;
 
 pub use explorer::ExplorerState;

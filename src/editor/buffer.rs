@@ -87,7 +87,6 @@ impl TextBuffer {
     }
 
     /// Guarda el contenido a un path específico y lo asocia al buffer.
-    #[expect(dead_code, reason = "se usará para save-as desde command palette")]
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
         let content = self.lines.join("\n");
         std::fs::write(path, &content)
