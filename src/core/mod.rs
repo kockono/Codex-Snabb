@@ -381,19 +381,11 @@ pub enum Action {
     ActivityBarSelect(crate::core::settings::SidebarSection),
 
     // ── Projects panel ──
-    /// Abrir folder picker para agregar nuevo proyecto.
+    /// Abrir diálogo nativo del SO para agregar nuevo proyecto.
     ProjectsAddNew,
-    /// Insertar un carácter en el input de ruta inline del panel de proyectos.
-    ProjectsPathInputChar(char),
-    /// Borrar el último carácter del input de ruta inline (Backspace).
-    ProjectsPathInputBackspace,
-    /// Confirmar el path escrito en el input inline (Enter).
-    ProjectsPathInputConfirm,
-    /// Cancelar el input inline sin cerrar nada (Esc).
-    ProjectsPathInputEscape,
-    /// Dar foco al input de ruta inline.
-    #[expect(dead_code, reason = "disponible para keybinding futuro — mouse usa path_input_focus() directamente")]
-    ProjectsPathInputFocus,
+    /// El diálogo nativo retornó una carpeta seleccionada por el usuario.
+    /// Contiene el path absoluto de la carpeta elegida.
+    ProjectsNativePickerResult(std::path::PathBuf),
     /// Cancelar folder picker sin agregar proyecto.
     #[expect(dead_code, reason = "disponible via command registry — FolderPickerCancel se usa directamente")]
     ProjectsCancelAdd,

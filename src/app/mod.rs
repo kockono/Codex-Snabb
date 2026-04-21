@@ -1393,13 +1393,36 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     .or_else(|| state.explorer.as_ref().map(|e| e.root.clone())) // CLONE: fallback al workspace actual
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             };
-            state.folder_picker.open(start);
-            tracing::debug!("projects: folder picker abierto");
+
+            // Abrir diálogo nativo en un hilo de bloqueo — no bloquea el event loop.
+            // El resultado llega via mpsc::channel y se procesa en el próximo tick.
+            let (tx, rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+            state.projects.native_picker_rx = Some(rx);
+
+            tokio::task::spawn_blocking(move || {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Seleccionar carpeta del proyecto")
+                    .set_directory(&start)
+                    .pick_folder()
+                {
+                    // Si el usuario canceló, el canal simplemente se cierra (Disconnected)
+                    let _ = tx.send(folder);
+                }
+                // tx se droppea aquí → Receiver::try_recv retorna Disconnected si no se envió nada
+            });
+
+            tracing::debug!("projects: diálogo nativo de carpeta iniciado");
+            vec![]
+        }
+        Action::ProjectsNativePickerResult(path) => {
+            // CLONE: path viene del async task — necesitamos ownership para add()
+            state.projects.add(path.clone());
+            tracing::debug!(path = %path.display(), "projects: proyecto agregado via diálogo nativo");
             vec![]
         }
         Action::ProjectsCancelAdd => {
-            state.folder_picker.close();
-            tracing::debug!("projects: folder picker cancelado");
+            state.projects.native_picker_rx = None;
+            tracing::debug!("projects: diálogo nativo cancelado");
             vec![]
         }
         Action::ProjectsMoveUp => {
@@ -1442,33 +1465,6 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 state.projects.active_project = Some(state.projects.selected);
                 state.focused_panel = PanelId::Editor;
             }
-            vec![]
-        }
-
-        // ── Projects path input inline ──
-        Action::ProjectsPathInputChar(ch) => {
-            state.projects.path_input_push(*ch);
-            vec![]
-        }
-        Action::ProjectsPathInputBackspace => {
-            state.projects.path_input_backspace();
-            vec![]
-        }
-        Action::ProjectsPathInputConfirm => {
-            if let Some(path) = state.projects.path_input_confirm() {
-                state.projects.add(path);
-                tracing::debug!("projects: proyecto agregado via path input inline");
-            }
-            vec![]
-        }
-        Action::ProjectsPathInputEscape => {
-            state.projects.path_input_escape();
-            tracing::debug!("projects: path input inline cancelado");
-            vec![]
-        }
-        Action::ProjectsPathInputFocus => {
-            state.projects.path_input_focus();
-            tracing::debug!("projects: foco dado al path input inline");
             vec![]
         }
 
@@ -1982,7 +1978,7 @@ async fn event_loop(
         // 3. Mapear evento a acción (sensible al panel enfocado y overlays)
         let action = match &event {
             Some(Event::Input(crossterm_event)) => {
-                keymap(
+                    keymap(
                     crossterm_event,
                     state.focused_panel,
                     state.palette.visible,
@@ -1998,7 +1994,6 @@ async fn event_loop(
                     state.folder_picker.visible,
                     state.folder_picker.path_input_focused,
                     state.projects.selected,
-                    state.projects.path_input_focused,
                     state.save_as.visible,
                     state.context_menu.visible,
                 )
@@ -2024,10 +2019,13 @@ async fn event_loop(
                 }
                 // Tick del error efímero del folder picker
                 state.folder_picker.tick_error();
-                // Tick del error efímero del path input inline de proyectos
-                state.projects.path_input_tick();
                 // Tick del error efímero del modal save as
                 state.save_as.tick_error();
+                // Consultar diálogo nativo de carpeta (no bloquea — try_recv)
+                if let Some(path) = state.projects.poll_native_picker() {
+                    let effects = reduce(&mut state, &Action::ProjectsNativePickerResult(path));
+                    process_effects(&effects, shutdown);
+                }
             }
             Some(Event::Input(_)) => {
                 // Cualquier input del usuario: cursor visible, reset counter

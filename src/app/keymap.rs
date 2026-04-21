@@ -43,7 +43,6 @@ pub(super) fn keymap(
     folder_picker_visible: bool,
     folder_picker_path_focused: bool,
     projects_selected: usize,
-    projects_path_input_focused: bool,
     save_as_visible: bool,
     context_menu_visible: bool,
 ) -> Action {
@@ -102,27 +101,7 @@ pub(super) fn keymap(
             (KeyCode::Esc, _) => Action::SaveAsCancel,
             (KeyCode::Enter, _) => Action::SaveAsConfirm,
             (KeyCode::Backspace, _) => Action::SaveAsBackspace,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::SaveAsChar(ch)
-            }
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Projects path input enfocado: captura chars antes de atajos globales ──
-    // Solo cuando el panel de proyectos tiene foco Y el input inline está activo.
-    // El folder picker (modal) tiene prioridad mayor — verificar después.
-    if !folder_picker_visible
-        && focused_panel == PanelId::Projects
-        && projects_path_input_focused
-        && let crossterm::event::Event::Key(key) = event
-        && key.kind == crossterm::event::KeyEventKind::Press
-    {
-        return match key.code {
-            KeyCode::Enter => Action::ProjectsPathInputConfirm,
-            KeyCode::Esc => Action::ProjectsPathInputEscape,
-            KeyCode::Backspace => Action::ProjectsPathInputBackspace,
-            KeyCode::Char(ch) => Action::ProjectsPathInputChar(ch),
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::SaveAsChar(ch),
             _ => Action::Noop,
         };
     }
@@ -572,7 +551,6 @@ mod tests {
             false, // folder_picker
             false, // folder_picker_path_focused
             0,     // projects_selected
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -599,7 +577,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -629,7 +606,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -656,7 +632,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -683,7 +658,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -710,7 +684,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -737,7 +710,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -766,7 +738,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -793,7 +764,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -820,7 +790,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -847,7 +816,6 @@ mod tests {
             false,
             false,
             0,
-            false, // projects_path_input_focused
             false, // save_as_visible
             false, // context_menu_visible
         );
@@ -874,7 +842,6 @@ mod tests {
             false,
             false,
             0,
-            false,
             true,  // save_as_visible
             false, // context_menu_visible
         );
@@ -901,7 +868,6 @@ mod tests {
             false,
             false,
             0,
-            false,
             true,  // save_as_visible
             false, // context_menu_visible
         );
@@ -928,7 +894,6 @@ mod tests {
             false,
             false,
             0,
-            false,
             true,  // save_as_visible
             false, // context_menu_visible
         );

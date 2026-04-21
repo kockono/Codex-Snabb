@@ -138,7 +138,6 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 theme,
                 &state.projects,
                 sidebar_focused,
-                state.cursor_visible,
             );
         } else {
             panels::render_sidebar(

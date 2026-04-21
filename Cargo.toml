@@ -67,6 +67,9 @@ tree-sitter-bash       = "0.25"   # req ^0.25
 # tree-sitter-yaml      — req ^0.19 (muy viejo, sin fork compatible)
 # tree-sitter-markdown  — req ^0.20 (muy viejo, sin fork compatible)
 
+# Diálogo nativo de selección de carpeta/archivo (usa WinAPI / AppKit / GTK)
+rfd = { version = "0.15", default-features = false }
+
 # Observabilidad
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

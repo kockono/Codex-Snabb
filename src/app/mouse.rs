@@ -637,12 +637,11 @@ pub(super) fn reduce_mouse_middle_click(state: &mut AppState, col: u16, row: u16
 /// Procesa click en el panel de proyectos.
 ///
 /// Layout interno del panel (dentro del borde):
-///   - Fila 0: `[+] Nuevo proyecto`    → abre folder picker
-///   - Fila 1: `[+] path input inline` → foco al input de ruta
-///   - Fila 2: separador               → ignorar
-///   - Filas 3+: lista de proyectos    → seleccionar + abrir
+///   - Fila 0: `[+] Nuevo proyecto` → abre diálogo nativo de carpeta
+///   - Fila 1: separador            → ignorar
+///   - Filas 2+: lista de proyectos → seleccionar + abrir
 ///
-/// En filas 3+, si el click cae en la zona ` [x]` (últimos 4 chars del inner area),
+/// En filas 2+, si el click cae en la zona ` [x]` (últimos 4 chars del inner area),
 /// elimina el proyecto inmediatamente sin confirmación.
 fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
     // inner_y = sidebar.y + 1 (borde superior del Block)
@@ -657,23 +656,15 @@ fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u1
 
     match visual_row {
         0 => {
-            // Click en [+] Nuevo proyecto → abrir folder picker
-            // Arrancar desde home del usuario o directorio actual
-            let start = home_dir()
-                .or_else(|| state.explorer.as_ref().map(|e| e.root.clone()))
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            state.folder_picker.open(start);
-            tracing::debug!("projects: folder picker abierto via mouse click");
+            // Click en [+] Nuevo proyecto → abrir diálogo nativo del SO
+            let effects = super::reduce(state, &crate::core::Action::ProjectsAddNew);
+            super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+            tracing::debug!("projects: diálogo nativo iniciado via mouse click");
         }
-        1 => {
-            // Click en la fila del path input inline → dar foco
-            state.projects.path_input_focus();
-            tracing::debug!("projects: foco en path input inline via mouse click");
-        }
-        2 => { /* separador — ignorar */ }
+        1 => { /* separador — ignorar */ }
         visual => {
-            // Click en la lista de proyectos (visual 3+ → índice visual - 3)
-            let list_row = visual - 3;
+            // Click en la lista de proyectos (visual 2+ → índice visual - 2)
+            let list_row = visual - 2;
             let idx = state.projects.scroll_offset + list_row;
             if idx >= state.projects.projects.len() {
                 return;
@@ -701,21 +692,6 @@ fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u1
                 state.projects.selected = idx;
             }
         }
-    }
-}
-
-/// Retorna el directorio home del usuario según el sistema operativo.
-fn home_dir() -> Option<std::path::PathBuf> {
-    if cfg!(windows) {
-        std::env::var("USERPROFILE")
-            .or_else(|_| {
-                std::env::var("HOMEDRIVE")
-                    .and_then(|d| std::env::var("HOMEPATH").map(|p| format!("{d}{p}")))
-            })
-            .ok()
-            .map(std::path::PathBuf::from)
-    } else {
-        std::env::var("HOME").ok().map(std::path::PathBuf::from)
     }
 }
 

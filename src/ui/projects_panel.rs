@@ -24,7 +24,6 @@ pub fn render_projects_panel(
     theme: &Theme,
     state: &ProjectsState,
     focused: bool,
-    cursor_visible: bool,
 ) {
     let border_color = if focused {
         theme.border_focused
@@ -59,38 +58,15 @@ pub fn render_projects_panel(
 
     // ── Pre-computar todo ANTES del render (sin allocaciones en render loop) ──
 
-    // Determinar si hay error activo para el layout condicional
-    let has_error = state.path_input_error;
-
-    // Layout dinámico: [+] nuevo (1) + path input (1) + error? (0|1) + separator (1) + list (fill) + footer (1)
-    let constraints: Vec<Constraint> = if has_error {
-        vec![
-            Constraint::Length(1), // [+] Nuevo proyecto
-            Constraint::Length(1), // [+] path input inline
-            Constraint::Length(1), // error "Ruta no válida"
-            Constraint::Length(1), // separador
-            Constraint::Fill(1),   // lista de proyectos
-            Constraint::Length(1), // footer
-        ]
-    } else {
-        vec![
-            Constraint::Length(1), // [+] Nuevo proyecto
-            Constraint::Length(1), // [+] path input inline
-            Constraint::Length(1), // separador
-            Constraint::Fill(1),   // lista de proyectos
-            Constraint::Length(1), // footer
-        ]
-    };
-
-    // Índices dinámicos de cada sección
-    let error_idx: usize = if has_error { 2 } else { usize::MAX }; // sentinel si no hay error
-    let separator_idx: usize = if has_error { 3 } else { 2 };
-    let list_idx: usize = if has_error { 4 } else { 3 };
-    let footer_idx: usize = if has_error { 5 } else { 4 };
-
+    // Layout fijo: [+] nuevo (1) + separator (1) + list (fill) + footer (1)
     let sections = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Length(1), // [+] Nuevo proyecto
+            Constraint::Length(1), // separador
+            Constraint::Fill(1),   // lista de proyectos
+            Constraint::Length(1), // footer
+        ])
         .split(inner);
 
     // ── Fila 0: [+] Nuevo proyecto ──
@@ -105,76 +81,11 @@ pub fn render_projects_panel(
         sections[0],
     );
 
-    // ── Fila 1: [+] path input inline ──
-    // Pre-computar bg y estilos FUERA del render
-    let input_bg = if state.path_input_focused {
-        theme.bg_active
-    } else {
-        theme.bg_secondary
-    };
-    let is_placeholder = state.path_input.is_empty();
-    let input_text: &str = if is_placeholder {
-        "Agregar por ruta..."
-    } else {
-        state.path_input.as_str()
-    };
-    let text_style = if is_placeholder {
-        Style::default()
-            .fg(theme.fg_secondary)
-            .bg(input_bg)
-            .add_modifier(Modifier::DIM)
-    } else {
-        Style::default().fg(theme.fg_primary).bg(input_bg)
-    };
-    // Cursor: "|" visible/oculto por cursor_visible (sistema de blink del app state)
-    let cursor_indicator = if state.path_input_focused && cursor_visible {
-        "|"
-    } else {
-        ""
-    };
-
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " [+] ",
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .bg(input_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(input_text, text_style),
-            Span::styled(
-                cursor_indicator,
-                Style::default().fg(theme.fg_accent).bg(input_bg),
-            ),
-        ]))
-        .style(Style::default().bg(input_bg)),
-        sections[1],
-    );
-
-    // ── Fila 2 (condicional): error "Ruta no válida" ──
-    if has_error {
-        // has_error garantiza que error_idx != usize::MAX y sections[error_idx] es válido
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("   ", Style::default().bg(theme.bg_secondary)),
-                Span::styled(
-                    "\u{2717} Ruta no v\u{e1}lida",
-                    Style::default()
-                        .fg(theme.diff_remove)
-                        .bg(theme.bg_secondary),
-                ),
-            ]))
-            .style(Style::default().bg(theme.bg_secondary)),
-            sections[error_idx],
-        );
-    }
-
-    // ── Separador ──
-    render_separator(f, sections[separator_idx], theme);
+    // ── Fila 1: separador ──
+    render_separator(f, sections[1], theme);
 
     // ── Lista de proyectos ──
-    let list_area = sections[list_idx];
+    let list_area = sections[2];
     if list_area.height == 0 || state.projects.is_empty() {
         // Empty state
         let msg = "Sin proyectos guardados";
@@ -273,9 +184,7 @@ pub fn render_projects_panel(
     }
 
     // ── Footer contextual ──
-    let footer_text = if state.path_input_focused {
-        " [Enter] Agregar  [Esc] Cancelar"
-    } else if focused {
+    let footer_text = if focused {
         " [Enter] Abrir  [L] Candado  [D] Eliminar"
     } else {
         " PROJECTS"
@@ -286,7 +195,7 @@ pub fn render_projects_panel(
             Style::default().fg(theme.fg_secondary),
         )))
         .style(Style::default().bg(theme.bg_active)),
-        sections[footer_idx],
+        sections[3],
     );
 }
 
