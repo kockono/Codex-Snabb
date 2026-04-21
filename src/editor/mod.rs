@@ -13,6 +13,7 @@ pub mod multicursor;
 pub mod search;
 pub mod selection;
 pub mod tabs;
+pub mod ts_highlight;
 pub mod undo;
 pub mod viewport;
 
@@ -23,6 +24,7 @@ use anyhow::Result;
 use buffer::TextBuffer;
 use cursor::Position;
 use highlighting::{HighlightCache, HighlightEngine};
+use ts_highlight::TsHighlightEngine;
 use multicursor::MultiCursorState;
 use selection::Selection;
 use undo::{EditOperation, UndoStack};
@@ -92,12 +94,27 @@ impl EditorState {
         })
     }
 
-    /// Inicializa el cache de highlighting con el motor de syntect.
+    /// Inicializa el cache de highlighting para el archivo actual.
     ///
-    /// Detecta la syntax por extensión del archivo y crea el cache.
+    /// Intenta tree-sitter primero (6 lenguajes soportados). Si no hay
+    /// grammar tree-sitter, cae a syntect como fallback (~50 lenguajes).
     /// Se llama después de `open_file` cuando el `HighlightEngine`
     /// está disponible (vive en `AppState`).
     pub fn init_highlighting(&mut self, engine: &HighlightEngine) {
+        // Intentar tree-sitter primero
+        if let Some(path) = self.buffer.file_path() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if let Some(ts_config) = ts_highlight::config_for_extension(ext) {
+                let ts_engine = TsHighlightEngine::new(ts_config);
+                self.highlight_cache.set_ts_engine(Some(ts_engine));
+                tracing::debug!(ext, "tree-sitter grammar cargado");
+                return; // No necesitamos syntect
+            }
+        }
+        // Fallback: syntect (camino existente)
         if let Some(path) = self.buffer.file_path()
             && let Some(syntax) = engine.detect_syntax(path)
         {

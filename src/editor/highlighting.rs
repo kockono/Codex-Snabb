@@ -24,6 +24,7 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, SyntaxReference, SyntaxSet};
 
 use super::buffer::TextBuffer;
+use super::ts_highlight::TsHighlightEngine;
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
@@ -275,6 +276,10 @@ pub struct HighlightCache {
     /// Hasta qué línea se ha pre-cacheado (exclusivo).
     /// Avanza en chunks de `PRECACHE_CHUNK_SIZE` por frame idle.
     precache_cursor: usize,
+    /// Motor tree-sitter para este buffer (Some si el lenguaje tiene grammar).
+    /// None = usar syntect (camino existente sin cambios).
+    /// Boxed para reducir el tamaño del variant None (solo 8 bytes de puntero).
+    ts_engine: Option<Box<TsHighlightEngine>>,
 }
 
 impl HighlightCache {
@@ -291,6 +296,7 @@ impl HighlightCache {
             checkpoints: HashMap::new(),
             precache_in_progress: false,
             precache_cursor: 0,
+            ts_engine: None,
         }
     }
 
@@ -307,6 +313,7 @@ impl HighlightCache {
             checkpoints: HashMap::new(),
             precache_in_progress: false,
             precache_cursor: 0,
+            ts_engine: None,
         }
     }
 
@@ -317,6 +324,10 @@ impl HighlightCache {
     /// y resetea el pre-cache si la edición afecta líneas ya pre-cacheadas.
     pub fn invalidate_from(&mut self, line: usize) {
         self.last_edit_time = Some(Instant::now());
+        // Invalidar tree-sitter engine si existe
+        if let Some(ref mut ts) = self.ts_engine {
+            ts.invalidate();
+        }
         match self.dirty_from {
             Some(existing) => {
                 // Mantener el mínimo: si ya estaba dirty desde línea 30
@@ -345,6 +356,10 @@ impl HighlightCache {
         self.last_edit_time = Some(Instant::now());
         self.dirty_from = Some(0);
         self.checkpoints.clear();
+        // Invalidar tree-sitter engine si existe
+        if let Some(ref mut ts) = self.ts_engine {
+            ts.invalidate();
+        }
         // Resetear pre-cache completo — todo debe re-procesarse.
         self.precache_in_progress = false;
         self.precache_cursor = 0;
@@ -370,6 +385,12 @@ impl HighlightCache {
     /// tokens stale en cache. Esto fuerza al render a usar texto plano inmediatamente
     /// durante el debounce, eliminando el lag perceptible al tipear.
     pub fn get_line(&self, line_idx: usize) -> Option<&[HighlightToken]> {
+        // Prioridad: tree-sitter > syntect.
+        // Si hay engine tree-sitter, delegar completamente a él.
+        if let Some(ref ts) = self.ts_engine {
+            return ts.get_line(line_idx);
+        }
+        // Camino syntect (sin cambios cuando ts_engine es None).
         // Si la línea está dirty, retornar None para que el render use plain text.
         // Esto elimina el lag de 150ms: el carácter aparece inmediatamente en plain
         // text, y los colores vuelven cuando syntect re-procesa tras el debounce.
@@ -448,6 +469,12 @@ impl HighlightCache {
         buffer: &TextBuffer,
         engine: &HighlightEngine,
     ) {
+        // Con tree-sitter, la re-coloración de línea individual no aplica.
+        // El motor re-parsea el viewport completo en ensure_viewport_highlighted().
+        // La invalidación ya se hizo en invalidate_from().
+        if self.ts_engine.is_some() {
+            return;
+        }
         if !engine.is_ready() {
             return;
         }
@@ -566,6 +593,19 @@ impl HighlightCache {
         viewport_start: usize,
         viewport_height: usize,
     ) {
+        // Si hay tree-sitter engine, usarlo en lugar de syntect.
+        // Construir source bytes desde buffer y delegar al motor tree-sitter.
+        if let Some(ref mut ts) = self.ts_engine {
+            let source = buffer_to_bytes(buffer);
+            let effective_start = viewport_start.saturating_sub(VIEWPORT_MARGIN);
+            let effective_end =
+                (viewport_start + viewport_height + VIEWPORT_MARGIN).min(buffer.line_count());
+            ts.highlight_viewport(&source, effective_start, effective_end);
+            return; // No usar syntect
+        }
+
+        // ── Camino syntect (sin cambios cuando ts_engine es None) ──
+
         // Engine no listo — noop
         if !engine.is_ready() {
             return;
@@ -900,6 +940,44 @@ impl HighlightCache {
             true // Hay más trabajo pendiente
         }
     }
+
+    /// Asigna un motor tree-sitter a este cache.
+    ///
+    /// Si se llama con `Some`, tree-sitter tiene prioridad sobre syntect.
+    /// El cache de syntect se limpia porque ya no se usa.
+    pub fn set_ts_engine(&mut self, engine: Option<TsHighlightEngine>) {
+        self.ts_engine = engine.map(Box::new);
+        if self.ts_engine.is_some() {
+            // Limpiar cache de syntect — ya no se usa
+            self.lines.clear();
+            self.dirty_from = Some(0);
+        }
+    }
+
+    /// Si el cache tiene un motor tree-sitter activo.
+    #[expect(dead_code, reason = "API pública — se usará para debug/status bar")]
+    pub fn has_ts_engine(&self) -> bool {
+        self.ts_engine.is_some()
+    }
+}
+
+/// Construye los bytes UTF-8 del buffer completo, uniendo líneas con newlines.
+///
+/// Una sola allocation por llamada — aceptable porque se llama fuera del render loop.
+fn buffer_to_bytes(buffer: &TextBuffer) -> Vec<u8> {
+    let line_count = buffer.line_count();
+    let total_len: usize = (0..line_count)
+        .map(|i| buffer.line(i).map(|l| l.len() + 1).unwrap_or(1))
+        .sum();
+    let mut bytes = Vec::with_capacity(total_len);
+    for i in 0..line_count {
+        let line = buffer.line(i).unwrap_or("");
+        bytes.extend_from_slice(line.as_bytes());
+        if i + 1 < line_count {
+            bytes.push(b'\n');
+        }
+    }
+    bytes
 }
 
 impl std::fmt::Debug for HighlightCache {
@@ -914,6 +992,7 @@ impl std::fmt::Debug for HighlightCache {
             .field("checkpoints_count", &self.checkpoints.len())
             .field("precache_in_progress", &self.precache_in_progress)
             .field("precache_cursor", &self.precache_cursor)
+            .field("ts_engine", &self.ts_engine)
             .finish()
     }
 }
