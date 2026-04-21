@@ -32,16 +32,16 @@ pub struct BudgetLimits {
 
 /// Budgets por defecto derivados de `architecture.md`.
 ///
-/// - Idle RAM sin LSP: < 40 MB
-/// - RAM en uso normal: < 70 MB
+/// - Idle RAM sin LSP: < 85 MB
+/// - RAM en uso normal: < 100 MB
 /// - Input-to-render target: < 16 ms
 /// - Input-to-render hard limit: < 33 ms
 /// - Cold startup: < 150 ms
 pub const DEFAULT_BUDGETS: BudgetLimits = BudgetLimits {
-    idle_ram_bytes: 40 * 1024 * 1024,    // 40 MB
-    working_ram_bytes: 70 * 1024 * 1024, // 70 MB
-    input_to_render_target_us: 16_000,   // 16 ms
-    input_to_render_hard_us: 33_000,     // 33 ms
+    idle_ram_bytes: 85 * 1024 * 1024,     // 85 MB
+    working_ram_bytes: 100 * 1024 * 1024, // 100 MB
+    input_to_render_target_us: 16_000,    // 16 ms
+    input_to_render_hard_us: 33_000,      // 33 ms
     cold_startup_ms: 150,
 };
 

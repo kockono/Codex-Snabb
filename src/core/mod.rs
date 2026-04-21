@@ -204,6 +204,14 @@ pub enum Action {
         /// Fila donde ocurrió el scroll.
         row: u16,
     },
+    /// Click del botón del medio del mouse (rueda) en posición absoluta de terminal.
+    /// Se usa para cerrar la tab sobre la que se hace click — igual que los browsers.
+    MouseMiddleClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
+        row: u16,
+    },
     /// Drag del mouse (botón izquierdo presionado + movimiento).
     /// Se usa para selección de texto arrastrando el mouse.
     MouseDrag {
@@ -242,6 +250,8 @@ pub enum Action {
     GitCommitInput(char),
     /// Borrar último carácter del mensaje de commit.
     GitCommitDeleteChar,
+    /// Ejecutar git fetch para sincronizar con el remoto.
+    GitFetch,
 
     // ── LSP ──
     /// Arrancar el language server para el archivo actual.
@@ -276,6 +286,18 @@ pub enum Action {
     PaletteConfirm,
     /// Cerrar la command palette.
     PaletteClose,
+
+    // ── Go to Line ──
+    /// Abrir modal Go to Line (Ctrl+G).
+    OpenGoToLine,
+    /// Insertar dígito en Go to Line.
+    GoToLineInsertChar(char),
+    /// Borrar último dígito en Go to Line.
+    GoToLineDeleteChar,
+    /// Confirmar y saltar a la línea.
+    GoToLineConfirm,
+    /// Cancelar Go to Line.
+    GoToLineClose,
 
     // ── Quick Open ──
     /// Mover selección arriba en el quick open.

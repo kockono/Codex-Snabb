@@ -180,6 +180,7 @@ impl TabState {
     ///
     /// Se usa para operaciones que afectan a todas las tabs, como
     /// invalidar caches de highlighting cuando el engine termina de cargar.
+    #[expect(dead_code, reason = "API pública para operaciones masivas sobre tabs")]
     pub fn all_editors_mut(&mut self) -> &mut [EditorState] {
         &mut self.editors
     }

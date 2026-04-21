@@ -37,12 +37,10 @@ use crate::workspace::explorer::{ExplorerState, FlatEntry};
 pub struct StatusBarData<'a> {
     /// Modo actual del editor (NORMAL, INSERT, etc.).
     pub mode: &'a str,
-    /// Nombre del archivo activo.
-    pub file_name: &'a str,
     /// Posición del cursor formateada (ej: "Ln 42, Col 7").
     pub cursor_pos: &'a str,
-    /// Branch de Git activa.
-    pub branch: &'a str,
+    /// Branch display completo: "⎇ main ↑2 ↓1 ⟳" — pre-formateado fuera del render.
+    pub git_status: &'a str,
     /// Encoding del archivo activo.
     pub encoding: &'a str,
 }
@@ -231,7 +229,15 @@ pub fn render_sidebar(
         return;
     };
 
-    let flat = explorer.flatten();
+    // Usar flat cache si disponible (pre-computado antes del render), fallback a flatten()
+    let owned_flat;
+    let flat: &[FlatEntry] = match explorer.cached_flat() {
+        Some(cached) => cached,
+        None => {
+            owned_flat = explorer.flatten();
+            &owned_flat
+        }
+    };
     let visible_height = inner.height as usize;
     let scroll = explorer.scroll_offset;
 
@@ -925,6 +931,7 @@ fn render_line_with_selections<'a>(
         if let Some(tokens) = highlight_tokens {
             return render_highlight_tokens_fast(
                 tokens,
+                text,
                 col_offset + text_len,
                 is_cursor_line,
                 active_line_bg,
@@ -1019,18 +1026,23 @@ fn render_line_with_selections<'a>(
 /// Solo se usa cuando no hay selecciones, cursores secundarios, diagnósticos
 /// ni bracket matches. Mucho más eficiente que la iteración char-by-char.
 ///
+/// `line_text`: el texto visible de la línea (después de col_offset).
+/// Se usa como fallback para texto no cubierto por tokens (ej: caracteres
+/// recién tipeados que aún no fueron re-tokenizados por syntect).
+///
 /// `col_offset`: byte offset del inicio de `text` en la línea completa.
 /// Cuando hay indent guides, el texto empieza después de la zona de
 /// indentación, así que los tokens de highlight deben ajustarse.
 fn render_highlight_tokens_fast<'a>(
     tokens: &[HighlightToken],
+    line_text: &str,
     total_len: usize,
     is_cursor_line: bool,
     active_line_bg: Color,
     normal_style: Style,
     col_offset: usize,
 ) -> Vec<Span<'a>> {
-    let mut result = Vec::with_capacity(tokens.len());
+    let mut result = Vec::with_capacity(tokens.len() + 1);
     let mut consumed: usize = 0;
 
     let bg = if is_cursor_line {
@@ -1076,6 +1088,22 @@ fn render_highlight_tokens_fast<'a>(
             result.push(Span::styled(display.to_string(), style));
         }
         consumed = token_end;
+    }
+
+    // ── Tail fallback: texto no cubierto por tokens ──
+    // Si los tokens cacheados no cubren todo el texto visible (ej: carácter
+    // recién tipeado al final de la línea), renderizar el resto con estilo
+    // neutro. Esto evita que texto nuevo sea invisible durante el debounce.
+    let covered_in_text = consumed.saturating_sub(col_offset);
+    if covered_in_text < line_text.len() {
+        let remainder = &line_text[covered_in_text..];
+        if !remainder.is_empty() {
+            let tail_style = Style::default()
+                .fg(normal_style.fg.unwrap_or(Color::Reset))
+                .bg(bg);
+            // CLONE: necesario — remainder es slice del buffer, Span toma ownership
+            result.push(Span::styled(remainder.to_string(), tail_style));
+        }
     }
 
     result
@@ -1509,13 +1537,8 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, theme: &Theme, data: &Status
         Span::styled(" ", Style::default().bg(theme.fg_accent)),
         Span::styled(" ", Style::default().bg(theme.bg_status)),
         Span::styled(
-            data.branch,
+            data.git_status,
             Style::default().fg(theme.fg_accent_alt).bg(theme.bg_status),
-        ),
-        Span::styled("  ", Style::default().bg(theme.bg_status)),
-        Span::styled(
-            data.file_name,
-            Style::default().fg(theme.fg_primary).bg(theme.bg_status),
         ),
     ];
 

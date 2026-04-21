@@ -24,18 +24,22 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, SyntaxReference, SyntaxSet};
 
 use super::buffer::TextBuffer;
+use super::ts_highlight::TsHighlightEngine;
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 /// Margen de líneas extra a tokenizar antes/después del viewport visible.
 /// Suaviza el scroll: al desplazarse, las líneas adyacentes ya están cacheadas.
-/// 50 líneas: con scroll de 1 línea por evento, da ~50 eventos de margen.
-const VIEWPORT_MARGIN: usize = 50;
+/// 20 líneas: con scroll de 3 líneas por evento, da ~6-7 eventos de margen.
+/// Reducido de 50: menos trabajo por re-process, imperceptible en scroll feel.
+const VIEWPORT_MARGIN: usize = 20;
 
-/// Tiempo mínimo entre la última edición y el re-highlight (debounce).
-/// Evita re-tokenizar en cada keystroke durante escritura rápida.
+/// Tiempo mínimo entre la última edición y el re-highlight contextual (debounce).
+/// Evita re-tokenizar el viewport completo en cada keystroke durante escritura rápida.
 /// Solo aplica a invalidaciones por edición, NO a scroll.
-const DEBOUNCE_MS: u64 = 150;
+/// Reducido de 150ms: con highlight_single_line() inmediato, el debounce solo
+/// controla el re-process contextual de líneas circundantes.
+const DEBOUNCE_MS: u64 = 80;
 
 /// Intervalo de líneas entre checkpoints de parse state.
 /// Cada N líneas se guarda el estado del parser para poder retomar
@@ -272,6 +276,10 @@ pub struct HighlightCache {
     /// Hasta qué línea se ha pre-cacheado (exclusivo).
     /// Avanza en chunks de `PRECACHE_CHUNK_SIZE` por frame idle.
     precache_cursor: usize,
+    /// Motor tree-sitter para este buffer (Some si el lenguaje tiene grammar).
+    /// None = usar syntect (camino existente sin cambios).
+    /// Boxed para reducir el tamaño del variant None (solo 8 bytes de puntero).
+    ts_engine: Option<Box<TsHighlightEngine>>,
 }
 
 impl HighlightCache {
@@ -288,6 +296,7 @@ impl HighlightCache {
             checkpoints: HashMap::new(),
             precache_in_progress: false,
             precache_cursor: 0,
+            ts_engine: None,
         }
     }
 
@@ -304,6 +313,7 @@ impl HighlightCache {
             checkpoints: HashMap::new(),
             precache_in_progress: false,
             precache_cursor: 0,
+            ts_engine: None,
         }
     }
 
@@ -314,6 +324,10 @@ impl HighlightCache {
     /// y resetea el pre-cache si la edición afecta líneas ya pre-cacheadas.
     pub fn invalidate_from(&mut self, line: usize) {
         self.last_edit_time = Some(Instant::now());
+        // Invalidar tree-sitter engine si existe
+        if let Some(ref mut ts) = self.ts_engine {
+            ts.invalidate();
+        }
         match self.dirty_from {
             Some(existing) => {
                 // Mantener el mínimo: si ya estaba dirty desde línea 30
@@ -337,20 +351,21 @@ impl HighlightCache {
     }
 
     /// Marca TODO el cache como dirty — para carga inicial o cambio de syntax.
+    #[expect(dead_code, reason = "API pública para invalidación masiva — útil si se re-introduce recarga en caliente")]
     pub fn invalidate(&mut self) {
         self.last_edit_time = Some(Instant::now());
         self.dirty_from = Some(0);
         self.checkpoints.clear();
+        // Invalidar tree-sitter engine si existe
+        if let Some(ref mut ts) = self.ts_engine {
+            ts.invalidate();
+        }
         // Resetear pre-cache completo — todo debe re-procesarse.
         self.precache_in_progress = false;
         self.precache_cursor = 0;
     }
 
     /// Si el cache tiene syntax asociada.
-    #[expect(
-        dead_code,
-        reason = "se usará para condicionales de rendering y status bar"
-    )]
     pub fn has_syntax(&self) -> bool {
         !self.syntax_name.is_empty()
     }
@@ -365,8 +380,24 @@ impl HighlightCache {
     ///
     /// Retorna `None` si la línea no está en el cache (fuera del viewport,
     /// dirty, o engine aún cargando). El caller renderiza texto plano como fallback.
-    pub fn get_line(&self, line: usize) -> Option<&[HighlightToken]> {
-        self.lines.get(&line).map(Vec::as_slice)
+    ///
+    /// Líneas marcadas como dirty (>= `dirty_from`) retornan `None` aunque tengan
+    /// tokens stale en cache. Esto fuerza al render a usar texto plano inmediatamente
+    /// durante el debounce, eliminando el lag perceptible al tipear.
+    pub fn get_line(&self, line_idx: usize) -> Option<&[HighlightToken]> {
+        // Prioridad: tree-sitter > syntect.
+        // Si hay engine tree-sitter, delegar completamente a él.
+        if let Some(ref ts) = self.ts_engine {
+            return ts.get_line(line_idx);
+        }
+        // Camino syntect (sin cambios cuando ts_engine es None).
+        // Si la línea está dirty, retornar None para que el render use plain text.
+        // Esto elimina el lag de 150ms: el carácter aparece inmediatamente en plain
+        // text, y los colores vuelven cuando syntect re-procesa tras el debounce.
+        if self.dirty_from.is_some_and(|from| line_idx >= from) {
+            return None;
+        }
+        self.lines.get(&line_idx).map(Vec::as_slice)
     }
 
     /// Si el cache está válido (no dirty en ninguna línea).
@@ -422,6 +453,125 @@ impl HighlightCache {
         HighlightLines::from_state(theme, hl_state, ps_state)
     }
 
+    /// Re-destaca SOLO la línea editada, sin debounce.
+    ///
+    /// Usa el checkpoint más cercano anterior a `line_idx` para obtener el parse
+    /// state y procesa únicamente hasta `line_idx` (inclusive). Actualiza el cache
+    /// para esa línea inmediatamente.
+    ///
+    /// No reemplaza `ensure_viewport_highlighted` — ese sigue manejando la
+    /// re-coloración contextual del viewport completo tras el debounce.
+    /// Este método solo garantiza que la línea actual tenga color correcto
+    /// en el mismo frame en que se editó.
+    pub fn highlight_single_line(
+        &mut self,
+        line_idx: usize,
+        buffer: &TextBuffer,
+        engine: &HighlightEngine,
+    ) {
+        // Con tree-sitter, la re-coloración de línea individual no aplica.
+        // El motor re-parsea el viewport completo en ensure_viewport_highlighted().
+        // La invalidación ya se hizo en invalidate_from().
+        if self.ts_engine.is_some() {
+            return;
+        }
+        if !engine.is_ready() {
+            return;
+        }
+        if self.syntax_name.is_empty() {
+            return;
+        }
+
+        let Some(syntax_set) = engine.syntax_set() else {
+            return;
+        };
+        let Some(theme) = engine.theme() else {
+            return;
+        };
+        let Some(syntax) = syntax_set.find_syntax_by_name(&self.syntax_name) else {
+            return;
+        };
+
+        let line_count = buffer.line_count();
+        if line_idx >= line_count {
+            return;
+        }
+
+        // Obtener checkpoint más cercano ANTES de line_idx
+        let (start_line, mut highlighter) = match self
+            .find_nearest_checkpoint(line_idx)
+            .and_then(|cp_line| {
+                let saved = self.checkpoints.get(&cp_line)?;
+                // CLONE: necesario — from_state consume los states, pero
+                // necesitamos mantener el checkpoint en el HashMap para futuros usos.
+                let hl = HighlightLines::from_state(
+                    theme,
+                    saved.highlight_state.clone(),
+                    saved.parse_state.clone(),
+                );
+                Some((cp_line, hl))
+            }) {
+            Some((cp_line, hl)) => (cp_line, hl),
+            None => (0, HighlightLines::new(syntax, theme)),
+        };
+
+        // Procesar líneas desde checkpoint hasta line_idx (inclusive).
+        // syntect parse state es incremental — DEBE avanzar por todas las líneas
+        // intermedias aunque no guardemos sus tokens.
+        let mut line_buf = String::with_capacity(256);
+        for i in start_line..=line_idx {
+            let line_text = buffer.line(i).unwrap_or("");
+            line_buf.clear();
+            line_buf.push_str(line_text);
+            if i < line_count - 1 {
+                line_buf.push('\n');
+            }
+
+            let highlight_result = highlighter.highlight_line(&line_buf, syntax_set);
+
+            if i == line_idx {
+                // Solo guardar tokens para la línea editada
+                let tokens = match highlight_result {
+                    Ok(ranges) => ranges
+                        .into_iter()
+                        .map(|(style, text)| {
+                            let clean = text.trim_end_matches('\n');
+                            HighlightToken {
+                                style,
+                                text: clean.to_owned(),
+                            }
+                        })
+                        .filter(|t| !t.text.is_empty())
+                        .collect(),
+                    Err(_) => vec![HighlightToken {
+                        style: SyntectStyle::default(),
+                        text: line_text.to_owned(),
+                    }],
+                };
+                // Insertar directamente en cache
+                self.lines.insert(line_idx, tokens);
+            }
+            // Para líneas intermedias (start_line..line_idx): solo avanzamos el
+            // parse state del highlighter, no guardamos tokens (ya están cacheados
+            // o se re-procesarán en el ensure_viewport_highlighted post-debounce).
+        }
+
+        // Avanzar dirty_from a line_idx + 1 para que get_line() retorne
+        // los tokens recién cacheados de la línea editada.
+        // Las líneas posteriores siguen dirty para el debounce contextual.
+        if let Some(dirty) = self.dirty_from
+            && dirty <= line_idx
+        {
+            let next = line_idx + 1;
+            if next < line_count {
+                self.dirty_from = Some(next);
+            } else {
+                // Era la última línea — todo limpio
+                self.dirty_from = None;
+            }
+        }
+    }
+
     /// Procesa el highlighting solo para las líneas del viewport visible.
     ///
     /// Usa checkpoints de parse state para evitar recorrer desde línea 0.
@@ -443,6 +593,18 @@ impl HighlightCache {
         viewport_start: usize,
         viewport_height: usize,
     ) {
+        // Si hay tree-sitter engine, usarlo en lugar de syntect.
+        // Pasar buffer directamente — TsHighlightEngine gestiona su propio source cache.
+        if let Some(ref mut ts) = self.ts_engine {
+            let effective_start = viewport_start.saturating_sub(VIEWPORT_MARGIN);
+            let effective_end =
+                (viewport_start + viewport_height + VIEWPORT_MARGIN).min(buffer.line_count());
+            ts.highlight_viewport(buffer, effective_start, effective_end);
+            return; // No usar syntect
+        }
+
+        // ── Camino syntect (sin cambios cuando ts_engine es None) ──
+
         // Engine no listo — noop
         if !engine.is_ready() {
             return;
@@ -777,6 +939,25 @@ impl HighlightCache {
             true // Hay más trabajo pendiente
         }
     }
+
+    /// Asigna un motor tree-sitter a este cache.
+    ///
+    /// Si se llama con `Some`, tree-sitter tiene prioridad sobre syntect.
+    /// El cache de syntect se limpia porque ya no se usa.
+    pub fn set_ts_engine(&mut self, engine: Option<TsHighlightEngine>) {
+        self.ts_engine = engine.map(Box::new);
+        if self.ts_engine.is_some() {
+            // Limpiar cache de syntect — ya no se usa
+            self.lines.clear();
+            self.dirty_from = Some(0);
+        }
+    }
+
+    /// Si el cache tiene un motor tree-sitter activo.
+    #[expect(dead_code, reason = "API pública — se usará para debug/status bar")]
+    pub fn has_ts_engine(&self) -> bool {
+        self.ts_engine.is_some()
+    }
 }
 
 impl std::fmt::Debug for HighlightCache {
@@ -791,6 +972,7 @@ impl std::fmt::Debug for HighlightCache {
             .field("checkpoints_count", &self.checkpoints.len())
             .field("precache_in_progress", &self.precache_in_progress)
             .field("precache_cursor", &self.precache_cursor)
+            .field("ts_engine", &self.ts_engine)
             .finish()
     }
 }

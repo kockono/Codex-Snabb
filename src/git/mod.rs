@@ -26,6 +26,10 @@ pub struct GitState {
     pub is_repo: bool,
     /// Nombre del branch actual (vacío si detached HEAD).
     pub branch: String,
+    /// Commits locales por delante del upstream (pendientes de push).
+    pub ahead: u32,
+    /// Commits remotos por detrás del upstream (pendientes de pull).
+    pub behind: u32,
     /// Lista de archivos con cambios (staged + unstaged).
     pub files: Vec<GitFileStatus>,
     /// Índice del archivo seleccionado en la lista.
@@ -51,6 +55,8 @@ impl GitState {
             visible: false,
             is_repo: false,
             branch: String::new(),
+            ahead: 0,
+            behind: 0,
             files: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -74,6 +80,8 @@ impl GitState {
             self.files.clear();
             self.selected_index = 0;
             self.diff_content = None;
+            self.ahead = 0;
+            self.behind = 0;
             return;
         }
 
@@ -89,6 +97,11 @@ impl GitState {
                 self.branch.push_str("(detached)");
             }
         }
+
+        // Ahead/behind respecto al upstream
+        let (ahead, behind) = commands::ahead_behind(repo_path);
+        self.ahead = ahead;
+        self.behind = behind;
 
         // Status de archivos
         match commands::status(repo_path) {

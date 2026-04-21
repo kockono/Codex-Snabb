@@ -69,7 +69,7 @@ impl CommandRegistry {
     pub fn register_defaults(&mut self) {
         self.commands.clear();
         // Pre-alocar capacidad conocida — sabemos exactamente cuántos hay
-        self.commands.reserve(24);
+        self.commands.reserve(25);
 
         // ── File ──
         self.register(CommandEntry {
@@ -92,6 +92,14 @@ impl CommandRegistry {
             category: "File",
             keybinding: Some("Ctrl+P"),
             action: Action::OpenQuickOpen,
+        });
+
+        self.register(CommandEntry {
+            id: "editor.go_to_line",
+            label: "Go to Line...",
+            category: "Editor",
+            keybinding: Some("Ctrl+G"),
+            action: Action::OpenGoToLine,
         });
 
         // ── Edit ──
@@ -172,6 +180,13 @@ impl CommandRegistry {
             category: "Git",
             keybinding: None,
             action: Action::OpenGitPanel,
+        });
+        self.register(CommandEntry {
+            id: "git.fetch",
+            label: "Git: Fetch from Remote",
+            category: "Git",
+            keybinding: None,
+            action: Action::GitFetch,
         });
 
         // ── LSP ──

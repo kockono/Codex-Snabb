@@ -7,6 +7,7 @@
 
 pub mod branch_picker;
 pub mod git_panel;
+pub mod go_to_line;
 pub mod icons;
 pub mod layout;
 pub mod palette;
@@ -57,18 +58,22 @@ use panels::StatusBarData;
 
 /// Renderiza el frame completo del IDE.
 ///
-/// Computa el layout, determina qué panel tiene foco, y renderiza
-/// cada región. Los datos para la status bar se derivan del estado
-/// ANTES de entrar al render — sin allocaciones dentro del draw.
+/// Usa el layout pre-computado de `state.last_layout` (calculado antes
+/// del render en el event loop). Solo recomputa como fallback si
+/// `last_layout` no existe (primer frame). Los datos para la status bar
+/// se derivan del estado ANTES de entrar al render — sin allocaciones
+/// dentro del draw.
 ///
 /// La función recibe `&AppState` y `&Theme` por referencia.
 /// El theme se crea una vez fuera del event loop.
 pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     let area = f.area();
 
-    // Computar layout — en el futuro se cacheará y solo se recalculará
-    // en resize o toggle de paneles
-    let layout = IdeLayout::compute(area, state.sidebar_visible, state.bottom_panel_visible);
+    // Usar layout pre-computado del event loop. Fallback a recompute solo
+    // en el primer frame antes de que last_layout exista.
+    let layout = state.last_layout.unwrap_or_else(|| {
+        IdeLayout::compute(area, state.sidebar_visible, state.bottom_panel_visible)
+    });
 
     // Determinar qué panel tiene foco
     let focused = state.focused_panel;
@@ -150,11 +155,13 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     );
 
     // ── Hardware cursor: posicionar la línea vertical del terminal ──
-    // Solo cuando el editor tiene foco y no hay overlays activos.
-    // La posición se computa una vez acá — sin allocaciones.
+    // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
+    // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
     if editor_focused
+        && state.cursor_visible
         && !state.palette.visible
         && !state.quick_open.visible
+        && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
@@ -200,30 +207,39 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Status bar ──
-    // Datos pre-computados desde AppState — sin allocaciones acá
-    // Branch real del repo git (o fallback si no es repo)
-    let branch_display = if state.git.is_repo && !state.git.branch.is_empty() {
-        &state.git.branch
-    } else if state.git.is_repo {
-        "(detached)"
+    // Datos pre-computados desde AppState — sin allocaciones en render
+    // Pre-format git status string: "⎇ main ↑2 ↓1 ⟳" — una vez por frame, fuera del render loop
+    use std::fmt::Write;
+    let git_status_str: String = if state.git.is_repo {
+        let branch = if state.git.branch.is_empty() {
+            "(detached)"
+        } else {
+            &state.git.branch
+        };
+        let mut s = String::with_capacity(32);
+        s.push_str("\u{2387} "); // ⎇
+        s.push_str(branch);
+        if state.git.ahead > 0 {
+            s.push_str(" \u{2191}"); // ↑
+            let _ = write!(s, "{}", state.git.ahead);
+        }
+        if state.git.behind > 0 {
+            s.push_str(" \u{2193}"); // ↓
+            let _ = write!(s, "{}", state.git.behind);
+        }
+        s.push_str(" \u{27F3}"); // ⟳
+        s
     } else {
-        "no git"
+        String::from("no git")
     };
-    // Si hay un mensaje de diagnóstico LSP, mostrarlo como file_name override
-    let file_display = state
-        .lsp
-        .status_message
-        .as_deref()
-        .unwrap_or(&state.status_file);
     let status_data = StatusBarData {
         mode: if state.lsp.has_server() {
             "LSP"
         } else {
             "NORMAL"
         },
-        file_name: file_display,
         cursor_pos: &state.status_line,
-        branch: branch_display,
+        git_status: &git_status_str,
         encoding: "UTF-8",
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
@@ -234,6 +250,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     if editor_focused
         && !state.palette.visible
         && !state.quick_open.visible
+        && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
     {
@@ -256,16 +273,176 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     // ── Overlays ──
-    // Prioridad: Settings > Branch picker > Quick open > Palette.
+    // Prioridad: Go to Line > Settings > Branch picker > Quick open > Palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
-    if state.keybindings.visible {
-        settings_panel::render_settings(f, area, &state.keybindings, theme);
+    if state.go_to_line.visible {
+        // Pre-format hint fuera del render — evitar format!() en render
+        use std::fmt::Write as FmtWrite;
+        let mut go_to_line_hint = String::with_capacity(16);
+        let _ = write!(go_to_line_hint, "1 \u{2013} {}", state.go_to_line.total_lines);
+        go_to_line::render_go_to_line(f, &layout, &state.go_to_line, theme, &go_to_line_hint);
+    } else if state.keybindings.visible {
+        settings_panel::render_settings(f, &layout, &state.keybindings, theme);
     } else if state.branch_picker.visible {
-        branch_picker::render_branch_picker(f, area, &state.branch_picker, theme);
+        branch_picker::render_branch_picker(f, &layout, &state.branch_picker, theme);
     } else if state.quick_open.visible {
-        quick_open::render_quick_open(f, area, &state.quick_open, theme);
+        quick_open::render_quick_open(f, &layout, &state.quick_open, theme);
     } else if state.palette.visible {
-        palette::render_palette(f, area, &state.palette, &state.commands, theme);
+        palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
+    }
+}
+
+/// Renderiza una pantalla de carga futurista con barra de progreso.
+///
+/// Se muestra durante la inicialización diferida (explorer, quick_open,
+/// git, highlight). Recibe campos individuales en vez de un struct
+/// para evitar dependencia circular (ui no importa app).
+///
+/// Allocaciones por frame: 2 Strings pequeños (bar + pct) — aceptable
+/// en fase de startup, fuera del event loop principal.
+pub fn render_loading(
+    frame: &mut Frame,
+    theme: &Theme,
+    step: &str,
+    progress: f32,
+    done: bool,
+) {
+    use ratatui::{
+        layout::Rect,
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, BorderType, Borders, Paragraph},
+    };
+
+    let area = frame.area();
+
+    // Fondo completo
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg_primary)),
+        area,
+    );
+
+    if area.width < 20 || area.height < 8 {
+        return;
+    }
+
+    // Caja central: 60% del ancho, 10 líneas, centrada
+    let box_w = (area.width * 60 / 100).clamp(40, 80);
+    let box_h: u16 = 10;
+    let box_x = area.width.saturating_sub(box_w) / 2;
+    let box_y = area.height.saturating_sub(box_h) / 2;
+    let box_area = Rect::new(box_x, box_y, box_w, box_h);
+
+    // Borde doble cyberpunk
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.fg_accent))
+        .style(Style::default().bg(theme.bg_secondary));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    if inner.height < 6 || inner.width < 10 {
+        return;
+    }
+
+    // Layout interno:
+    // +0: (blank)
+    // +1: título
+    // +2: subtítulo
+    // +3: (blank)
+    // +4: paso actual
+    // +5: (blank)
+    // +6: barra de progreso
+    // +7: porcentaje
+
+    // ── Título ──
+    let title = "\u{2588} IDE TUI \u{2588}"; // █ IDE TUI █
+    let title_len = title.chars().count() as u16;
+    let title_x = inner.x + inner.width.saturating_sub(title_len) / 2;
+    if inner.y + 1 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.fg_accent)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(title_x, inner.y + 1, title_len, 1),
+        );
+    }
+
+    // ── Subtítulo ──
+    let subtitle = "Rust TUI IDE \u{2014} RAM/CPU First"; // —
+    let sub_len = subtitle.chars().count() as u16;
+    let sub_x = inner.x + inner.width.saturating_sub(sub_len) / 2;
+    if inner.y + 2 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                subtitle,
+                Style::default().fg(theme.fg_secondary),
+            ))),
+            Rect::new(sub_x, inner.y + 2, sub_len, 1),
+        );
+    }
+
+    // ── Paso actual ──
+    let step_len = step.chars().count() as u16;
+    let step_display_w = step_len.min(inner.width.saturating_sub(2));
+    let step_x = inner.x + inner.width.saturating_sub(step_display_w) / 2;
+    if inner.y + 4 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                step,
+                Style::default().fg(theme.fg_accent_alt),
+            ))),
+            Rect::new(step_x, inner.y + 4, step_display_w, 1),
+        );
+    }
+
+    // ── Barra de progreso ──
+    // Una String por frame en startup — aceptable (no es el event loop)
+    let bar_w = inner.width.saturating_sub(4) as usize;
+    if bar_w > 0 && inner.y + 6 < area.height {
+        let filled = ((progress * bar_w as f32) as usize).min(bar_w);
+        let empty = bar_w.saturating_sub(filled);
+
+        let mut bar = String::with_capacity(bar_w * 3 + 2);
+        bar.push('[');
+        for _ in 0..filled {
+            bar.push('\u{2588}'); // █
+        }
+        for _ in 0..empty {
+            bar.push('\u{2591}'); // ░
+        }
+        bar.push(']');
+
+        let bar_x = inner.x + 2;
+        let bar_color = if done { theme.diff_add } else { theme.fg_accent };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                bar,
+                Style::default().fg(bar_color),
+            ))),
+            Rect::new(bar_x, inner.y + 6, inner.width.saturating_sub(2), 1),
+        );
+    }
+
+    // ── Porcentaje ──
+    if inner.y + 7 < area.height {
+        let pct = (progress * 100.0) as u8;
+        let mut pct_str = String::with_capacity(8);
+        use std::fmt::Write;
+        let _ = write!(pct_str, "{}%", pct);
+        let pct_len = pct_str.len() as u16;
+        let pct_x = inner.x + inner.width.saturating_sub(pct_len) / 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                pct_str,
+                Style::default().fg(theme.fg_secondary),
+            ))),
+            Rect::new(pct_x, inner.y + 7, pct_len, 1),
+        );
     }
 }
 

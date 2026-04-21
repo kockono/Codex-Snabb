@@ -13,6 +13,7 @@ pub mod multicursor;
 pub mod search;
 pub mod selection;
 pub mod tabs;
+pub mod ts_highlight;
 pub mod undo;
 pub mod viewport;
 
@@ -23,6 +24,7 @@ use anyhow::Result;
 use buffer::TextBuffer;
 use cursor::Position;
 use highlighting::{HighlightCache, HighlightEngine};
+use ts_highlight::TsHighlightEngine;
 use multicursor::MultiCursorState;
 use selection::Selection;
 use undo::{EditOperation, UndoStack};
@@ -51,6 +53,11 @@ pub struct EditorState {
     pub search: Option<search::BufferSearch>,
     /// Cache de syntax highlighting para este buffer.
     pub highlight_cache: HighlightCache,
+    /// Si el highlight del viewport fue diferido al próximo frame.
+    ///
+    /// Se activa al abrir un archivo nuevo para no bloquear el frame
+    /// del open con trabajo pesado. El siguiente frame lo procesa normal.
+    pub highlight_deferred: bool,
 }
 
 impl EditorState {
@@ -63,6 +70,7 @@ impl EditorState {
             undo_stack: UndoStack::new(),
             search: None,
             highlight_cache: HighlightCache::new(),
+            highlight_deferred: false,
         }
     }
 
@@ -80,20 +88,50 @@ impl EditorState {
             undo_stack: UndoStack::new(),
             search: None,
             highlight_cache: HighlightCache::new(),
+            // Diferir highlight al siguiente frame — el archivo acaba de abrirse.
+            // Así el frame del open es instantáneo y el highlight corre después.
+            highlight_deferred: true,
         })
     }
 
-    /// Inicializa el cache de highlighting con el motor de syntect.
+    /// Inicializa el cache de highlighting para el archivo actual.
     ///
-    /// Detecta la syntax por extensión del archivo y crea el cache.
+    /// Intenta tree-sitter primero (6 lenguajes soportados). Si no hay
+    /// grammar tree-sitter, cae a syntect como fallback (~50 lenguajes).
     /// Se llama después de `open_file` cuando el `HighlightEngine`
     /// está disponible (vive en `AppState`).
     pub fn init_highlighting(&mut self, engine: &HighlightEngine) {
+        // Intentar tree-sitter primero
+        if let Some(path) = self.buffer.file_path() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if let Some(ts_config) = ts_highlight::config_for_extension(ext) {
+                let ts_engine = TsHighlightEngine::new(ts_config);
+                self.highlight_cache.set_ts_engine(Some(ts_engine));
+                tracing::debug!(ext, "tree-sitter grammar cargado");
+                return; // No necesitamos syntect
+            }
+        }
+        // Fallback: syntect (camino existente)
         if let Some(path) = self.buffer.file_path()
             && let Some(syntax) = engine.detect_syntax(path)
         {
             self.highlight_cache = HighlightCache::with_syntax(syntax.name.as_str());
         }
+    }
+
+    /// Re-destaca inmediatamente la línea del cursor primario.
+    ///
+    /// Elimina el parpadeo blanco de 80ms al tipear: la línea editada
+    /// se re-colorea en el mismo frame sin esperar al debounce.
+    /// `ensure_viewport_highlighted` sigue manejando el re-process
+    /// contextual del viewport completo.
+    pub fn rehighlight_cursor_line(&mut self, engine: &HighlightEngine) {
+        let line = self.cursors.primary().position.line;
+        self.highlight_cache
+            .highlight_single_line(line, &self.buffer, engine);
     }
 
     /// Inserta un carácter en la posición de todos los cursores.
@@ -334,6 +372,22 @@ impl EditorState {
         primary.clear_selection();
         self.viewport
             .ensure_cursor_visible(&self.cursors.primary().position);
+    }
+
+    /// Mueve el cursor primario a una línea específica (0-indexed) y centra el viewport.
+    ///
+    /// Clampea la línea al rango válido del buffer. Cursor va a columna 0.
+    /// El viewport se centra en la línea target para dar contexto visual.
+    pub fn go_to_line(&mut self, line_idx: usize) {
+        let clamped = line_idx.min(self.buffer.line_count().saturating_sub(1));
+        let primary = self.cursors.primary_mut();
+        primary.position.line = clamped;
+        primary.position.col = 0;
+        primary.desired_col = 0;
+        primary.clear_selection();
+        // Centrar viewport en la línea target
+        let half_viewport = self.viewport.height / 2;
+        self.viewport.scroll_offset = clamped.saturating_sub(half_viewport);
     }
 
     /// Mueve el cursor primario al inicio absoluto del buffer.

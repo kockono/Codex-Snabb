@@ -18,10 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
-        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
@@ -29,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::command::CommandRegistry;
 use crate::core::settings::{KeybindingsState, SidebarSection};
-use crate::core::{Action, AppConfig, Direction, Effect, Event, PanelId};
+use crate::core::{Action, AppConfig, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::editor::highlighting::HighlightEngine;
 use crate::editor::tabs::TabState;
@@ -44,6 +41,33 @@ use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
 use crate::workspace::ExplorerState;
 use crate::workspace::QuickOpenState;
+use crate::workspace::quick_open::GoToLineState;
+
+// ─── Loading Progress ──────────────────────────────────────────────────────────
+
+/// Progreso de inicialización para la loading screen.
+///
+/// Cada paso se completa secuencialmente y actualiza `progress: 0.0..=1.0`.
+/// Los strings de paso son `&'static str` — cero allocaciones.
+#[derive(Debug)]
+pub struct LoadingProgress {
+    /// Paso actual siendo procesado.
+    pub step: &'static str,
+    /// Progreso 0.0 a 1.0.
+    pub progress: f32,
+    /// Si la inicialización terminó.
+    pub done: bool,
+}
+
+impl LoadingProgress {
+    pub fn new() -> Self {
+        Self {
+            step: "Iniciando sistemas...",
+            progress: 0.0,
+            done: false,
+        }
+    }
+}
 
 // ─── AppState ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +100,8 @@ pub struct AppState {
     pub palette: PaletteState,
     /// Estado del quick open (overlay Ctrl+P).
     pub quick_open: QuickOpenState,
+    /// Estado del modal Go to Line (Ctrl+G).
+    pub go_to_line: GoToLineState,
     /// Estado del panel de búsqueda global (Ctrl+Shift+F).
     pub search: SearchState,
     /// Estado de la terminal integrada (PTY + scrollback).
@@ -102,38 +128,23 @@ pub struct AppState {
     /// Se actualiza en cada movimiento de cursor — no en cada frame.
     /// `(bracket_pos, matching_bracket_pos)` o `None` si no hay match.
     pub bracket_match: Option<(crate::editor::cursor::Position, crate::editor::cursor::Position)>,
+    /// Si el cursor del editor es visible (para efecto blink).
+    /// Se togglea cada N ticks (~500ms). `true` = visible.
+    pub cursor_visible: bool,
+    /// Contador de ticks para el blink del cursor.
+    /// Se resetea a 0 en cada input del usuario.
+    pub cursor_blink_counter: u32,
 }
 
 impl AppState {
     /// Crea un nuevo estado con valores por defecto y editor vacío.
     ///
-    /// Intenta inicializar el explorer con el directorio de trabajo actual.
-    /// Si falla, el explorer queda como `None` — la app funciona sin él.
+    /// Solo inicializa partes rápidas (structs vacíos, registros).
+    /// Las operaciones lentas (explorer, quick_open, git) se difieren
+    /// a la loading phase en `event_loop()` para mostrar progreso.
     fn new(config: AppConfig) -> Self {
-        let cwd = std::env::current_dir().ok();
-
-        let explorer = cwd.as_deref().and_then(|cwd| {
-            ExplorerState::new(cwd)
-                .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
-                .ok()
-        });
-
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
-
-        // Construir índice de quick open desde el workspace root
-        let mut quick_open = QuickOpenState::new();
-        if let Some(ref root) = cwd
-            && let Err(e) = quick_open.build_index(root)
-        {
-            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
-        }
-
-        // Inicializar git state — verificar si es repo y refrescar
-        let mut git = GitState::new();
-        if let Some(ref cwd) = cwd {
-            git.refresh(cwd);
-        }
 
         Self {
             running: true,
@@ -143,13 +154,14 @@ impl AppState {
             sidebar_visible: true,
             bottom_panel_visible: true,
             tabs: TabState::new(),
-            explorer,
+            explorer: None,
             commands,
             palette: PaletteState::new(),
-            quick_open,
+            quick_open: QuickOpenState::new(),
+            go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
-            git,
+            git: GitState::new(),
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
@@ -158,13 +170,16 @@ impl AppState {
             last_layout: None,
             highlight_engine: HighlightEngine::new(),
             bracket_match: None,
+            cursor_visible: true,
+            cursor_blink_counter: 0,
         }
     }
 
     /// Crea un nuevo estado con un archivo abierto.
     ///
-    /// El explorer se inicializa con el directorio del archivo si tiene
-    /// uno, o con el directorio de trabajo actual como fallback.
+    /// Solo abre el archivo (rápido) e inicializa structs vacíos.
+    /// Las operaciones lentas (explorer, quick_open, git) se difieren
+    /// a la loading phase en `event_loop()` para mostrar progreso.
     fn with_file(config: AppConfig, path: &std::path::Path) -> Result<Self> {
         let highlight_engine = HighlightEngine::new();
         let mut editor = EditorState::open_file(path)?;
@@ -175,34 +190,8 @@ impl AppState {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("[no file]"));
 
-        // Derivar directorio para el explorer: padre del archivo o cwd
-        let explorer_root = path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok());
-
-        let explorer = explorer_root.as_deref().and_then(|root| {
-            ExplorerState::new(root)
-                .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
-                .ok()
-        });
-
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
-
-        // Construir índice de quick open desde el workspace root
-        let mut quick_open = QuickOpenState::new();
-        if let Some(ref root) = explorer_root
-            && let Err(e) = quick_open.build_index(root)
-        {
-            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
-        }
-
-        // Inicializar git state desde el directorio del explorer
-        let mut git = GitState::new();
-        if let Some(ref root) = explorer_root {
-            git.refresh(root);
-        }
 
         Ok(Self {
             running: true,
@@ -212,13 +201,14 @@ impl AppState {
             sidebar_visible: true,
             bottom_panel_visible: true,
             tabs,
-            explorer,
+            explorer: None,
             commands,
             palette: PaletteState::new(),
-            quick_open,
+            quick_open: QuickOpenState::new(),
+            go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
-            git,
+            git: GitState::new(),
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
@@ -227,6 +217,8 @@ impl AppState {
             last_layout: None,
             highlight_engine,
             bracket_match: None,
+            cursor_visible: true,
+            cursor_blink_counter: 0,
         })
     }
 
@@ -274,400 +266,8 @@ impl AppState {
     }
 }
 
-// ─── Keymap ────────────────────────────────────────────────────────────────────
-
-/// Mapea un evento de crossterm a una acción del sistema.
-///
-/// El keymap es CONTEXT-AWARE — las mismas teclas producen acciones
-/// distintas según el panel enfocado y los overlays activos:
-///
-/// - **Quick Open abierto**: captura TODO el input
-/// - **Palette abierta**: captura TODO el input
-/// - **Search panel activo**: captura input cuando sidebar tiene foco
-/// - **Git panel activo**: captura input cuando sidebar tiene foco
-/// - **Global**: Ctrl+atajos, Esc, Tab (siempre activos cuando overlays cerrados)
-/// - **Editor**: flechas mueven cursor, chars insertan texto
-/// - **Explorer**: flechas navegan el árbol, Enter abre/expande
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keymap requiere estado de cada overlay — refactorizar a struct agregaría indirección sin beneficio"
-)]
-fn keymap(
-    event: &crossterm::event::Event,
-    focused_panel: PanelId,
-    palette_visible: bool,
-    quick_open_visible: bool,
-    branch_picker_visible: bool,
-    search_visible: bool,
-    git_state: &GitState,
-    lsp_completion_visible: bool,
-    settings_visible: bool,
-    settings_editing: bool,
-    commands: &CommandRegistry,
-) -> Action {
-    // ── Eventos de mouse ── se procesan ANTES del match de teclado
-    if let CrosstermEvent::Mouse(mouse) = event {
-        return match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => Action::MouseClick {
-                col: mouse.column,
-                row: mouse.row,
-            },
-            MouseEventKind::ScrollUp => Action::MouseScrollUp {
-                col: mouse.column,
-                row: mouse.row,
-            },
-            MouseEventKind::ScrollDown => Action::MouseScrollDown {
-                col: mouse.column,
-                row: mouse.row,
-            },
-            MouseEventKind::Drag(MouseButton::Left) => Action::MouseDrag {
-                col: mouse.column,
-                row: mouse.row,
-            },
-            _ => Action::Noop,
-        };
-    }
-
-    let CrosstermEvent::Key(key) = event else {
-        return Action::Noop;
-    };
-    if key.kind != KeyEventKind::Press {
-        return Action::Noop;
-    }
-
-    // ── Settings overlay visible: prioridad máxima ──
-    if settings_visible {
-        if settings_editing {
-            // Modo edición: capturar la tecla como nuevo keybind
-            return match key.code {
-                KeyCode::Esc => Action::SettingsCancelEdit,
-                _ => Action::SettingsCaptureKey(*key),
-            };
-        }
-        // Modo normal del settings overlay
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::SettingsClose,
-            (KeyCode::Up, KeyModifiers::NONE) => Action::SettingsUp,
-            (KeyCode::Down, KeyModifiers::NONE) => Action::SettingsDown,
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::SettingsStartEdit,
-            (KeyCode::Delete, _) => Action::SettingsRemoveKeybind,
-            (KeyCode::Backspace, _) => Action::SettingsSearchDelete,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::SettingsSearchInsert(ch)
-            }
-            _ => Action::Noop,
-        };
-    }
-
-    // ── LSP Completion visible: captura navegación, Enter, Esc ──
-    if lsp_completion_visible && focused_panel == PanelId::Editor {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => return Action::LspCompletionCancel,
-            (KeyCode::Enter, KeyModifiers::NONE) => return Action::LspCompletionConfirm,
-            (KeyCode::Up, KeyModifiers::NONE) => return Action::LspCompletionUp,
-            (KeyCode::Down, KeyModifiers::NONE) => return Action::LspCompletionDown,
-            // Tab = confirmar (estilo VS Code)
-            (KeyCode::Tab, KeyModifiers::NONE) => return Action::LspCompletionConfirm,
-            // Otros caracteres: cerrar completions y dejar pasar la acción normal
-            _ => {
-                // No capturar — caer al flujo normal para que chars se inserten
-            }
-        }
-    }
-
-    // ── Branch Picker abierto: captura TODO el input ──
-    if branch_picker_visible {
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::BranchPickerClose,
-            (KeyCode::Enter, _) => Action::BranchPickerConfirm,
-            (KeyCode::Up, KeyModifiers::NONE) => Action::BranchPickerUp,
-            (KeyCode::Down, KeyModifiers::NONE) => Action::BranchPickerDown,
-            // Ctrl+P / Ctrl+N para vim-style navigation
-            (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::BranchPickerUp,
-            (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::BranchPickerDown,
-            (KeyCode::Backspace, _) => Action::BranchPickerDeleteChar,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::BranchPickerInsertChar(ch)
-            }
-            // Cualquier otra tecla NO se propaga
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Quick Open abierto: captura TODO el input ──
-    if quick_open_visible {
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::QuickOpenClose,
-            (KeyCode::Enter, _) => Action::QuickOpenConfirm,
-            (KeyCode::Up, KeyModifiers::NONE) => Action::QuickOpenUp,
-            (KeyCode::Down, KeyModifiers::NONE) => Action::QuickOpenDown,
-            // Ctrl+P / Ctrl+N para vim-style navigation
-            (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::QuickOpenUp,
-            (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::QuickOpenDown,
-            (KeyCode::Backspace, _) => Action::QuickOpenDeleteChar,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::QuickOpenInsertChar(ch)
-            }
-            // Cualquier otra tecla NO se propaga
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Palette abierta: captura TODO el input ──
-    if palette_visible {
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::PaletteClose,
-            (KeyCode::Enter, _) => Action::PaletteConfirm,
-            (KeyCode::Up, KeyModifiers::NONE) => Action::PaletteUp,
-            (KeyCode::Down, KeyModifiers::NONE) => Action::PaletteDown,
-            // Ctrl+P / Ctrl+N para vim-style navigation
-            (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::PaletteUp,
-            (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::PaletteDown,
-            (KeyCode::Backspace, _) => Action::PaletteDeleteChar,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::PaletteInsertChar(ch)
-            }
-            // Cualquier otra tecla NO se propaga
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Search panel activo: captura input cuando foco en Search ──
-    if search_visible && focused_panel == PanelId::Search {
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::SearchClose,
-            // Enter: si foco en campo de input → ejecutar búsqueda;
-            //        si hay resultados → toggle fold / abrir match
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::SearchSelectAndOpen,
-            (KeyCode::Tab, KeyModifiers::NONE) => Action::SearchNextField,
-            (KeyCode::BackTab, KeyModifiers::SHIFT) => Action::SearchPrevField,
-            // Up/Down navegan por la lista aplanada (headers + matches)
-            (KeyCode::Up, KeyModifiers::NONE) => Action::SearchPrevMatch,
-            (KeyCode::Down, KeyModifiers::NONE) => Action::SearchNextMatch,
-            (KeyCode::F(3), KeyModifiers::NONE) => Action::SearchNextMatch,
-            (KeyCode::F(3), mods) if mods.contains(KeyModifiers::SHIFT) => Action::SearchPrevMatch,
-            // Left en FileHeader expandido → colapsar
-            (KeyCode::Left, KeyModifiers::NONE) => Action::SearchToggleFold,
-            // Right en FileHeader colapsado → expandir
-            (KeyCode::Right, KeyModifiers::NONE) => Action::SearchToggleFold,
-            (KeyCode::Backspace, _) => Action::SearchDeleteChar,
-            // Alt+C → toggle case sensitive
-            (KeyCode::Char('c'), KeyModifiers::ALT) => Action::SearchToggleCase,
-            // Alt+W → toggle whole word
-            (KeyCode::Char('w'), KeyModifiers::ALT) => Action::SearchToggleWholeWord,
-            // Alt+R → toggle regex
-            (KeyCode::Char('r'), KeyModifiers::ALT) => Action::SearchToggleRegex,
-            // Ctrl+Shift+H → toggle replace
-            (KeyCode::Char('H'), mods)
-                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-            {
-                Action::SearchToggleReplace
-            }
-            // Ctrl+Shift+1 → replace current
-            (KeyCode::Char('!'), mods)
-                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-            {
-                Action::SearchReplaceCurrent
-            }
-            // Ctrl+Shift+A en search → replace all in file
-            (KeyCode::Char('A'), mods)
-                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-            {
-                Action::SearchReplaceAllInFile
-            }
-            // Chars se escriben en el campo activo
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::SearchInsertChar(ch)
-            }
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Git panel activo: captura input cuando foco en Git ──
-    if git_state.visible && focused_panel == PanelId::Git {
-        // Modo commit: capturar chars para el mensaje
-        if git_state.commit_mode {
-            return match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => Action::GitCommitCancel,
-                (KeyCode::Enter, KeyModifiers::NONE) => Action::GitCommitConfirm,
-                (KeyCode::Backspace, _) => Action::GitCommitDeleteChar,
-                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                    Action::GitCommitInput(ch)
-                }
-                _ => Action::Noop,
-            };
-        }
-
-        // Modo diff: navegación del diff
-        if git_state.show_diff {
-            return match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
-                    Action::GitToggleDiff
-                }
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitDiffScrollUp,
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                    Action::GitDiffScrollDown
-                }
-                _ => Action::Noop,
-            };
-        }
-
-        // Modo normal: navegación de lista de archivos
-        return match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => Action::GitClose,
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitUp,
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::GitDown,
-            (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                Action::GitStageToggle
-            }
-            (KeyCode::Char('d'), KeyModifiers::NONE) => Action::GitToggleDiff,
-            (KeyCode::Char('c'), KeyModifiers::NONE) => Action::GitStartCommit,
-            (KeyCode::Char('r'), KeyModifiers::NONE) => Action::GitRefresh,
-            _ => Action::Noop,
-        };
-    }
-
-    // ── Custom keybinds del registry (prioridad sobre hardcodeados) ──
-    // Solo verificar si hay overrides para evitar overhead innecesario
-    if let Some(custom_action) = commands.match_key_event(key) {
-        return custom_action;
-    }
-
-    // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
-    match (key.code, key.modifiers) {
-        // Esc: si hay multicursor activo, limpiar; sino, quit
-        (KeyCode::Esc, _) => return Action::ClearMultiCursor,
-        // Ctrl+Tab → siguiente pestaña
-        (KeyCode::Tab, KeyModifiers::CONTROL) => return Action::NextTab,
-        // Ctrl+Shift+Tab → pestaña anterior
-        (KeyCode::BackTab, mods)
-            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-        {
-            return Action::PrevTab;
-        }
-        // Ctrl+W → cerrar pestaña activa
-        (KeyCode::Char('w'), KeyModifiers::CONTROL) => return Action::CloseTab,
-        (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
-        (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
-        (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
-        (KeyCode::Char('j'), KeyModifiers::CONTROL) => return Action::ToggleBottomPanel,
-        // Ctrl+` abre/cierra terminal (con spawn automático si no hay sesión)
-        (KeyCode::Char('`'), KeyModifiers::CONTROL) => return Action::ToggleTerminal,
-        (KeyCode::Char('s'), KeyModifiers::CONTROL) => return Action::SaveFile,
-        (KeyCode::Char('z'), KeyModifiers::CONTROL) => return Action::Undo,
-        (KeyCode::Char('y'), KeyModifiers::CONTROL) => return Action::Redo,
-        // Ctrl+Shift+F abre búsqueda global.
-        (KeyCode::Char('F'), mods)
-            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-        {
-            return Action::OpenGlobalSearch;
-        }
-        // Alt+Shift+P abre la command palette.
-        // crossterm reporta Alt+Shift+P como 'P' mayúscula con ALT|SHIFT flags.
-        (KeyCode::Char('P'), mods)
-            if mods.contains(KeyModifiers::ALT) && mods.contains(KeyModifiers::SHIFT) =>
-        {
-            return Action::OpenCommandPalette;
-        }
-        // Ctrl+P (sin Shift) abre quick open.
-        // crossterm reporta Ctrl+P (sin Shift) como 'p' minúscula con CONTROL flag.
-        // El guard !SHIFT asegura que no interfiera con Ctrl+Shift+P.
-        (KeyCode::Char('p'), mods)
-            if mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::SHIFT) =>
-        {
-            return Action::OpenQuickOpen;
-        }
-        _ => {}
-    }
-
-    // ── Context-aware: match sobre (panel enfocado, tecla) ──
-    match focused_panel {
-        PanelId::Terminal => match (key.code, key.modifiers) {
-            // Esc sale del foco del terminal
-            (KeyCode::Esc, _) => Action::FocusNext,
-            // Ctrl+C → enviar Ctrl+C al terminal
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::TerminalCtrlC,
-            // Enter → enviar Enter al terminal
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::TerminalEnter,
-            // Shift+Up / PageUp → scroll up del terminal
-            (KeyCode::Up, mods) if mods.contains(KeyModifiers::SHIFT) => Action::TerminalScrollUp,
-            (KeyCode::PageUp, _) => Action::TerminalScrollUp,
-            // Shift+Down / PageDown → scroll down del terminal
-            (KeyCode::Down, mods) if mods.contains(KeyModifiers::SHIFT) => {
-                Action::TerminalScrollDown
-            }
-            (KeyCode::PageDown, _) => Action::TerminalScrollDown,
-            // Caracteres → input al terminal
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::TerminalInput(ch)
-            }
-            _ => Action::Noop,
-        },
-
-        PanelId::Editor => match (key.code, key.modifiers) {
-            // ── LSP ──
-            // Ctrl+Space → autocompletado
-            (KeyCode::Char(' '), KeyModifiers::CONTROL) => Action::LspCompletion,
-            // F12 → go-to-definition
-            (KeyCode::F(12), KeyModifiers::NONE) => Action::LspGotoDefinition,
-            // Ctrl+K → hover (info de tipo)
-            (KeyCode::Char('k'), KeyModifiers::CONTROL) => Action::LspHover,
-
-            // Movimiento de cursor
-            (KeyCode::Up, KeyModifiers::NONE) => Action::MoveCursor(Direction::Up),
-            (KeyCode::Down, KeyModifiers::NONE) => Action::MoveCursor(Direction::Down),
-            (KeyCode::Left, KeyModifiers::NONE) => Action::MoveCursor(Direction::Left),
-            (KeyCode::Right, KeyModifiers::NONE) => Action::MoveCursor(Direction::Right),
-            (KeyCode::Home, KeyModifiers::NONE) => Action::MoveToLineStart,
-            (KeyCode::End, KeyModifiers::NONE) => Action::MoveToLineEnd,
-
-            // Shift + flechas → selección
-            (KeyCode::Up, mods) if mods.contains(KeyModifiers::SHIFT) => {
-                Action::MoveCursorSelecting(Direction::Up)
-            }
-            (KeyCode::Down, mods) if mods.contains(KeyModifiers::SHIFT) => {
-                Action::MoveCursorSelecting(Direction::Down)
-            }
-            (KeyCode::Left, mods) if mods.contains(KeyModifiers::SHIFT) => {
-                Action::MoveCursorSelecting(Direction::Left)
-            }
-            (KeyCode::Right, mods) if mods.contains(KeyModifiers::SHIFT) => {
-                Action::MoveCursorSelecting(Direction::Right)
-            }
-
-            // Ctrl+D → seleccionar siguiente ocurrencia
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Action::SelectNextOccurrence,
-
-            // Edición
-            (KeyCode::Backspace, KeyModifiers::NONE) => Action::DeleteChar,
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::InsertNewline,
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::InsertChar(ch)
-            }
-
-            _ => Action::Noop,
-        },
-
-        PanelId::Explorer => match (key.code, key.modifiers) {
-            // Navegación
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ExplorerUp,
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::ExplorerDown,
-            // Abrir/expandir
-            (KeyCode::Enter | KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
-                Action::ExplorerToggle
-            }
-            // Colapsar
-            (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => Action::ExplorerCollapse,
-            // Refresh
-            (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ExplorerRefresh,
-
-            _ => Action::Noop,
-        },
-
-        // Otros paneles — sin keybindings específicos aún
-        _ => Action::Noop,
-    }
-}
+mod keymap;
+use keymap::keymap;
 
 // ─── Reducer ───────────────────────────────────────────────────────────────────
 
@@ -826,7 +426,16 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                             if let Some(path) = explorer.selected_path() {
                                 match state.tabs.open_file(&path) {
                                     Ok(()) => {
-                                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
+                                        // init_highlighting se llama solo si el cache
+                                        // no tiene syntax asignada (archivo recién abierto).
+                                        // Si ya tiene syntax (tab existente), no tocar el cache.
+                                        {
+                                            let engine = &state.highlight_engine;
+                                            let editor = state.tabs.active_mut();
+                                            if !editor.highlight_cache.has_syntax() {
+                                                editor.init_highlighting(engine);
+                                            }
+                                        }
                                         state.focused_panel = PanelId::Editor;
                                         state.update_status_cache();
                                         // Notificar LSP del nuevo archivo abierto
@@ -935,6 +544,10 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             reduce_mouse_drag(state, *col, *row);
             vec![]
         }
+        Action::MouseMiddleClick { col, row } => {
+            reduce_mouse_middle_click(state, *col, *row);
+            vec![]
+        }
 
         // ── Acciones del Quick Open ──
         Action::OpenQuickOpen => {
@@ -1003,6 +616,39 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     }
                 }
             }
+            vec![]
+        }
+
+        // ── Acciones de Go to Line ──
+        Action::OpenGoToLine => {
+            // Cerrar quick open si estaba abierto
+            state.quick_open.close();
+            let total = state.tabs.active().buffer.line_count();
+            state.go_to_line.open(total);
+            tracing::debug!("go to line abierto");
+            vec![]
+        }
+        Action::GoToLineInsertChar(ch) => {
+            state.go_to_line.push_char(*ch);
+            vec![]
+        }
+        Action::GoToLineDeleteChar => {
+            state.go_to_line.pop_char();
+            vec![]
+        }
+        Action::GoToLineConfirm => {
+            if let Some(line_1indexed) = state.go_to_line.parsed_line() {
+                // go_to_line usa 1-indexed; cursor es 0-indexed
+                let target = line_1indexed.saturating_sub(1);
+                state.tabs.active_mut().go_to_line(target);
+                state.update_status_cache();
+            }
+            state.go_to_line.close();
+            vec![]
+        }
+        Action::GoToLineClose => {
+            state.go_to_line.close();
+            tracing::debug!("go to line cerrado");
             vec![]
         }
 
@@ -1318,6 +964,20 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.git.commit_input.pop();
             vec![]
         }
+        Action::GitFetch => {
+            let root = get_workspace_root(state);
+            match crate::git::commands::fetch(&root) {
+                Ok(()) => {
+                    // Re-fetch ahead/behind después del fetch
+                    state.git.refresh(&root);
+                    tracing::info!("git fetch completado");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "git fetch falló");
+                }
+            }
+            vec![]
+        }
 
         // ── Acciones LSP ──
         Action::LspStart => {
@@ -1601,48 +1261,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
     }
 }
 
-/// Helper: obtiene el workspace root desde el explorer o cwd.
-fn get_workspace_root(state: &AppState) -> PathBuf {
-    state
-        .explorer
-        .as_ref()
-        .map(|e| e.root.clone()) // CLONE: necesario — root se usa después de &mut state
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Helper: envía notificación LSP did_change si hay server activo.
-///
-/// Usa debounce interno del LspState — no envía en cada keystroke.
-fn notify_lsp_change(state: &mut AppState) {
-    if !state.lsp.has_server() {
-        return;
-    }
-    if let Some(path) = state.tabs.active().buffer.file_path().map(|p| p.to_path_buf()) {
-        let text = buffer_full_text(state.tabs.active());
-        if let Err(e) = state.lsp.notify_change(&path, &text) {
-            tracing::warn!(error = %e, "error en LSP did_change");
-        }
-    }
-}
-
-/// Helper: obtiene el texto completo del buffer del editor como un String.
-///
-/// Reconstruye el texto uniendo líneas con `\n`. Se usa para LSP did_open/did_change.
-fn buffer_full_text(editor: &EditorState) -> String {
-    let line_count = editor.buffer.line_count();
-    // Pre-alocar con estimado razonable (80 chars por línea promedio)
-    let mut text = String::with_capacity(line_count * 80);
-    for i in 0..line_count {
-        if i > 0 {
-            text.push('\n');
-        }
-        if let Some(line) = editor.buffer.line(i) {
-            text.push_str(line);
-        }
-    }
-    text
-}
+mod helpers;
+use helpers::{buffer_full_text, get_workspace_root, notify_lsp_change};
 
 // ─── Search navigation helper ──────────────────────────────────────────────────
 
@@ -1701,525 +1321,8 @@ fn navigate_to_search_match(state: &mut AppState) {
     state.update_status_cache();
 }
 
-// ─── Mouse helpers ─────────────────────────────────────────────────────────────
-
-/// Dirección de scroll del mouse.
-#[derive(Debug, Clone, Copy)]
-enum ScrollDirection {
-    Up,
-    Down,
-}
-
-/// Calcula el ancho real del gutter (números de línea + separador `│ `).
-///
-/// Debe coincidir EXACTAMENTE con la lógica de render en `panels.rs`:
-/// `digit_count(line_count).max(4)` + 2 (separador).
-fn editor_gutter_width(line_count: usize) -> u16 {
-    let digits = crate::ui::panels::digit_count(line_count).max(4);
-    let separator = 2; // "│ "
-    (digits + separator) as u16
-}
-
-/// Cantidad de líneas que el scroll del mouse desplaza por evento.
-/// 1 línea por evento: scroll suave. El usuario controla la velocidad
-/// con la velocidad del wheel (más eventos = más scroll).
-const MOUSE_SCROLL_LINES: usize = 1;
-
-/// Determina en qué panel cayó una posición (col, row) absoluta.
-///
-/// Usa el layout almacenado en `AppState.last_layout`. Si no hay layout
-/// (primer frame), retorna `None`. La función es pura — no muta estado.
-/// Resultado de hit-test que distingue activity bar de paneles normales.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HitTestResult {
-    /// Click en un panel normal del IDE.
-    Panel(PanelId),
-    /// Click en la activity bar — incluye la fila relativa dentro de la barra.
-    ActivityBar { row_in_bar: u16 },
-}
-
-fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<HitTestResult> {
-    let point_in_rect = |r: Rect, c: u16, rw: u16| -> bool {
-        c >= r.x && c < r.x + r.width && rw >= r.y && rw < r.y + r.height
-    };
-
-    // Activity bar siempre visible — verificar primero
-    if point_in_rect(layout.activity_bar, col, row) {
-        return Some(HitTestResult::ActivityBar {
-            row_in_bar: row - layout.activity_bar.y,
-        });
-    }
-
-    // Verificar paneles en orden de prioridad visual
-    if layout.sidebar_visible && point_in_rect(layout.sidebar, col, row) {
-        return Some(HitTestResult::Panel(PanelId::Explorer));
-    }
-    if point_in_rect(layout.editor_area, col, row) {
-        return Some(HitTestResult::Panel(PanelId::Editor));
-    }
-    if layout.bottom_panel_visible && point_in_rect(layout.bottom_panel, col, row) {
-        return Some(HitTestResult::Panel(PanelId::Terminal));
-    }
-    // Title bar y status bar no son paneles enfocables
-    None
-}
-
-/// Procesa un click de mouse — resuelve panel, cambia foco, ejecuta acción contextual.
-fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
-    let Some(layout) = state.last_layout else {
-        return; // Sin layout aún — primer frame
-    };
-
-    // ── Click en status bar: detectar click en zona del branch ──
-    {
-        let sb = layout.status_bar;
-        if row >= sb.y && row < sb.y + sb.height {
-            // La status bar tiene: " MODE " + " " + branch + "  " + file_name...
-            // El branch empieza aprox en col = sb.x + mode_width + 2
-            // El mode ("NORMAL" o "LSP") ocupa ~8 chars (espacio + texto + espacio + separador)
-            // Estimado conservador: el branch está entre col 8 y 8 + branch_len
-            let mode_width: u16 = if state.lsp.has_server() { 6 } else { 8 }; // " LSP " vs " NORMAL "
-            let branch_start = sb.x + mode_width;
-            let branch_len = if state.git.is_repo {
-                state.git.branch.len() as u16
-            } else {
-                6 // "no git"
-            };
-            let branch_end = branch_start + branch_len + 1; // +1 margen
-
-            if col >= branch_start && col < branch_end && state.git.is_repo {
-                // Click en el branch name → abrir branch picker
-                let root = get_workspace_root(state);
-                match state.branch_picker.open(&root) {
-                    Ok(()) => {
-                        tracing::debug!("branch picker abierto via mouse click");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "error al abrir branch picker via mouse");
-                    }
-                }
-                return;
-            }
-            // Click en otra parte de la status bar — ignorar
-            return;
-        }
-    }
-
-    let Some(hit) = hit_test_panel(&layout, col, row) else {
-        return; // Click en zona no interactiva (title bar)
-    };
-
-    match hit {
-        HitTestResult::ActivityBar { row_in_bar } => {
-            // Resolver qué icono fue clickeado
-            // Iconos: 0=Explorer, 1=Git, 2=Search, penúltima fila=Settings
-            let bar_height = layout.activity_bar.height;
-            let settings_row = bar_height.saturating_sub(2);
-
-            if row_in_bar == settings_row {
-                // Click en Settings (último icono)
-                let effects = reduce(state, &Action::SettingsOpen);
-                process_effects(&effects, &CancellationToken::new());
-            } else {
-                // Click en iconos de sección (0, 1, 2)
-                let section = match row_in_bar {
-                    0 => Some(SidebarSection::Explorer),
-                    1 => Some(SidebarSection::Git),
-                    2 => Some(SidebarSection::Search),
-                    _ => None,
-                };
-                if let Some(section) = section {
-                    let effects = reduce(state, &Action::ActivityBarSelect(section));
-                    process_effects(&effects, &CancellationToken::new());
-                }
-            }
-        }
-        HitTestResult::Panel(panel) => {
-            // Si la sidebar muestra search o git, redirigir foco al panel activo
-            let panel = if panel == PanelId::Explorer && state.search.visible {
-                PanelId::Search
-            } else if panel == PanelId::Explorer && state.git.visible {
-                PanelId::Git
-            } else {
-                panel
-            };
-
-            // Cambiar foco al panel clickeado
-            state.focused_panel = panel;
-            tracing::debug!(?panel, col, row, "mouse click → foco");
-
-            match panel {
-                PanelId::Search => {
-                    // Click en search panel — resolver qué flat item fue clickeado
-                    reduce_mouse_click_search(state, &layout, row);
-                }
-                PanelId::Explorer => {
-                    reduce_mouse_click_explorer(state, &layout, row);
-                }
-                PanelId::Editor => {
-                    reduce_mouse_click_editor(state, &layout, col, row);
-                }
-                // Terminal y otros: solo cambio de foco por ahora
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Procesa click en el explorer — seleccionar entry, abrir/toggle.
-fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u16) {
-    let Some(ref mut explorer) = state.explorer else {
-        return;
-    };
-
-    // Calcular el inner area de la sidebar (descontar bordes del Block)
-    // Block con Borders::ALL tiene 1px de borde arriba (+ título) y 1px abajo
-    let inner_y = layout.sidebar.y + 1; // Borde superior + título
-    let inner_height = layout.sidebar.height.saturating_sub(2); // Bordes superior e inferior
-
-    if row < inner_y || row >= inner_y + inner_height {
-        return; // Click en el borde, no en contenido
-    }
-
-    // Índice visual dentro del inner area
-    let visual_row = (row - inner_y) as usize;
-    // Índice real en la lista aplanada = scroll_offset + visual_row
-    let flat_index = explorer.scroll_offset + visual_row;
-
-    let flat = explorer.flatten();
-    let flat_len = flat.len();
-    if flat_index >= flat_len {
-        return; // Click debajo de los entries
-    }
-
-    let is_dir = flat[flat_index].is_dir;
-    // CLONE: necesario — necesitamos el path para abrir archivo después de drop(flat)
-    let entry_path = flat[flat_index].path.clone();
-    drop(flat);
-
-    // Seleccionar el entry clickeado
-    explorer.selected_index = flat_index;
-
-    if is_dir {
-        // Toggle expand/collapse del directorio
-        if let Err(e) = explorer.toggle_selected() {
-            tracing::error!(error = %e, "error en toggle de explorer por mouse");
-        }
-    } else {
-        // Abrir archivo en una tab del editor
-        match state.tabs.open_file(&entry_path) {
-            Ok(()) => {
-                state.tabs.active_mut().init_highlighting(&state.highlight_engine);
-                state.focused_panel = PanelId::Editor;
-                state.update_status_cache();
-                tracing::info!(path = %entry_path.display(), "archivo abierto por mouse click");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "error al abrir archivo por mouse click");
-            }
-        }
-    }
-}
-
-/// Procesa click en el search panel — seleccionar item en la lista aplanada.
-fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16) {
-    // Calcular inner area de la sidebar (descontar bordes del Block)
-    let inner_y = layout.sidebar.y + 1; // Borde superior + título
-    let inner_height = layout.sidebar.height.saturating_sub(2); // Bordes
-
-    if row < inner_y || row >= inner_y + inner_height {
-        return;
-    }
-
-    // Calcular cuántas filas de input hay (query + replace? + include + exclude)
-    let input_lines: u16 = if state.search.replace_visible { 4 } else { 3 };
-    // +1 para summary al fondo
-    let results_start = inner_y + input_lines;
-    let results_end = inner_y + inner_height - 1; // última fila es summary
-
-    if row < results_start || row >= results_end {
-        return; // Click en inputs o summary, no en resultados
-    }
-
-    // Índice visual dentro del área de resultados
-    let visual_row = (row - results_start) as usize;
-    let flat_index = state.search.scroll_offset + visual_row;
-
-    if flat_index >= state.search.flat_items.len() {
-        return;
-    }
-
-    state.search.selected_flat_index = flat_index;
-
-    // Ejecutar acción según tipo de item
-    match state.search.flat_items[flat_index] {
-        crate::search::FlatSearchItem::FileHeader { group_index } => {
-            state.search.toggle_fold(group_index);
-        }
-        crate::search::FlatSearchItem::MatchLine { match_index, .. } => {
-            state.search.selected_match = match_index;
-            navigate_to_search_match(state);
-        }
-    }
-}
-
-/// Procesa click en el editor — mover cursor o cambiar tab.
-fn reduce_mouse_click_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
-    // Calcular inner area del editor (descontar bordes del Block)
-    let inner_y = layout.editor_area.y + 1;
-    let inner_x = layout.editor_area.x + 1;
-    let inner_height = layout.editor_area.height.saturating_sub(2);
-
-    if row < inner_y || row >= inner_y + inner_height {
-        return; // Click en borde
-    }
-
-    // ── Click en la barra de tabs (primera fila del inner area) ──
-    let tab_bar_row = inner_y;
-    if row == tab_bar_row {
-        resolve_tab_click(state, col, inner_x);
-        return;
-    }
-
-    // ── Click en breadcrumbs (segunda fila del inner area) ──
-    let breadcrumbs_row = inner_y + 1;
-    if row == breadcrumbs_row {
-        return; // Breadcrumbs no son interactivos por ahora
-    }
-
-    // Ajustar coordenadas: el contenido empieza 2 filas después (tab bar + breadcrumbs)
-    let content_y = inner_y + 2;
-    if row < content_y {
-        return;
-    }
-
-    let editor = state.tabs.active_mut();
-
-    // Línea en el buffer = viewport offset + fila visual (relativa al contenido, no al inner)
-    let visual_row = (row - content_y) as usize;
-    let target_line = editor.viewport.scroll_offset + visual_row;
-
-    // Columna en el buffer = col relativo al inner area - gutter dinámico
-    let gutter = editor_gutter_width(editor.buffer.line_count());
-    let text_x = inner_x + gutter;
-    let target_col = if col >= text_x {
-        (col - text_x) as usize
-    } else {
-        0 // Click en el gutter — columna 0
-    };
-
-    // Clampear a límites del buffer
-    let max_line = editor.buffer.line_count().saturating_sub(1);
-    let clamped_line = target_line.min(max_line);
-    let max_col = editor.buffer.line_len(clamped_line);
-    let clamped_col = target_col.min(max_col);
-
-    // Limpiar cursores secundarios al hacer click
-    editor.cursors.clear_secondary();
-    let primary = editor.cursors.primary_mut();
-    primary.position.line = clamped_line;
-    primary.position.col = clamped_col;
-    primary.sync_desired_col();
-    // Iniciar selección con anchor = head = click_pos.
-    // Si el usuario no arrastra, anchor == head → selección vacía (equivale a sin selección).
-    // Si arrastra, el drag handler actualiza head para extender la selección.
-    let click_pos = crate::editor::cursor::Position {
-        line: clamped_line,
-        col: clamped_col,
-    };
-    primary.selection = Some(crate::editor::selection::Selection::new(click_pos, click_pos));
-    let pos = editor.cursors.primary().position;
-    editor.viewport.ensure_cursor_visible(&pos);
-    state.update_status_cache();
-
-    tracing::debug!(line = clamped_line, col = clamped_col, "mouse click → cursor editor");
-}
-
-/// Resuelve qué tab fue clickeada y ejecuta la acción correspondiente.
-///
-/// Recorre las tabs pre-computadas calculando los anchos acumulados
-/// para determinar cuál tab contiene la columna clickeada.
-/// Click en `×` de tab activa → cerrar tab.
-/// Click en cualquier parte de una tab → cambiar a esa tab.
-fn resolve_tab_click(state: &mut AppState, col: u16, inner_x: u16) {
-    let tab_infos = state.tabs.tab_info();
-    let click_col = col.saturating_sub(inner_x) as usize;
-
-    let mut accumulated: usize = 0;
-    for (i, tab) in tab_infos.iter().enumerate() {
-        // Mismo cálculo que render_tab_bar (con iconos):
-        // "│ " (2) + icon(2) + " "(1) + name.len() + indicator.len() + " " (1)
-        let icon = crate::ui::icons::file_icon(&tab.name);
-        let has_indicator = tab.is_dirty || tab.is_active;
-        let indicator_len: usize = if has_indicator { 2 } else { 0 };
-        let tab_width = 2 + icon.len() + 1 + tab.name.len() + indicator_len + 1;
-
-        if click_col >= accumulated && click_col < accumulated + tab_width {
-            // Click cayó en esta tab
-            if tab.is_active && !tab.is_dirty {
-                // Verificar si clickeó en la zona del "×" (últimos 2 chars antes del padding)
-                // "│ "(2) + icon(2) + " "(1) + name = close_start
-                let close_start = accumulated + 2 + icon.len() + 1 + tab.name.len();
-                if click_col >= close_start && click_col < close_start + 2 {
-                    // Click en el ×: cerrar tab
-                    state.tabs.close_active();
-                    state.update_status_cache();
-                    tracing::debug!("tab cerrada via mouse click");
-                    return;
-                }
-            }
-            // Cambiar a esta tab
-            state.tabs.switch_to(i);
-            state.update_status_cache();
-            tracing::debug!(tab = i, "tab seleccionada via mouse click");
-            return;
-        }
-
-        accumulated += tab_width;
-    }
-}
-
-/// Procesa drag del mouse — selección de texto arrastrando.
-///
-/// Solo actúa si el drag cae en el editor area. Extiende la selección
-/// desde el anchor (seteado en el click) hasta la posición actual del drag.
-fn reduce_mouse_drag(state: &mut AppState, col: u16, row: u16) {
-    let Some(layout) = state.last_layout else {
-        return; // Sin layout — primer frame
-    };
-
-    let Some(hit) = hit_test_panel(&layout, col, row) else {
-        return;
-    };
-
-    // Drag-to-select solo en el editor
-    if let HitTestResult::Panel(PanelId::Editor) = hit {
-        reduce_mouse_drag_editor(state, &layout, col, row);
-    }
-}
-
-/// Procesa drag en el editor — extiende selección desde anchor hasta posición del drag.
-fn reduce_mouse_drag_editor(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
-    // Calcular inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
-    let inner_y = layout.editor_area.y + 1 + 2; // +1 borde, +1 tab bar, +1 breadcrumbs
-    let inner_x = layout.editor_area.x + 1;
-    let inner_height = layout.editor_area.height.saturating_sub(4); // bordes + tab bar + breadcrumbs
-
-    // Clampear row al rango visible del editor para permitir scroll
-    // cuando el drag sale por arriba o abajo del viewport
-    let clamped_row = row.clamp(inner_y, inner_y + inner_height.saturating_sub(1));
-
-    let editor = state.tabs.active_mut();
-
-    // Línea en el buffer = viewport offset + fila visual
-    let visual_row = (clamped_row - inner_y) as usize;
-    let target_line = editor.viewport.scroll_offset + visual_row;
-
-    // Columna en el buffer = col relativo al inner area - gutter dinámico
-    let gutter = editor_gutter_width(editor.buffer.line_count());
-    let text_x = inner_x + gutter;
-    let target_col = if col >= text_x {
-        (col - text_x) as usize
-    } else {
-        0 // Drag en el gutter — columna 0
-    };
-
-    // Clampear a límites del buffer
-    let max_line = editor.buffer.line_count().saturating_sub(1);
-    let clamped_line = target_line.min(max_line);
-    let max_col = editor.buffer.line_len(clamped_line);
-    let clamped_col = target_col.min(max_col);
-
-    let primary = editor.cursors.primary_mut();
-
-    // Verificar que hay una selección activa (seteada por el click previo)
-    if primary.selection.is_none() {
-        return;
-    }
-
-    // Actualizar posición del cursor y head de la selección
-    primary.position.line = clamped_line;
-    primary.position.col = clamped_col;
-    primary.sync_desired_col();
-    primary.extend_selection();
-
-    // Scroll automático si el drag lleva el cursor fuera del viewport
-    let pos = editor.cursors.primary().position;
-    editor.viewport.ensure_cursor_visible(&pos);
-    state.update_status_cache();
-
-    tracing::trace!(line = clamped_line, col = clamped_col, "mouse drag → selección editor");
-}
-
-/// Procesa scroll del mouse — scrollea el panel bajo el cursor.
-fn reduce_mouse_scroll(state: &mut AppState, col: u16, row: u16, direction: ScrollDirection) {
-    let Some(layout) = state.last_layout else {
-        return;
-    };
-
-    let Some(hit) = hit_test_panel(&layout, col, row) else {
-        return;
-    };
-
-    let panel = match hit {
-        HitTestResult::Panel(p) => p,
-        HitTestResult::ActivityBar { .. } => return, // No scroll en activity bar
-    };
-
-    match panel {
-        PanelId::Explorer => {
-            // Si search está visible, scrollear resultados de búsqueda (flat items)
-            if state.search.visible {
-                let flat_count = state.search.flat_items.len();
-                match direction {
-                    ScrollDirection::Up => {
-                        state.search.scroll_offset = state.search.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                    }
-                    ScrollDirection::Down => {
-                        let max_scroll = flat_count.saturating_sub(1);
-                        state.search.scroll_offset = (state.search.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
-                    }
-                }
-            } else if let Some(ref mut explorer) = state.explorer {
-                let flat_count = explorer.flatten().len();
-                match direction {
-                    ScrollDirection::Up => {
-                        explorer.scroll_offset = explorer.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                    }
-                    ScrollDirection::Down => {
-                        let max_scroll = flat_count.saturating_sub(1);
-                        explorer.scroll_offset = (explorer.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
-                    }
-                }
-            }
-        }
-        PanelId::Editor => {
-            let editor = state.tabs.active_mut();
-            let line_count = editor.buffer.line_count();
-            match direction {
-                ScrollDirection::Up => {
-                    editor.viewport.scroll_offset =
-                        editor.viewport.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
-                }
-                ScrollDirection::Down => {
-                    let max_scroll = line_count.saturating_sub(1);
-                    editor.viewport.scroll_offset =
-                        (editor.viewport.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
-                }
-            }
-        }
-        PanelId::Terminal => {
-            if let Some(ref mut session) = state.terminal.session {
-                match direction {
-                    ScrollDirection::Up => session.scroll_up(MOUSE_SCROLL_LINES),
-                    ScrollDirection::Down => session.scroll_down(MOUSE_SCROLL_LINES),
-                }
-            }
-        }
-        // Otros paneles: scroll no implementado aún
-        _ => {}
-    }
-}
+mod mouse;
+use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_middle_click, reduce_mouse_scroll, ScrollDirection};
 
 // ─── Process Effects ───────────────────────────────────────────────────────────
 
@@ -2305,6 +1408,139 @@ async fn event_loop(
 
     let tick_duration = Duration::from_millis(state.config.tick_rate_ms);
 
+    // ── Loading phase: inicialización diferida con pantalla de progreso ──
+    //
+    // Las operaciones lentas (explorer, quick_open, git, highlight) se
+    // ejecutan paso a paso, renderizando la loading screen entre cada
+    // paso para mostrar progreso al usuario.
+    //
+    // thread::sleep(16ms) es aceptable acá: estamos en la fase de startup
+    // ANTES del event loop principal. No afecta latencia de input.
+    {
+        let loading_start = std::time::Instant::now();
+        let mut loading = LoadingProgress::new();
+
+        // Track de pasos completados
+        let mut step_explorer_done = false;
+        let mut step_quickopen_done = false;
+        let mut step_git_done = false;
+        let step_highlight_done = false;
+
+        // Derivar root para inicialización: padre del archivo o cwd
+        let init_root: Option<std::path::PathBuf> = match &file {
+            Some(p) => p.parent()
+                .map(|parent| parent.to_path_buf())
+                .or_else(|| std::env::current_dir().ok()),
+            None => std::env::current_dir().ok(),
+        };
+
+        loop {
+            // Renderizar loading screen PRIMERO (usuario ve progreso)
+            terminal.draw(|frame| {
+                ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+            }).context("error en render de loading")?;
+
+            // Un paso de inicialización por iteración
+            if !step_explorer_done {
+                loading.step = "Escaneando archivos del workspace...";
+                loading.progress = 0.1;
+                if let Some(ref root) = init_root {
+                    state.explorer = ExplorerState::new(root)
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "no se pudo inicializar explorer");
+                            e
+                        })
+                        .ok();
+                }
+                step_explorer_done = true;
+                continue; // render siguiente frame con progreso actualizado
+            }
+
+            if !step_quickopen_done {
+                loading.step = "Indexando workspace para Quick Open...";
+                loading.progress = 0.3;
+                if let Some(ref root) = init_root
+                    && let Err(e) = state.quick_open.build_index(root)
+                {
+                    tracing::warn!(error = %e, "no se pudo construir índice de quick open");
+                }
+                step_quickopen_done = true;
+                continue;
+            }
+
+            if !step_git_done {
+                loading.step = "Leyendo estado de Git...";
+                loading.progress = 0.5;
+                if let Some(ref root) = init_root {
+                    state.git.refresh(root);
+                }
+                step_git_done = true;
+                continue;
+            }
+
+            if !step_highlight_done {
+                loading.step = "Cargando syntax highlighting...";
+                loading.progress = 0.7;
+                // try_init non-blocking — engine puede no estar listo aún
+                let ready = state.highlight_engine.try_init();
+                if ready || state.highlight_engine.is_ready() {
+                    // Pre-highlightear viewport del archivo activo
+                    loading.step = "Pre-procesando colores del viewport...";
+                    loading.progress = 0.9;
+                    // Render intermedio para mostrar progreso actualizado
+                    terminal.draw(|frame| {
+                        ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+                    }).context("error en render de loading")?;
+
+                    // Fix: llamar init_highlighting() AHORA que el engine está listo.
+                    // En with_file() el engine aún no había cargado, así que
+                    // init_highlighting() no pudo detectar syntax. Lo hacemos aquí.
+                    {
+                        let engine = &state.highlight_engine;
+                        state.tabs.active_mut().init_highlighting(engine);
+                    }
+
+                    let engine = &state.highlight_engine;
+                    let editor = state.tabs.active_mut();
+                    let vp_start = editor.viewport.scroll_offset;
+                    // viewport.height puede ser 0 antes del primer render —
+                    // usar .max(40) como estimado razonable.
+                    let vp_height = editor.viewport.height.max(40);
+                    editor.highlight_cache.ensure_viewport_highlighted(
+                        &editor.buffer,
+                        engine,
+                        vp_start,
+                        vp_height,
+                    );
+
+                    let _ = step_highlight_done; // consumir variable
+                    loading.progress = 1.0;
+                    loading.step = "\u{2713} Sistemas inicializados";
+                    loading.done = true;
+
+                    // Render final mostrando 100%
+                    terminal.draw(|frame| {
+                        ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+                    }).context("error en render de loading")?;
+
+                    // Breve pausa para que el usuario vea el 100% completado
+                    std::thread::sleep(Duration::from_millis(100));
+                    tracing::info!("loading phase completada — todos los sistemas listos");
+                    break;
+                }
+
+                // Engine no listo aún — timeout de seguridad
+                if loading_start.elapsed() > Duration::from_secs(3) {
+                    tracing::warn!("highlight timeout — iniciando sin syntax highlighting");
+                    break;
+                }
+                // Esperar antes de reintentar — 16ms ≈ 60fps
+                std::thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+        }
+    }
+
     loop {
         // 1. Poll de eventos con timeout (esto ESPERA — no cuenta como frame time)
         let event = poll_event(tick_duration)?;
@@ -2320,6 +1556,7 @@ async fn event_loop(
                     state.focused_panel,
                     state.palette.visible,
                     state.quick_open.visible,
+                    state.go_to_line.visible,
                     state.branch_picker.visible,
                     state.search.visible,
                     &state.git,
@@ -2338,8 +1575,44 @@ async fn event_loop(
             state.metrics.record_event();
         }
 
+        // 4.5. Cursor blink: togglear visibilidad cada 10 ticks (~500ms).
+        //      Reset en cualquier input del usuario (cursor siempre visible al teclear).
+        match &event {
+            Some(Event::Tick) => {
+                state.cursor_blink_counter += 1;
+                // 8 ticks * 50ms = 400ms blink period
+                if state.cursor_blink_counter >= 8 {
+                    state.cursor_blink_counter = 0;
+                    state.cursor_visible = !state.cursor_visible;
+                }
+            }
+            Some(Event::Input(_)) => {
+                // Cualquier input del usuario: cursor visible, reset counter
+                state.cursor_visible = true;
+                state.cursor_blink_counter = 0;
+            }
+            // Otros eventos async (FileLoaded, SearchResult, etc.): no afectan blink
+            Some(_) | None => {}
+        }
+
         // 5. Reducer: actualizar estado y obtener efectos
         let effects = reduce(&mut state, &action);
+
+        // 5.5. Re-highlight inmediato de la línea del cursor después de ediciones.
+        //      Elimina el parpadeo blanco: la línea editada se re-colorea en el
+        //      mismo frame sin esperar al debounce de ensure_viewport_highlighted.
+        if matches!(
+            action,
+            Action::InsertChar(_)
+                | Action::DeleteChar
+                | Action::InsertNewline
+                | Action::Undo
+                | Action::Redo
+        ) && state.highlight_engine.is_ready()
+        {
+            let engine = &state.highlight_engine;
+            state.tabs.active_mut().rehighlight_cursor_line(engine);
+        }
 
         // 6. Procesar efectos
         process_effects(&effects, shutdown);
@@ -2375,6 +1648,12 @@ async fn event_loop(
                 let git_list_height = sidebar_height.saturating_sub(1 + commit_lines);
                 state.git.ensure_visible(git_list_height);
             }
+        }
+
+        // 6.8. Pre-computar flat cache del explorer para evitar recompute en render.
+        //      Se hace antes del render — el render solo lee el cache via cached_flat().
+        if let Some(ref mut explorer) = state.explorer {
+            explorer.ensure_flat_cache();
         }
 
         // 7. Computar layout y almacenarlo para resolución de mouse.
@@ -2413,25 +1692,23 @@ async fn event_loop(
             editor.viewport.update_size(text_width, editor_inner_h);
         }
 
-        // 7.6. Ensure syntax highlight — carga lazy del engine + viewport-aware cache.
+        // 7.6. Ensure syntax highlight — viewport-aware cache.
         //      Se hace acá para NO alocar dentro del render loop.
-        {
-            // Intentar inicializar el engine si la carga en background terminó.
-            // Si se inicializó en este frame, marcar caches de todas las tabs como dirty.
-            let just_loaded = state.highlight_engine.try_init();
-            if just_loaded {
-                // El engine acaba de cargar — marcar todas las tabs como dirty
-                // para que sus caches se re-procesen con colores
-                for editor in state.tabs.all_editors_mut() {
-                    editor.highlight_cache.invalidate();
-                }
-                tracing::info!("highlight engine listo — re-highlighting todos los buffers");
-            }
-
-            // Solo procesar highlight si el engine está listo
-            if state.highlight_engine.is_ready() {
-                let engine = &state.highlight_engine;
-                let editor = state.tabs.active_mut();
+        //      try_init() ya se ejecutó en la loading phase — en el main loop
+        //      el engine ya está listo (o nunca lo estará si falló).
+        //
+        //      Si highlight_deferred está activo, el archivo acaba de abrirse.
+        //      Skipeamos el highlight este frame (render es instantáneo) y lo
+        //      procesamos el siguiente frame. Esto elimina el lurch al abrir archivos.
+        if state.highlight_engine.is_ready() {
+            let engine = &state.highlight_engine;
+            let editor = state.tabs.active_mut();
+            if editor.highlight_deferred {
+                // Primer frame post-open: solo inicializar syntax, no highlight.
+                // El siguiente frame ya procesa normal.
+                editor.init_highlighting(engine);
+                editor.highlight_deferred = false;
+            } else {
                 let vp_start = editor.viewport.scroll_offset;
                 let vp_height = editor.viewport.height;
                 editor.highlight_cache.ensure_viewport_highlighted(
@@ -2576,3 +1853,5 @@ fn cleanup_terminal() -> Result<()> {
     .context("no se pudo restaurar terminal")?;
     Ok(())
 }
+
+

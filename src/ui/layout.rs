@@ -126,6 +126,25 @@ impl IdeLayout {
     }
 }
 
+/// Rectángulo estándar para todos los overlays modales.
+///
+/// Todos los modales comparten el mismo X, width y Y de inicio.
+/// Solo la altura varía según el contenido de cada modal.
+///
+/// - Ancho: 60% del terminal, clamped [40, 120]
+/// - X: centrado horizontalmente sobre el área total
+/// - Y: inmediatamente debajo del title bar (title_bar.bottom())
+/// - Altura máxima: hasta la status bar (no la pisa)
+pub fn modal_rect(layout: &IdeLayout, height: u16) -> Rect {
+    let total_width = layout.title_bar.width;
+    let modal_width = (total_width * 60 / 100).clamp(40, 120);
+    let x = layout.title_bar.x + (total_width.saturating_sub(modal_width)) / 2;
+    let y = layout.title_bar.bottom(); // = title_bar.y + 1
+    let max_height = layout.status_bar.y.saturating_sub(y);
+    let clamped_height = height.min(max_height).max(3);
+    Rect::new(x, y, modal_width, clamped_height)
+}
+
 /// Calcula el ancho de la sidebar respetando mínimos y máximos.
 ///
 /// ~20% del ancho total, clamped entre `SIDEBAR_MIN_COLS` y `SIDEBAR_MAX_COLS`.

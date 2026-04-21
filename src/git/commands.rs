@@ -249,6 +249,42 @@ pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<String> {
     run_git(repo_path, &["checkout", checkout_name])
 }
 
+// ─── Ahead/Behind & Fetch ──────────────────────────────────────────────────────
+
+/// Retorna (ahead, behind) respecto al upstream del branch actual.
+///
+/// ahead = commits locales no pusheados.
+/// behind = commits remotos no pulleados.
+/// Retorna (0, 0) si no hay upstream, detached HEAD, o si falla.
+pub fn ahead_behind(repo_path: &Path) -> (u32, u32) {
+    let output = match run_git(repo_path, &["rev-list", "--count", "--left-right", "@{u}...HEAD"]) {
+        Ok(s) => s,
+        Err(_) => return (0, 0),
+    };
+
+    let trimmed = output.trim();
+    let mut parts = trimmed.split('\t');
+    let behind = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let ahead = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    (ahead, behind)
+}
+
+/// Ejecuta `git fetch --quiet` de forma síncrona.
+///
+/// Retorna Ok(()) si el comando se ejecutó exitosamente.
+/// Retorna Err si git no está disponible o el fetch falla.
+pub fn fetch(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["fetch", "--quiet"])?;
+    Ok(())
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Parsea un carácter de status de `git status --porcelain=v1`.

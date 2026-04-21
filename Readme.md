@@ -6,7 +6,7 @@
 
 ## ¿Qué es?
 
-**IDE-Rust** busca llevar a terminal una experiencia de trabajo estilo IDE agradable sin necesitar una curva de aprendizaje alta y sin el costo de un entorno gráfico pesado a cambio de una curva de aprendizaje baja. Lo mejor de 2 mundos.
+**IDE-Rust** busca llevar a termin al una experiencia de trabajo estilo IDE agradable sin necesitar una curva de aprendizaje alta y sin el costo de un entorno gráfico pesado a cambio de una curva de aprendizaje baja. Lo mejor de 2 mundos.
 
 La propuesta no es “meter VS Code entero en una TTY”. La propuesta es más disciplinada:
 
@@ -41,8 +41,34 @@ Todo eso sin aceptar como “normal” un consumo excesivo de RAM, CPU o renders
 - **regex** + **globset** para búsqueda y filtros
 - **tracing** para observabilidad
 - **anyhow** + **thiserror** para manejo de errores
+- **tree-sitter** para syntax highlighting incremental
+- **syntect** como fallback para lenguajes sin grammar tree-sitter
 
 Referencia: `Cargo.toml`.
+
+## Syntax highlighting — Lenguajes soportados
+
+El highlighting usa **tree-sitter** como motor principal (parsing incremental, <1ms por keystroke) con **syntect** como fallback para extensiones no reconocidas.
+
+| Lenguaje | Extensiones | Motor | Estado |
+|----------|-------------|-------|--------|
+| Rust | `.rs` | tree-sitter | ✅ Soportado |
+| TypeScript | `.ts`, `.tsx` | tree-sitter | ✅ Soportado |
+| Go | `.go` | tree-sitter | ✅ Soportado |
+| JSON | `.json` | tree-sitter | ✅ Soportado |
+| CSS | `.css` | tree-sitter | ✅ Soportado |
+| Bash / Shell | `.sh`, `.bash` | tree-sitter | ✅ Soportado |
+| Python | `.py` | syntect | 🔄 Pendiente grammar |
+| JavaScript | `.js`, `.jsx` | syntect | 🔄 Pendiente grammar |
+| C | `.c`, `.h` | syntect | 🔄 Pendiente grammar |
+| C++ | `.cpp`, `.hpp` | syntect | 🔄 Pendiente grammar |
+| HTML | `.html`, `.htm` | syntect | 🔄 Pendiente grammar |
+| TOML | `.toml` | syntect | 🔄 Grammar viejo (^0.20) |
+| YAML | `.yml`, `.yaml` | syntect | 🔄 Grammar viejo (^0.19) |
+| Markdown | `.md` | syntect | 🔄 Grammar viejo (^0.20) |
+| Otros | `*` | syntect | ✅ Fallback automático |
+
+> Los lenguajes en estado 🔄 usan syntect como fallback automático — funcionan con colores, solo sin parsing incremental. Se irán migrando a tree-sitter a medida que sus grammars actualicen compatibilidad con el core `^0.25`.
 
 ### Flujo central
 

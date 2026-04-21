@@ -6,13 +6,14 @@
 //! El render solo dibuja desde el cache de `filtered`.
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
+use crate::ui::layout::{self, IdeLayout};
 use crate::ui::theme::Theme;
 use crate::workspace::quick_open::{QuickOpenState, MAX_VISIBLE_ITEMS};
 
@@ -27,31 +28,15 @@ use crate::workspace::quick_open::{QuickOpenState, MAX_VISIBLE_ITEMS};
 ///
 /// Precondición: `state.visible == true`.
 /// NO aloca `format!()` dentro del loop de items — pre-computa antes.
-pub fn render_quick_open(f: &mut Frame, area: Rect, state: &QuickOpenState, theme: &Theme) {
+pub fn render_quick_open(f: &mut Frame, layout: &IdeLayout, state: &QuickOpenState, theme: &Theme) {
     if !state.visible {
         return;
     }
 
-    // ── Calcular área del overlay ──
-    // ~60% del ancho, centrado
-    let overlay_width = (area.width * 60 / 100)
-        .max(30)
-        .min(area.width.saturating_sub(4));
-    let x_offset = (area.width.saturating_sub(overlay_width)) / 2;
-
-    // Alto: input(1) + borde arriba(1) + items + borde abajo(1)
+    // ── Calcular área del overlay via modal_rect ──
     let visible_items = state.filtered.len().min(MAX_VISIBLE_ITEMS);
-    // 3 = borde arriba + input line + borde abajo
-    // +1 para el separador entre input y lista
-    let overlay_height = (visible_items as u16 + 4).min(area.height.saturating_sub(4));
-    let y_offset = area.height / 6; // ~1/6 desde arriba
-
-    let overlay_rect = Rect::new(
-        area.x + x_offset,
-        area.y + y_offset,
-        overlay_width,
-        overlay_height,
-    );
+    let modal_height = (visible_items as u16 + 5).max(6);
+    let overlay_rect = layout::modal_rect(layout, modal_height);
 
     // ── Limpiar el área del overlay ──
     f.render_widget(Clear, overlay_rect);
@@ -76,17 +61,19 @@ pub fn render_quick_open(f: &mut Frame, area: Rect, state: &QuickOpenState, them
         return;
     }
 
-    // ── Layout interno: input (1 línea) + lista (resto) ──
+    // ── Layout interno: input (1 línea) + lista (resto) + footer (1) ──
     let inner_layout = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
             Constraint::Length(1), // input
             Constraint::Fill(1),   // lista de archivos
+            Constraint::Length(1), // footer
         ])
         .split(inner);
 
     let input_area = inner_layout[0];
     let list_area = inner_layout[1];
+    let footer_area = inner_layout[2];
 
     // ── Render input field ──
     let input_line = Line::from(vec![
@@ -131,6 +118,15 @@ pub fn render_quick_open(f: &mut Frame, area: Rect, state: &QuickOpenState, them
 
     let list_paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
     f.render_widget(list_paragraph, list_area);
+
+    // ── Footer con atajos ──
+    let footer = Paragraph::new(Line::from(Span::styled(
+        " [\u{2191}\u{2193}] Navegar   [Enter] Abrir   [:] Línea   [Esc] Cerrar",
+        Style::default().fg(theme.fg_secondary),
+    )))
+    .alignment(Alignment::Left)
+    .style(Style::default().bg(theme.bg_active));
+    f.render_widget(footer, footer_area);
 }
 
 /// Renderiza un item de archivo como una `Line` de ratatui.

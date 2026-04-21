@@ -34,6 +34,9 @@ pub struct FlatEntry {
 /// Administra el árbol lazy, la selección actual, y el scroll
 /// para viewport virtual. Las operaciones de navegación mantienen
 /// la selección dentro de bounds válidos.
+///
+/// El árbol aplanado se cachea para evitar recomputar en cada frame.
+/// Se invalida (`cache_dirty = true`) en operaciones que mutan el árbol.
 #[derive(Debug)]
 pub struct ExplorerState {
     /// Directorio raíz del workspace.
@@ -44,6 +47,10 @@ pub struct ExplorerState {
     pub selected_index: usize,
     /// Offset de scroll para viewport virtual.
     pub scroll_offset: usize,
+    /// Cache del árbol aplanado — evita recomputar cada frame.
+    flat_cache: Option<Vec<FlatEntry>>,
+    /// Flag de invalidación — `true` cuando el árbol mutó y el cache es stale.
+    cache_dirty: bool,
 }
 
 impl ExplorerState {
@@ -60,17 +67,54 @@ impl ExplorerState {
             entries,
             selected_index: 0,
             scroll_offset: 0,
+            flat_cache: None,
+            cache_dirty: true,
         })
     }
 
-    /// Aplana el árbol recursivamente para renderizado.
+    /// Aplana el árbol recursivamente para renderizado (sin cache).
     ///
     /// Solo incluye entries visibles (dirs expandidos y sus hijos).
     /// Retorna un Vec de `FlatEntry` con profundidad para indentación.
+    /// Usado internamente cuando se necesita un Vec owned temporal.
     pub fn flatten(&self) -> Vec<FlatEntry> {
         let mut result = Vec::new();
         flatten_recursive(&self.entries, 0, &mut result);
         result
+    }
+
+    /// Retorna el árbol aplanado cacheado — recomputa solo si dirty.
+    ///
+    /// Preferir este método sobre `flatten()` en render loops y cualquier
+    /// hot path. Evita re-alocar el Vec cada frame cuando el árbol no cambió.
+    pub fn ensure_flat_cache(&mut self) -> &[FlatEntry] {
+        if self.cache_dirty || self.flat_cache.is_none() {
+            let mut result = Vec::new();
+            flatten_recursive(&self.entries, 0, &mut result);
+            self.flat_cache = Some(result);
+            self.cache_dirty = false;
+        }
+        // SAFETY: siempre Some después del bloque de arriba
+        self.flat_cache.as_deref().unwrap_or(&[])
+    }
+
+    /// Retorna el flat cache si está disponible y no dirty.
+    ///
+    /// Usado en render (donde solo se tiene `&self`). Si el cache está
+    /// actualizado (fue llenado por `ensure_flat_cache` antes del render),
+    /// retorna el slice cacheado. Si no, retorna `None` y el caller
+    /// debe usar `flatten()` como fallback.
+    pub fn cached_flat(&self) -> Option<&[FlatEntry]> {
+        if !self.cache_dirty {
+            self.flat_cache.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Invalida el flat cache — debe llamarse después de mutar el árbol.
+    fn invalidate_cache(&mut self) {
+        self.cache_dirty = true;
     }
 
     /// Mover selección arriba.
@@ -82,7 +126,7 @@ impl ExplorerState {
 
     /// Mover selección abajo.
     pub fn move_down(&mut self) {
-        let flat_count = self.flatten().len();
+        let flat_count = self.ensure_flat_cache().len();
         if flat_count > 0 && self.selected_index < flat_count - 1 {
             self.selected_index += 1;
         }
@@ -111,6 +155,7 @@ impl ExplorerState {
 
         // Buscar y toggle el directorio en el árbol
         toggle_entry_by_path(&mut self.entries, &target_path)?;
+        self.invalidate_cache();
 
         Ok(false)
     }
@@ -140,8 +185,9 @@ impl ExplorerState {
     pub fn refresh(&mut self) -> Result<()> {
         self.entries = load_directory(&self.root)
             .with_context(|| format!("no se pudo refrescar: {}", self.root.display()))?;
-        // Clampear selección
-        let flat_count = self.flatten().len();
+        self.invalidate_cache();
+        // Clampear selección — usar ensure_flat_cache para evitar double-compute
+        let flat_count = self.ensure_flat_cache().len();
         if flat_count == 0 {
             self.selected_index = 0;
         } else if self.selected_index >= flat_count {
@@ -185,6 +231,7 @@ impl ExplorerState {
         drop(flat);
 
         collapse_entry_by_path(&mut self.entries, &target_path)?;
+        self.invalidate_cache();
         Ok(true)
     }
 }

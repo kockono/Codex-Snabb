@@ -347,3 +347,69 @@ fn is_ignored(name: &str) -> bool {
         .iter()
         .any(|ignored| ignored.to_ascii_lowercase() == name_lower)
 }
+
+// ─── GoToLineState ─────────────────────────────────────────────────────────────
+
+/// Estado del modal Go to Line (Ctrl+G).
+///
+/// Modal pequeño que permite saltar a un número de línea específico.
+/// Acepta solo dígitos (0-9) y Backspace. Enter confirma, Esc cancela.
+/// El input se parsea como número 1-indexed y se clampea al rango válido.
+#[derive(Debug)]
+pub struct GoToLineState {
+    /// Si el modal está visible.
+    pub visible: bool,
+    /// Dígitos que el usuario ha escrito (sin el ':').
+    /// Capacidad fija de 8 — suficiente para archivos de millones de líneas.
+    pub input: String,
+    /// Total de líneas del archivo activo (para mostrar hint y clampear).
+    pub total_lines: usize,
+}
+
+impl GoToLineState {
+    /// Crea un estado inicial (modal cerrado).
+    pub fn new() -> Self {
+        Self {
+            visible: false,
+            input: String::with_capacity(8),
+            total_lines: 0,
+        }
+    }
+
+    /// Abre el modal con el total de líneas del archivo actual.
+    pub fn open(&mut self, total_lines: usize) {
+        self.visible = true;
+        self.input.clear();
+        self.total_lines = total_lines;
+    }
+
+    /// Cierra el modal y limpia el input.
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.input.clear();
+    }
+
+    /// Agrega un dígito al input (ignora no-dígitos, máximo 6 chars).
+    pub fn push_char(&mut self, ch: char) {
+        if ch.is_ascii_digit() && self.input.len() < 6 {
+            self.input.push(ch);
+        }
+    }
+
+    /// Borra el último dígito del input.
+    pub fn pop_char(&mut self) {
+        self.input.pop();
+    }
+
+    /// Parsea el input como número de línea (1-indexed).
+    ///
+    /// Retorna `None` si vacío, cero, o inválido.
+    /// Clampea al rango `[1, total_lines]`.
+    pub fn parsed_line(&self) -> Option<usize> {
+        let n: usize = self.input.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some(n.min(self.total_lines).max(1))
+    }
+}
