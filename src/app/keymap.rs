@@ -156,8 +156,8 @@ pub(super) fn keymap(
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::QuickOpenUp,
             (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::QuickOpenDown,
             (KeyCode::Backspace, _) => Action::QuickOpenDeleteChar,
-            // ':' en Quick Open → switch a Go to Line mode
-            (KeyCode::Char(':'), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::OpenGoToLine,
+            // ':' se envía como char normal — QuickOpenState::insert_char() maneja
+            // el switch a go-to-line mode cuando es el primer carácter.
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 Action::QuickOpenInsertChar(ch)
             }
@@ -596,7 +596,9 @@ mod tests {
     }
 
     #[test]
-    fn colon_in_quick_open_returns_open_go_to_line() {
+    fn colon_in_quick_open_returns_insert_char() {
+        // ':' ya no abre un modal separado — se envía como char normal.
+        // QuickOpenState::insert_char() maneja el switch a go-to-line inline.
         let commands = test_commands();
         let event = key_event(KeyCode::Char(':'), KeyModifiers::SHIFT);
         let action = keymap(
@@ -613,7 +615,7 @@ mod tests {
             false,
             &commands,
         );
-        assert_eq!(action, Action::OpenGoToLine);
+        assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
 
     #[test]

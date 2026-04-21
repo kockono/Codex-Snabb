@@ -554,6 +554,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             // Solo abrir si la palette NO está visible (un overlay a la vez)
             if !state.palette.visible {
                 state.quick_open.open();
+                // Pasar total_lines del archivo activo para go-to-line hint
+                state.quick_open.total_lines = state.tabs.active().buffer.line_count();
                 tracing::debug!("quick open abierto");
             }
             vec![]
@@ -580,39 +582,50 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::QuickOpenConfirm => {
-            // Obtener path seleccionado, abrir en editor, cerrar quick open.
-            // CLONE: necesario — el path se extrae del quick_open state (inmutable
-            // durante la lectura) y luego se usa para abrir archivo (que requiere
-            // &mut state vía EditorState::open_file).
-            let selected = state.quick_open.selected_path().map(|p| p.to_path_buf());
-            state.quick_open.close();
+            if state.quick_open.is_goto_mode() {
+                // Go-to-line mode: saltar a la línea indicada
+                if let Some(line_1indexed) = state.quick_open.parsed_line() {
+                    let target = line_1indexed.saturating_sub(1);
+                    state.tabs.active_mut().go_to_line(target);
+                    state.update_status_cache();
+                }
+                state.quick_open.close();
+                state.focused_panel = PanelId::Editor;
+            } else {
+                // File search mode: abrir archivo seleccionado (existing behavior)
+                // CLONE: necesario — el path se extrae del quick_open state (inmutable
+                // durante la lectura) y luego se usa para abrir archivo (que requiere
+                // &mut state vía EditorState::open_file).
+                let selected = state.quick_open.selected_path().map(|p| p.to_path_buf());
+                state.quick_open.close();
 
-            if let Some(relative_path) = selected {
-                // Resolver path absoluto desde el workspace root
-                let absolute_path = if let Some(ref explorer) = state.explorer {
-                    explorer.root.join(&relative_path)
-                } else if let Ok(cwd) = std::env::current_dir() {
-                    cwd.join(&relative_path)
-                } else {
-                    relative_path
-                };
+                if let Some(relative_path) = selected {
+                    // Resolver path absoluto desde el workspace root
+                    let absolute_path = if let Some(ref explorer) = state.explorer {
+                        explorer.root.join(&relative_path)
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        cwd.join(&relative_path)
+                    } else {
+                        relative_path
+                    };
 
-                match state.tabs.open_file(&absolute_path) {
-                    Ok(()) => {
-                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
-                        state.focused_panel = PanelId::Editor;
-                        state.update_status_cache();
-                        // Notificar LSP del nuevo archivo abierto
-                        if state.lsp.has_server() {
-                            let text = buffer_full_text(state.tabs.active());
-                            if let Err(e) = state.lsp.notify_open(&absolute_path, &text) {
-                                tracing::warn!(error = %e, "error en LSP did_open");
+                    match state.tabs.open_file(&absolute_path) {
+                        Ok(()) => {
+                            state.tabs.active_mut().init_highlighting(&state.highlight_engine);
+                            state.focused_panel = PanelId::Editor;
+                            state.update_status_cache();
+                            // Notificar LSP del nuevo archivo abierto
+                            if state.lsp.has_server() {
+                                let text = buffer_full_text(state.tabs.active());
+                                if let Err(e) = state.lsp.notify_open(&absolute_path, &text) {
+                                    tracing::warn!(error = %e, "error en LSP did_open");
+                                }
                             }
+                            tracing::info!(path = %absolute_path.display(), "archivo abierto desde quick open");
                         }
-                        tracing::info!(path = %absolute_path.display(), "archivo abierto desde quick open");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "error al abrir archivo desde quick open");
+                        Err(e) => {
+                            tracing::error!(error = %e, "error al abrir archivo desde quick open");
+                        }
                     }
                 }
             }

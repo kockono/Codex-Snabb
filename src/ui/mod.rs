@@ -286,7 +286,11 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     } else if state.branch_picker.visible {
         branch_picker::render_branch_picker(f, &layout, &state.branch_picker, theme);
     } else if state.quick_open.visible {
-        quick_open::render_quick_open(f, &layout, &state.quick_open, theme);
+        let active_file_name = state.tabs.active().buffer.file_path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("[sin archivo]");
+        quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name);
     } else if state.palette.visible {
         palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
     }
