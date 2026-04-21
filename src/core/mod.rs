@@ -204,6 +204,14 @@ pub enum Action {
         /// Fila donde ocurrió el scroll.
         row: u16,
     },
+    /// Click del botón del medio del mouse (rueda) en posición absoluta de terminal.
+    /// Se usa para cerrar la tab sobre la que se hace click — igual que los browsers.
+    MouseMiddleClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
+        row: u16,
+    },
     /// Drag del mouse (botón izquierdo presionado + movimiento).
     /// Se usa para selección de texto arrastrando el mouse.
     MouseDrag {

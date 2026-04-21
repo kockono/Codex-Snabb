@@ -441,6 +441,56 @@ fn resolve_tab_click(state: &mut AppState, col: u16, inner_x: u16) {
     }
 }
 
+// ─── Mouse middle click ────────────────────────────────────────────────────────
+
+/// Procesa click del botón del medio — cierra la tab sobre la que se hizo click.
+///
+/// Solo actúa si el click cae en la tab bar del editor area (primera fila del inner).
+/// Idéntico al comportamiento de browsers y VS Code: middle click = cerrar tab.
+/// Si no hay tab en esa posición, no hace nada.
+pub(super) fn reduce_mouse_middle_click(state: &mut AppState, col: u16, row: u16) {
+    let Some(layout) = state.last_layout else {
+        return;
+    };
+
+    // Solo actuar si el click cayó en el editor area
+    if !layout
+        .editor_area
+        .contains(ratatui::layout::Position { x: col, y: row })
+    {
+        return;
+    }
+
+    // Tab bar = primera fila del inner area (descontar borde superior)
+    let tab_bar_row = layout.editor_area.y + 1;
+    if row != tab_bar_row {
+        return; // Click fuera de la tab bar — ignorar
+    }
+
+    let inner_x = layout.editor_area.x + 1;
+    let tab_infos = state.tabs.tab_info();
+    let click_col = col.saturating_sub(inner_x) as usize;
+
+    // Mismo cálculo de anchos que resolve_tab_click y render_tab_bar
+    let mut accumulated: usize = 0;
+    for (i, tab) in tab_infos.iter().enumerate() {
+        let icon = crate::ui::icons::file_icon(&tab.name);
+        let has_indicator = tab.is_dirty || tab.is_active;
+        let indicator_len: usize = if has_indicator { 2 } else { 0 };
+        let tab_width = 2 + icon.len() + 1 + tab.name.len() + indicator_len + 1;
+
+        if click_col >= accumulated && click_col < accumulated + tab_width {
+            // Cambiar a la tab clickeada y cerrarla
+            state.tabs.switch_to(i);
+            state.tabs.close_active();
+            state.update_status_cache();
+            tracing::debug!(tab = i, "tab cerrada via middle click");
+            return;
+        }
+        accumulated += tab_width;
+    }
+}
+
 // ─── Mouse drag ────────────────────────────────────────────────────────────────
 
 /// Procesa drag del mouse — selección de texto arrastrando.

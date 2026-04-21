@@ -48,6 +48,10 @@ pub(super) fn keymap(
                 col: mouse.column,
                 row: mouse.row,
             },
+            MouseEventKind::Down(MouseButton::Middle) => Action::MouseMiddleClick {
+                col: mouse.column,
+                row: mouse.row,
+            },
             MouseEventKind::ScrollUp => Action::MouseScrollUp {
                 col: mouse.column,
                 row: mouse.row,
