@@ -215,6 +215,9 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                 PanelId::Editor => {
                     reduce_mouse_click_editor(state, &layout, col, row);
                 }
+                PanelId::Projects => {
+                    reduce_mouse_click_projects(state, &layout, row);
+                }
                 // Terminal y otros: solo cambio de foco por ahora
                 _ => {}
             }
@@ -491,6 +494,70 @@ pub(super) fn reduce_mouse_middle_click(state: &mut AppState, col: u16, row: u16
             return;
         }
         accumulated += tab_width;
+    }
+}
+
+// ─── Projects panel click ──────────────────────────────────────────────────────
+
+/// Procesa click en el panel de proyectos.
+///
+/// Layout interno del panel (dentro del borde):
+///   - Fila 0: `[+] Nuevo proyecto`  → abre folder picker
+///   - Fila 1: separador             → ignorar
+///   - Filas 2+: lista de proyectos  → seleccionar + abrir
+fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, row: u16) {
+    // inner_y = sidebar.y + 1 (borde superior del Block)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // click en borde
+    }
+
+    let visual_row = (row - inner_y) as usize;
+
+    match visual_row {
+        0 => {
+            // Click en [+] Nuevo proyecto → abrir folder picker
+            // Arrancar desde home del usuario o directorio actual
+            let start = home_dir()
+                .or_else(|| state.explorer.as_ref().map(|e| e.root.clone()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            state.folder_picker.open(start);
+            tracing::debug!("projects: folder picker abierto via mouse click");
+        }
+        1 => { /* separador — ignorar */ }
+        visual => {
+            // Click en la lista de proyectos (visual 2+ → índice visual - 2)
+            let list_row = visual - 2;
+            let idx = state.projects.scroll_offset + list_row;
+            if idx >= state.projects.projects.len() {
+                return;
+            }
+            if state.projects.selected == idx {
+                // Segundo click en el mismo proyecto → abrir
+                let effects = super::reduce(state, &crate::core::Action::ProjectsOpen);
+                super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+            } else {
+                // Primer click → solo seleccionar
+                state.projects.selected = idx;
+            }
+        }
+    }
+}
+
+/// Retorna el directorio home del usuario según el sistema operativo.
+fn home_dir() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE")
+            .or_else(|_| {
+                std::env::var("HOMEDRIVE")
+                    .and_then(|d| std::env::var("HOMEPATH").map(|p| format!("{d}{p}")))
+            })
+            .ok()
+            .map(std::path::PathBuf::from)
+    } else {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
     }
 }
 

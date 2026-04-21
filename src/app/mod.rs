@@ -1303,12 +1303,23 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
 
         // ── Projects panel ──
         Action::ProjectsAddNew => {
-            // Abrir folder picker desde el directorio actual o home
-            let start = state
-                .explorer
-                .as_ref()
-                .map(|e| e.root.clone()) // CLONE: necesario — se mueve al folder_picker
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // Arrancar desde home del usuario → experiencia natural como file dialog
+            let start = {
+                // Windows: USERPROFILE, Linux/Mac: HOME
+                let home = if cfg!(windows) {
+                    std::env::var("USERPROFILE")
+                        .or_else(|_| std::env::var("HOMEDRIVE").and_then(|d| {
+                            std::env::var("HOMEPATH").map(|p| format!("{d}{p}"))
+                        }))
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                } else {
+                    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+                };
+                home
+                    .or_else(|| state.explorer.as_ref().map(|e| e.root.clone())) // CLONE: fallback al workspace actual
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            };
             state.folder_picker.open(start);
             tracing::debug!("projects: folder picker abierto");
             vec![]
