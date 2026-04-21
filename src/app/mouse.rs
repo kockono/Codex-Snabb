@@ -84,8 +84,76 @@ pub(super) fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<H
 
 // ─── Mouse click ───────────────────────────────────────────────────────────────
 
+/// Procesa un right-click de mouse — abre context menu si es en el explorer.
+pub(super) fn reduce_mouse_right_click(state: &mut AppState, col: u16, row: u16) {
+    let Some(layout) = state.last_layout else {
+        return; // Sin layout aún — primer frame
+    };
+
+    let Some(hit) = hit_test_panel(&layout, col, row) else {
+        return; // Click en zona no interactiva
+    };
+
+    // Redirigir correctamente igual que en reduce_mouse_click
+    let panel = match hit {
+        HitTestResult::Panel(p) => {
+            if p == PanelId::Explorer && state.search.visible {
+                PanelId::Search
+            } else if p == PanelId::Explorer && state.git.visible {
+                PanelId::Git
+            } else if p == PanelId::Explorer && state.projects.visible {
+                PanelId::Projects
+            } else {
+                p
+            }
+        }
+        HitTestResult::ActivityBar { .. } => return, // No context menu en activity bar
+    };
+
+    if panel == PanelId::Explorer {
+        // Resolver qué archivo está en la fila clickeada
+        if let Some(path) = get_explorer_path_at_row(state, &layout, row) {
+            state.context_menu.open(col, row, path);
+            tracing::debug!(col, row, "context menu abierto via right-click");
+        }
+    }
+}
+
+/// Retorna el path del archivo/directorio en la fila visual del explorer.
+///
+/// Extrae la lógica de resolución de fila → path del `reduce_mouse_click_explorer`
+/// para reusar en el right-click handler sin duplicar código.
+fn get_explorer_path_at_row(
+    state: &AppState,
+    layout: &IdeLayout,
+    row: u16,
+) -> Option<std::path::PathBuf> {
+    let explorer = state.explorer.as_ref()?;
+
+    // Calcular el inner area de la sidebar (misma lógica que reduce_mouse_click_explorer)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return None; // Click en el borde del panel
+    }
+
+    let visual_row = (row - inner_y) as usize;
+    let flat_index = explorer.scroll_offset + visual_row;
+
+    let flat = explorer.flatten();
+    // CLONE: necesario — el path se retorna como owned, el Vec se destruye al salir
+    flat.get(flat_index).map(|e| e.path.clone())
+}
+
 /// Procesa un click de mouse — resuelve panel, cambia foco, ejecuta acción contextual.
 pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
+    // Si el context menu está visible, cerrarlo al hacer left-click
+    // El click se sigue procesando normalmente después de cerrar el menú.
+    if state.context_menu.visible {
+        state.context_menu.close();
+    }
+
     let Some(layout) = state.last_layout else {
         return; // Sin layout aún — primer frame
     };
@@ -209,6 +277,10 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                     // Click en search panel — resolver qué flat item fue clickeado
                     reduce_mouse_click_search(state, &layout, row);
                 }
+                PanelId::Git => {
+                    // Click en git panel — input row, button row o file list
+                    reduce_mouse_click_git(state, &layout, row);
+                }
                 PanelId::Explorer => {
                     reduce_mouse_click_explorer(state, &layout, row);
                 }
@@ -321,6 +393,69 @@ fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16)
         crate::search::FlatSearchItem::MatchLine { match_index, .. } => {
             state.search.selected_match = match_index;
             super::navigate_to_search_match(state);
+        }
+    }
+}
+
+/// Procesa click en el git panel — foco en input, trigger commit, o selección de archivo.
+///
+/// Layout interno del panel (dentro del borde):
+///   - Fila 0: branch name           → ignorar (solo informativo)
+///   - Fila 1: commit input row      → activar commit_mode (dar foco al input)
+///   - Fila 2: commit button row     → ejecutar commit si commit_input no está vacío
+///   - Fila 3: separador             → ignorar
+///   - Filas 4+: lista de archivos   → seleccionar archivo (future: stage toggle)
+fn reduce_mouse_click_git(state: &mut AppState, layout: &IdeLayout, row: u16) {
+    // inner_y = sidebar.y + 1 (borde superior del Block + título ocupa 1 fila)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // click en borde
+    }
+
+    let visual_row = (row - inner_y) as usize;
+
+    match visual_row {
+        0 => {
+            // Branch line — ignorar (no interactivo)
+        }
+        1 => {
+            // Commit input row — dar foco (activar commit_mode)
+            state.git.commit_mode = true;
+            tracing::debug!("git panel: foco en commit input via mouse click");
+        }
+        2 => {
+            // Commit button row — ejecutar commit si hay mensaje
+            if !state.git.commit_input.trim().is_empty() {
+                let root = get_workspace_root(state);
+                match state.git.commit(&root) {
+                    Ok(()) => {
+                        tracing::info!("git panel: commit via mouse click en botón ✓ Commit");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "git panel: error al hacer commit via mouse");
+                    }
+                }
+            } else {
+                // Sin mensaje: dar foco al input para que el usuario escriba
+                state.git.commit_mode = true;
+                tracing::debug!("git panel: click en botón Commit sin mensaje → foco en input");
+            }
+        }
+        3 => {
+            // Separador — ignorar
+        }
+        visual => {
+            // Lista de archivos — seleccionar (visual 4+ → índice = visual - 4 + scroll)
+            let list_row = visual - 4;
+            // El scroll_offset gestiona el viewport de la lista.
+            // No stage/toggle por click aquí: el usuario usa Enter/'s' con teclado.
+            let idx = state.git.scroll_offset + list_row;
+            if idx < state.git.files.len() {
+                state.git.selected_index = idx;
+                tracing::debug!(idx, "git panel: archivo seleccionado via mouse click");
+            }
         }
     }
 }

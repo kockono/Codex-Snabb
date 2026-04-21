@@ -36,12 +36,14 @@ use crate::lsp::LspState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::search::SearchState;
 use crate::terminal::TerminalState;
+use crate::ui::context_menu::ContextMenuState;
 use crate::ui::layout::IdeLayout;
 use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
 use crate::workspace::ExplorerState;
 use crate::workspace::QuickOpenState;
 use crate::workspace::quick_open::GoToLineState;
+use crate::workspace::save_as::SaveAsState;
 
 // ─── Loading Progress ──────────────────────────────────────────────────────────
 
@@ -118,6 +120,10 @@ pub struct AppState {
     pub projects: crate::workspace::projects::ProjectsState,
     /// Folder picker modal para selección de carpeta.
     pub folder_picker: crate::workspace::folder_picker::FolderPickerState,
+    /// Modal "Guardar como" para buffers sin path asociado (untitled).
+    pub save_as: SaveAsState,
+    /// Context menu flotante del explorer (aparece al hacer right-click).
+    pub context_menu: ContextMenuState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
     /// Evita allocaciones dentro del render — se computan antes.
     pub status_line: String,
@@ -177,6 +183,8 @@ impl AppState {
                 ps
             },
             folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
+            save_as: SaveAsState::new(),
+            context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file: String::from("[no file]"),
             status_pct: String::from("0%"),
@@ -231,6 +239,8 @@ impl AppState {
                 ps
             },
             folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
+            save_as: SaveAsState::new(),
+            context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file,
             status_pct: String::from("0%"),
@@ -416,14 +426,22 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::SaveFile => {
-            match state.tabs.active_mut().save() {
-                Ok(()) => {
-                    tracing::info!("archivo guardado");
-                    state.update_status_cache();
+            let has_path = state.tabs.active().buffer.file_path().is_some();
+            if has_path {
+                match state.tabs.active_mut().save() {
+                    Ok(()) => {
+                        tracing::info!("archivo guardado");
+                        state.update_status_cache();
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error al guardar archivo");
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "error al guardar archivo");
-                }
+            } else {
+                // Buffer sin path (untitled) → abrir modal Save As con workspace root
+                let root = state.explorer.as_ref().map(|e| e.root.as_path());
+                state.save_as.open(root);
+                tracing::debug!("save as: modal abierto para buffer untitled");
             }
             vec![]
         }
@@ -570,6 +588,10 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::MouseMiddleClick { col, row } => {
             reduce_mouse_middle_click(state, *col, *row);
+            vec![]
+        }
+        Action::MouseRightClick { col, row } => {
+            reduce_mouse_right_click(state, *col, *row);
             vec![]
         }
 
@@ -970,9 +992,11 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::GitStartCommit => {
+            // Activar foco en el input de commit (commit_mode = true).
+            // El texto NO se limpia — el input siempre visible retiene su contenido.
+            // Si el usuario quiere un commit limpio, puede borrar manualmente con Backspace.
             state.git.commit_mode = true;
-            state.git.commit_input.clear();
-            tracing::debug!("modo commit activado");
+            tracing::debug!("modo commit: foco activado");
             vec![]
         }
         Action::GitCommitConfirm => {
@@ -988,9 +1012,11 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::GitCommitCancel => {
+            // Esc quita el foco del input (commit_mode = false) pero MANTIENE el texto.
+            // Esto permite al usuario cancelar el foco sin perder lo que escribió,
+            // igual que VS Code — el input siempre visible retiene su contenido.
             state.git.commit_mode = false;
-            state.git.commit_input.clear();
-            tracing::debug!("modo commit cancelado");
+            tracing::debug!("modo commit: foco quitado (texto conservado)");
             vec![]
         }
         Action::GitCommitInput(ch) => {
@@ -1289,15 +1315,62 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::CloseTab | Action::CloseBuffer => {
-            state.tabs.close_active();
-            state.update_status_cache();
-            tracing::debug!(tabs = state.tabs.tab_count(), "tab cerrada");
+            let active = state.tabs.active();
+            if active.buffer.is_dirty() && active.buffer.file_path().is_none() {
+                // Buffer untitled con cambios sin guardar — preguntar antes de cerrar
+                let root = state.explorer.as_ref().map(|e| e.root.as_path());
+                state.save_as.open(root);
+                tracing::debug!("save as: modal abierto al cerrar buffer untitled dirty");
+            } else {
+                state.tabs.close_active();
+                state.update_status_cache();
+                tracing::debug!(tabs = state.tabs.tab_count(), "tab cerrada");
+            }
             vec![]
         }
         Action::SwitchTab(index) => {
             state.tabs.switch_to(*index);
             state.update_status_cache();
             tracing::debug!(tab = *index, "switch a tab");
+            vec![]
+        }
+
+        // ── Save As modal ──
+        Action::SaveAsOpen => {
+            let root = state.explorer.as_ref().map(|e| e.root.as_path());
+            state.save_as.open(root);
+            tracing::debug!("save as: modal abierto manualmente");
+            vec![]
+        }
+        Action::SaveAsChar(ch) => {
+            state.save_as.push_char(*ch);
+            vec![]
+        }
+        Action::SaveAsBackspace => {
+            state.save_as.backspace();
+            vec![]
+        }
+        Action::SaveAsCancel => {
+            state.save_as.close();
+            tracing::debug!("save as: cancelado por usuario");
+            vec![]
+        }
+        Action::SaveAsConfirm => {
+            if let Some(path) = state.save_as.confirm() {
+                match state.tabs.active_mut().buffer.save_as(&path) {
+                    Ok(()) => {
+                        state.update_status_cache();
+                        // Refrescar explorer para que muestre el archivo recién creado
+                        if let Some(ref mut explorer) = state.explorer {
+                            let _ = explorer.refresh();
+                        }
+                        tracing::info!(path = %path.display(), "archivo guardado como");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error en save_as");
+                    }
+                }
+            }
             vec![]
         }
 
@@ -1460,6 +1533,158 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Context Menu ──
+        Action::ContextMenuOpen { x, y } => {
+            // Obtener el path del entry seleccionado en el explorer
+            if let Some(path) = state
+                .explorer
+                .as_ref()
+                .and_then(|e| e.selected_path())
+            {
+                // Si viene del teclado (x=0, y=0), calcular posición desde layout
+                let (cx, cy) = if *x == 0 && *y == 0 {
+                    if let Some(layout) = state.last_layout {
+                        let explorer = state.explorer.as_ref();
+                        let scroll = explorer.map(|e| e.scroll_offset).unwrap_or(0);
+                        let sel = explorer.map(|e| e.selected_index).unwrap_or(0);
+                        let visual_row = sel.saturating_sub(scroll) as u16;
+                        // inner_y = sidebar.y + 1 (borde) + 1 (header si hay)
+                        let cy = layout.sidebar.y + 1 + visual_row;
+                        let cx = layout.sidebar.x + 1;
+                        (cx, cy)
+                    } else {
+                        (2, 2)
+                    }
+                } else {
+                    (*x, *y)
+                };
+                state.context_menu.open(cx, cy, path);
+                tracing::debug!(cx, cy, "context menu abierto");
+            }
+            vec![]
+        }
+        Action::ContextMenuClose => {
+            state.context_menu.close();
+            tracing::debug!("context menu cerrado");
+            vec![]
+        }
+        Action::ContextMenuUp => {
+            state.context_menu.move_up();
+            vec![]
+        }
+        Action::ContextMenuDown => {
+            state.context_menu.move_down();
+            vec![]
+        }
+        Action::ContextMenuConfirm => {
+            if let Some(item) = state.context_menu.selected_item() {
+                // CLONE: necesario — path debe ser owned antes de cerrar el menú
+                let path = state.context_menu.target_path.clone();
+                state.context_menu.close();
+                if let Some(path) = path {
+                    use crate::ui::context_menu::ContextMenuItem;
+                    match item {
+                        ContextMenuItem::Delete => {
+                            if path.is_dir() {
+                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                    tracing::error!(error = %e, path = %path.display(), "error al eliminar directorio");
+                                } else {
+                                    tracing::info!(path = %path.display(), "directorio eliminado via context menu");
+                                }
+                            } else if let Err(e) = std::fs::remove_file(&path) {
+                                tracing::error!(error = %e, path = %path.display(), "error al eliminar archivo");
+                            } else {
+                                tracing::info!(path = %path.display(), "archivo eliminado via context menu");
+                            }
+                            // Refrescar explorer para reflejar el cambio
+                            if let Some(ref mut explorer) = state.explorer
+                                && let Err(e) = explorer.refresh()
+                            {
+                                tracing::error!(error = %e, "error al refrescar explorer después de delete");
+                            }
+                        }
+                        ContextMenuItem::CopyPath => {
+                            // Clipboard no implementado — loggear el path como referencia
+                            tracing::info!(path = %path.display(), "copy path (clipboard no impl)");
+                        }
+                        ContextMenuItem::CopyRelativePath => {
+                            let rel = state
+                                .explorer
+                                .as_ref()
+                                .and_then(|e| path.strip_prefix(&e.root).ok())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            tracing::info!(path = %rel, "copy relative path (clipboard no impl)");
+                        }
+                        ContextMenuItem::RevealInExplorer => {
+                            let dir = if path.is_dir() {
+                                // CLONE: necesario — path se usa luego si is_dir falla
+                                path.clone()
+                            } else {
+                                path.parent()
+                                    .map(|p| p.to_path_buf())
+                                    // CLONE: fallback al path completo si no hay parent
+                                    .unwrap_or_else(|| path.clone())
+                            };
+                            // CRÍTICO: stdin/stdout/stderr en Null para que el proceso
+                            // hijo NO herede los handles del terminal. Sin esto,
+                            // explorer.exe / open / xdg-open toman control del
+                            // terminal y rompen crossterm (raw mode, alternate screen).
+                            #[cfg(windows)]
+                            {
+                                use std::process::Stdio;
+                                if let Err(e) = std::process::Command::new("explorer")
+                                    .arg(&dir)
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .spawn()
+                                {
+                                    tracing::error!(error = %e, "error al abrir explorer de Windows");
+                                }
+                            }
+                            #[cfg(target_os = "macos")]
+                            {
+                                use std::process::Stdio;
+                                if let Err(e) = std::process::Command::new("open")
+                                    .arg(&dir)
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .spawn()
+                                {
+                                    tracing::error!(error = %e, "error al abrir Finder");
+                                }
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                use std::process::Stdio;
+                                if let Err(e) = std::process::Command::new("xdg-open")
+                                    .arg(&dir)
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .spawn()
+                                {
+                                    tracing::error!(error = %e, "error al abrir file manager");
+                                }
+                            }
+                            tracing::info!(path = %dir.display(), "reveal in file explorer");
+                        }
+                        ContextMenuItem::Copy => {
+                            // Copia de archivo al clipboard — no implementado aún
+                            tracing::info!(path = %path.display(), "copy file (no impl)");
+                        }
+                        ContextMenuItem::Rename => {
+                            // Rename — no implementado aún (requiere input modal)
+                            tracing::info!(path = %path.display(), "rename (no impl aún)");
+                        }
+                    }
+                }
+            }
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
         | Action::FocusPanel(_)
@@ -1528,7 +1753,7 @@ fn navigate_to_search_match(state: &mut AppState) {
 }
 
 mod mouse;
-use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_middle_click, reduce_mouse_scroll, ScrollDirection};
+use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_middle_click, reduce_mouse_right_click, reduce_mouse_scroll, ScrollDirection};
 
 // ─── Process Effects ───────────────────────────────────────────────────────────
 
@@ -1774,6 +1999,8 @@ async fn event_loop(
                     state.folder_picker.path_input_focused,
                     state.projects.selected,
                     state.projects.path_input_focused,
+                    state.save_as.visible,
+                    state.context_menu.visible,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -1799,6 +2026,8 @@ async fn event_loop(
                 state.folder_picker.tick_error();
                 // Tick del error efímero del path input inline de proyectos
                 state.projects.path_input_tick();
+                // Tick del error efímero del modal save as
+                state.save_as.tick_error();
             }
             Some(Event::Input(_)) => {
                 // Cualquier input del usuario: cursor visible, reset counter

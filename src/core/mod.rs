@@ -93,6 +93,19 @@ pub enum Action {
     /// Cerrar el buffer activo.
     CloseBuffer,
 
+    // ── Save As modal ──
+    /// Abrir el modal "Guardar como" (buffer sin path asociado).
+    #[expect(dead_code, reason = "disponible para keybinding futuro — se dispara via SaveFile en buffers untitled")]
+    SaveAsOpen,
+    /// Escribir un carácter en el input de path del modal Save As.
+    SaveAsChar(char),
+    /// Borrar el último carácter del input de path del modal Save As.
+    SaveAsBackspace,
+    /// Confirmar el path y guardar el buffer.
+    SaveAsConfirm,
+    /// Cancelar el modal Save As sin guardar.
+    SaveAsCancel,
+
     // ── Tabs ──
     /// Ir a la pestaña siguiente (Ctrl+Tab).
     NextTab,
@@ -218,6 +231,14 @@ pub enum Action {
         /// Columna actual del drag (0-indexed, coordenada de terminal).
         col: u16,
         /// Fila actual del drag (0-indexed, coordenada de terminal).
+        row: u16,
+    },
+    /// Right-click del mouse en posición absoluta de terminal.
+    /// Abre el context menu del panel bajo el cursor.
+    MouseRightClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
         row: u16,
     },
 
@@ -389,6 +410,24 @@ pub enum Action {
     ProjectsMoveDown,
     /// Activar/abrir el proyecto seleccionado (switch workspace).
     ProjectsOpen,
+
+    // ── Context menu (menú contextual del explorer) ──
+    /// Abrir context menu en posición (x, y) para el path del explorer seleccionado.
+    /// Se dispara via MouseRightClick — no hay keybinding directo.
+    ContextMenuOpen {
+        /// Columna de terminal donde aparece el menú.
+        x: u16,
+        /// Fila de terminal donde aparece el menú.
+        y: u16,
+    },
+    /// Cerrar el context menu.
+    ContextMenuClose,
+    /// Mover selección arriba en el context menu.
+    ContextMenuUp,
+    /// Mover selección abajo en el context menu.
+    ContextMenuDown,
+    /// Confirmar el item seleccionado en el context menu.
+    ContextMenuConfirm,
 
     // ── Folder picker (modal de selección de carpeta) ──
     /// Navegar arriba en el folder picker.

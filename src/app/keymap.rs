@@ -44,6 +44,8 @@ pub(super) fn keymap(
     folder_picker_path_focused: bool,
     projects_selected: usize,
     projects_path_input_focused: bool,
+    save_as_visible: bool,
+    context_menu_visible: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -53,6 +55,10 @@ pub(super) fn keymap(
                 row: mouse.row,
             },
             MouseEventKind::Down(MouseButton::Middle) => Action::MouseMiddleClick {
+                col: mouse.column,
+                row: mouse.row,
+            },
+            MouseEventKind::Down(MouseButton::Right) => Action::MouseRightClick {
                 col: mouse.column,
                 row: mouse.row,
             },
@@ -77,6 +83,30 @@ pub(super) fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Context menu visible: prioridad máxima (antes de todos los overlays) ──
+    if context_menu_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::ContextMenuClose,
+            (KeyCode::Up | KeyCode::Char('k'), _) => Action::ContextMenuUp,
+            (KeyCode::Down | KeyCode::Char('j'), _) => Action::ContextMenuDown,
+            (KeyCode::Enter, _) => Action::ContextMenuConfirm,
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Save As modal visible: prioridad máxima (modal) ──
+    if save_as_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::SaveAsCancel,
+            (KeyCode::Enter, _) => Action::SaveAsConfirm,
+            (KeyCode::Backspace, _) => Action::SaveAsBackspace,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::SaveAsChar(ch)
+            }
+            _ => Action::Noop,
+        };
     }
 
     // ── Projects path input enfocado: captura chars antes de atajos globales ──
@@ -286,6 +316,12 @@ pub(super) fn keymap(
 
     // ── Git panel activo: captura input cuando foco en Git ──
     if git_state.visible && focused_panel == PanelId::Git {
+        // Ctrl+Enter siempre confirma el commit (independiente del modo).
+        // Se verifica primero para que funcione tanto en commit_mode como en modo normal.
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::GitCommitConfirm;
+        }
+
         // Modo commit: capturar chars para el mensaje
         if git_state.commit_mode {
             return match (key.code, key.modifiers) {
@@ -314,6 +350,7 @@ pub(super) fn keymap(
         }
 
         // Modo normal: navegación de lista de archivos
+        // 'c' ahora activa el modo commit (foco en el input — commit_mode = true)
         return match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Action::GitClose,
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitUp,
@@ -461,6 +498,11 @@ pub(super) fn keymap(
             (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => Action::ExplorerCollapse,
             // Refresh
             (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ExplorerRefresh,
+            // Context menu — alternativa al right-click para Windows Terminal
+            // que intercepta el right-click antes de que llegue a la app
+            (KeyCode::Char('m'), KeyModifiers::NONE) | (KeyCode::F(10), KeyModifiers::SHIFT) => {
+                Action::ContextMenuOpen { x: 0, y: 0 }
+            }
 
             _ => Action::Noop,
         },
@@ -531,6 +573,8 @@ mod tests {
             false, // folder_picker_path_focused
             0,     // projects_selected
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -556,6 +600,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -584,6 +630,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -609,6 +657,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -634,6 +684,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -659,6 +711,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -684,6 +738,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -711,6 +767,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -736,6 +794,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -761,6 +821,8 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -786,7 +848,90 @@ mod tests {
             false,
             0,
             false, // projects_path_input_focused
+            false, // save_as_visible
+            false, // context_menu_visible
         );
         assert_eq!(action, Action::GoToLineClose);
+    }
+
+    #[test]
+    fn esc_in_save_as_modal_returns_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            true,  // save_as_visible
+            false, // context_menu_visible
+        );
+        assert_eq!(action, Action::SaveAsCancel);
+    }
+
+    #[test]
+    fn enter_in_save_as_modal_returns_confirm() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            true,  // save_as_visible
+            false, // context_menu_visible
+        );
+        assert_eq!(action, Action::SaveAsConfirm);
+    }
+
+    #[test]
+    fn char_in_save_as_modal_returns_save_as_char() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            true,  // save_as_visible
+            false, // context_menu_visible
+        );
+        assert_eq!(action, Action::SaveAsChar('a'));
     }
 }

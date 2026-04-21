@@ -6,6 +6,7 @@
 //! y dibujan. Nada de IO ni cómputo pesado en render.
 
 pub mod branch_picker;
+pub mod context_menu;
 pub mod git_panel;
 pub mod go_to_line;
 pub mod icons;
@@ -14,6 +15,7 @@ pub mod palette;
 pub mod panels;
 pub mod projects_panel;
 pub mod quick_open;
+pub mod save_as_modal;
 pub mod search_panel;
 pub mod settings_panel;
 pub mod theme;
@@ -120,7 +122,14 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             );
         } else if state.git.visible {
             // Git activo: renderizar panel de git en la sidebar
-            git_panel::render_git_panel(f, layout.sidebar, &state.git, theme, sidebar_focused);
+            git_panel::render_git_panel(
+                f,
+                layout.sidebar,
+                &state.git,
+                theme,
+                sidebar_focused,
+                state.cursor_visible,
+            );
         } else if state.projects.visible {
             // Proyectos activo: renderizar panel de proyectos en la sidebar
             projects_panel::render_projects_panel(
@@ -181,6 +190,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.branch_picker.visible
         && !state.keybindings.visible
         && !state.folder_picker.visible
+        && !state.save_as.visible
     {
         // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
         let inner_x = layout.editor_area.x + 1;
@@ -272,6 +282,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.branch_picker.visible
         && !state.keybindings.visible
         && !state.folder_picker.visible
+        && !state.save_as.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -296,6 +307,17 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         projects_panel::render_folder_picker(f, &layout, theme, &state.folder_picker);
     }
 
+    // ── Save As modal ──
+    if state.save_as.visible {
+        save_as_modal::render_save_as_modal(
+            f,
+            &layout,
+            &state.save_as,
+            theme,
+            state.cursor_visible,
+        );
+    }
+
     // ── Overlays ──
     // Prioridad: Go to Line > Settings > Branch picker > Quick open > Palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
@@ -317,6 +339,12 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name, state.cursor_visible);
     } else if state.palette.visible {
         palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
+    }
+
+    // ── Context menu (z-order máximo — tapa todo) ──
+    // Se renderiza DESPUÉS de todos los overlays para aparecer encima de cualquier cosa.
+    if state.context_menu.visible {
+        context_menu::render_context_menu(f, area, &state.context_menu, theme);
     }
 }
 
