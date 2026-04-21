@@ -43,6 +43,32 @@ use crate::workspace::ExplorerState;
 use crate::workspace::QuickOpenState;
 use crate::workspace::quick_open::GoToLineState;
 
+// ─── Loading Progress ──────────────────────────────────────────────────────────
+
+/// Progreso de inicialización para la loading screen.
+///
+/// Cada paso se completa secuencialmente y actualiza `progress: 0.0..=1.0`.
+/// Los strings de paso son `&'static str` — cero allocaciones.
+#[derive(Debug)]
+pub struct LoadingProgress {
+    /// Paso actual siendo procesado.
+    pub step: &'static str,
+    /// Progreso 0.0 a 1.0.
+    pub progress: f32,
+    /// Si la inicialización terminó.
+    pub done: bool,
+}
+
+impl LoadingProgress {
+    pub fn new() -> Self {
+        Self {
+            step: "Iniciando sistemas...",
+            progress: 0.0,
+            done: false,
+        }
+    }
+}
+
 // ─── AppState ──────────────────────────────────────────────────────────────────
 
 /// Estado central de la aplicación.
@@ -113,33 +139,12 @@ pub struct AppState {
 impl AppState {
     /// Crea un nuevo estado con valores por defecto y editor vacío.
     ///
-    /// Intenta inicializar el explorer con el directorio de trabajo actual.
-    /// Si falla, el explorer queda como `None` — la app funciona sin él.
+    /// Solo inicializa partes rápidas (structs vacíos, registros).
+    /// Las operaciones lentas (explorer, quick_open, git) se difieren
+    /// a la loading phase en `event_loop()` para mostrar progreso.
     fn new(config: AppConfig) -> Self {
-        let cwd = std::env::current_dir().ok();
-
-        let explorer = cwd.as_deref().and_then(|cwd| {
-            ExplorerState::new(cwd)
-                .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
-                .ok()
-        });
-
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
-
-        // Construir índice de quick open desde el workspace root
-        let mut quick_open = QuickOpenState::new();
-        if let Some(ref root) = cwd
-            && let Err(e) = quick_open.build_index(root)
-        {
-            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
-        }
-
-        // Inicializar git state — verificar si es repo y refrescar
-        let mut git = GitState::new();
-        if let Some(ref cwd) = cwd {
-            git.refresh(cwd);
-        }
 
         Self {
             running: true,
@@ -149,14 +154,14 @@ impl AppState {
             sidebar_visible: true,
             bottom_panel_visible: true,
             tabs: TabState::new(),
-            explorer,
+            explorer: None,
             commands,
             palette: PaletteState::new(),
-            quick_open,
+            quick_open: QuickOpenState::new(),
             go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
-            git,
+            git: GitState::new(),
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
@@ -172,8 +177,9 @@ impl AppState {
 
     /// Crea un nuevo estado con un archivo abierto.
     ///
-    /// El explorer se inicializa con el directorio del archivo si tiene
-    /// uno, o con el directorio de trabajo actual como fallback.
+    /// Solo abre el archivo (rápido) e inicializa structs vacíos.
+    /// Las operaciones lentas (explorer, quick_open, git) se difieren
+    /// a la loading phase en `event_loop()` para mostrar progreso.
     fn with_file(config: AppConfig, path: &std::path::Path) -> Result<Self> {
         let highlight_engine = HighlightEngine::new();
         let mut editor = EditorState::open_file(path)?;
@@ -184,34 +190,8 @@ impl AppState {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("[no file]"));
 
-        // Derivar directorio para el explorer: padre del archivo o cwd
-        let explorer_root = path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok());
-
-        let explorer = explorer_root.as_deref().and_then(|root| {
-            ExplorerState::new(root)
-                .map_err(|e| tracing::warn!(error = %e, "no se pudo inicializar explorer"))
-                .ok()
-        });
-
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
-
-        // Construir índice de quick open desde el workspace root
-        let mut quick_open = QuickOpenState::new();
-        if let Some(ref root) = explorer_root
-            && let Err(e) = quick_open.build_index(root)
-        {
-            tracing::warn!(error = %e, "no se pudo construir índice de quick open");
-        }
-
-        // Inicializar git state desde el directorio del explorer
-        let mut git = GitState::new();
-        if let Some(ref root) = explorer_root {
-            git.refresh(root);
-        }
 
         Ok(Self {
             running: true,
@@ -221,14 +201,14 @@ impl AppState {
             sidebar_visible: true,
             bottom_panel_visible: true,
             tabs,
-            explorer,
+            explorer: None,
             commands,
             palette: PaletteState::new(),
-            quick_open,
+            quick_open: QuickOpenState::new(),
             go_to_line: GoToLineState::new(),
             search: SearchState::new(),
             terminal: TerminalState::new(),
-            git,
+            git: GitState::new(),
             branch_picker: BranchPicker::new(),
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
@@ -446,7 +426,16 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                             if let Some(path) = explorer.selected_path() {
                                 match state.tabs.open_file(&path) {
                                     Ok(()) => {
-                                        state.tabs.active_mut().init_highlighting(&state.highlight_engine);
+                                        // init_highlighting se llama solo si el cache
+                                        // no tiene syntax asignada (archivo recién abierto).
+                                        // Si ya tiene syntax (tab existente), no tocar el cache.
+                                        {
+                                            let engine = &state.highlight_engine;
+                                            let editor = state.tabs.active_mut();
+                                            if !editor.highlight_cache.has_syntax() {
+                                                editor.init_highlighting(engine);
+                                            }
+                                        }
                                         state.focused_panel = PanelId::Editor;
                                         state.update_status_cache();
                                         // Notificar LSP del nuevo archivo abierto
@@ -553,6 +542,10 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::MouseDrag { col, row } => {
             reduce_mouse_drag(state, *col, *row);
+            vec![]
+        }
+        Action::MouseMiddleClick { col, row } => {
+            reduce_mouse_middle_click(state, *col, *row);
             vec![]
         }
 
@@ -1329,7 +1322,7 @@ fn navigate_to_search_match(state: &mut AppState) {
 }
 
 mod mouse;
-use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_scroll, ScrollDirection};
+use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_middle_click, reduce_mouse_scroll, ScrollDirection};
 
 // ─── Process Effects ───────────────────────────────────────────────────────────
 
@@ -1415,6 +1408,139 @@ async fn event_loop(
 
     let tick_duration = Duration::from_millis(state.config.tick_rate_ms);
 
+    // ── Loading phase: inicialización diferida con pantalla de progreso ──
+    //
+    // Las operaciones lentas (explorer, quick_open, git, highlight) se
+    // ejecutan paso a paso, renderizando la loading screen entre cada
+    // paso para mostrar progreso al usuario.
+    //
+    // thread::sleep(16ms) es aceptable acá: estamos en la fase de startup
+    // ANTES del event loop principal. No afecta latencia de input.
+    {
+        let loading_start = std::time::Instant::now();
+        let mut loading = LoadingProgress::new();
+
+        // Track de pasos completados
+        let mut step_explorer_done = false;
+        let mut step_quickopen_done = false;
+        let mut step_git_done = false;
+        let step_highlight_done = false;
+
+        // Derivar root para inicialización: padre del archivo o cwd
+        let init_root: Option<std::path::PathBuf> = match &file {
+            Some(p) => p.parent()
+                .map(|parent| parent.to_path_buf())
+                .or_else(|| std::env::current_dir().ok()),
+            None => std::env::current_dir().ok(),
+        };
+
+        loop {
+            // Renderizar loading screen PRIMERO (usuario ve progreso)
+            terminal.draw(|frame| {
+                ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+            }).context("error en render de loading")?;
+
+            // Un paso de inicialización por iteración
+            if !step_explorer_done {
+                loading.step = "Escaneando archivos del workspace...";
+                loading.progress = 0.1;
+                if let Some(ref root) = init_root {
+                    state.explorer = ExplorerState::new(root)
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "no se pudo inicializar explorer");
+                            e
+                        })
+                        .ok();
+                }
+                step_explorer_done = true;
+                continue; // render siguiente frame con progreso actualizado
+            }
+
+            if !step_quickopen_done {
+                loading.step = "Indexando workspace para Quick Open...";
+                loading.progress = 0.3;
+                if let Some(ref root) = init_root
+                    && let Err(e) = state.quick_open.build_index(root)
+                {
+                    tracing::warn!(error = %e, "no se pudo construir índice de quick open");
+                }
+                step_quickopen_done = true;
+                continue;
+            }
+
+            if !step_git_done {
+                loading.step = "Leyendo estado de Git...";
+                loading.progress = 0.5;
+                if let Some(ref root) = init_root {
+                    state.git.refresh(root);
+                }
+                step_git_done = true;
+                continue;
+            }
+
+            if !step_highlight_done {
+                loading.step = "Cargando syntax highlighting...";
+                loading.progress = 0.7;
+                // try_init non-blocking — engine puede no estar listo aún
+                let ready = state.highlight_engine.try_init();
+                if ready || state.highlight_engine.is_ready() {
+                    // Pre-highlightear viewport del archivo activo
+                    loading.step = "Pre-procesando colores del viewport...";
+                    loading.progress = 0.9;
+                    // Render intermedio para mostrar progreso actualizado
+                    terminal.draw(|frame| {
+                        ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+                    }).context("error en render de loading")?;
+
+                    // Fix: llamar init_highlighting() AHORA que el engine está listo.
+                    // En with_file() el engine aún no había cargado, así que
+                    // init_highlighting() no pudo detectar syntax. Lo hacemos aquí.
+                    {
+                        let engine = &state.highlight_engine;
+                        state.tabs.active_mut().init_highlighting(engine);
+                    }
+
+                    let engine = &state.highlight_engine;
+                    let editor = state.tabs.active_mut();
+                    let vp_start = editor.viewport.scroll_offset;
+                    // viewport.height puede ser 0 antes del primer render —
+                    // usar .max(40) como estimado razonable.
+                    let vp_height = editor.viewport.height.max(40);
+                    editor.highlight_cache.ensure_viewport_highlighted(
+                        &editor.buffer,
+                        engine,
+                        vp_start,
+                        vp_height,
+                    );
+
+                    let _ = step_highlight_done; // consumir variable
+                    loading.progress = 1.0;
+                    loading.step = "\u{2713} Sistemas inicializados";
+                    loading.done = true;
+
+                    // Render final mostrando 100%
+                    terminal.draw(|frame| {
+                        ui::render_loading(frame, theme, loading.step, loading.progress, loading.done);
+                    }).context("error en render de loading")?;
+
+                    // Breve pausa para que el usuario vea el 100% completado
+                    std::thread::sleep(Duration::from_millis(100));
+                    tracing::info!("loading phase completada — todos los sistemas listos");
+                    break;
+                }
+
+                // Engine no listo aún — timeout de seguridad
+                if loading_start.elapsed() > Duration::from_secs(3) {
+                    tracing::warn!("highlight timeout — iniciando sin syntax highlighting");
+                    break;
+                }
+                // Esperar antes de reintentar — 16ms ≈ 60fps
+                std::thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+        }
+    }
+
     loop {
         // 1. Poll de eventos con timeout (esto ESPERA — no cuenta como frame time)
         let event = poll_event(tick_duration)?;
@@ -1471,6 +1597,22 @@ async fn event_loop(
 
         // 5. Reducer: actualizar estado y obtener efectos
         let effects = reduce(&mut state, &action);
+
+        // 5.5. Re-highlight inmediato de la línea del cursor después de ediciones.
+        //      Elimina el parpadeo blanco: la línea editada se re-colorea en el
+        //      mismo frame sin esperar al debounce de ensure_viewport_highlighted.
+        if matches!(
+            action,
+            Action::InsertChar(_)
+                | Action::DeleteChar
+                | Action::InsertNewline
+                | Action::Undo
+                | Action::Redo
+        ) && state.highlight_engine.is_ready()
+        {
+            let engine = &state.highlight_engine;
+            state.tabs.active_mut().rehighlight_cursor_line(engine);
+        }
 
         // 6. Procesar efectos
         process_effects(&effects, shutdown);
@@ -1550,25 +1692,23 @@ async fn event_loop(
             editor.viewport.update_size(text_width, editor_inner_h);
         }
 
-        // 7.6. Ensure syntax highlight — carga lazy del engine + viewport-aware cache.
+        // 7.6. Ensure syntax highlight — viewport-aware cache.
         //      Se hace acá para NO alocar dentro del render loop.
-        {
-            // Intentar inicializar el engine si la carga en background terminó.
-            // Si se inicializó en este frame, marcar caches de todas las tabs como dirty.
-            let just_loaded = state.highlight_engine.try_init();
-            if just_loaded {
-                // El engine acaba de cargar — marcar todas las tabs como dirty
-                // para que sus caches se re-procesen con colores
-                for editor in state.tabs.all_editors_mut() {
-                    editor.highlight_cache.invalidate();
-                }
-                tracing::info!("highlight engine listo — re-highlighting todos los buffers");
-            }
-
-            // Solo procesar highlight si el engine está listo
-            if state.highlight_engine.is_ready() {
-                let engine = &state.highlight_engine;
-                let editor = state.tabs.active_mut();
+        //      try_init() ya se ejecutó en la loading phase — en el main loop
+        //      el engine ya está listo (o nunca lo estará si falló).
+        //
+        //      Si highlight_deferred está activo, el archivo acaba de abrirse.
+        //      Skipeamos el highlight este frame (render es instantáneo) y lo
+        //      procesamos el siguiente frame. Esto elimina el lurch al abrir archivos.
+        if state.highlight_engine.is_ready() {
+            let engine = &state.highlight_engine;
+            let editor = state.tabs.active_mut();
+            if editor.highlight_deferred {
+                // Primer frame post-open: solo inicializar syntax, no highlight.
+                // El siguiente frame ya procesa normal.
+                editor.init_highlighting(engine);
+                editor.highlight_deferred = false;
+            } else {
                 let vp_start = editor.viewport.scroll_offset;
                 let vp_height = editor.viewport.height;
                 editor.highlight_cache.ensure_viewport_highlighted(

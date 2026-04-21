@@ -292,6 +292,160 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     }
 }
 
+/// Renderiza una pantalla de carga futurista con barra de progreso.
+///
+/// Se muestra durante la inicialización diferida (explorer, quick_open,
+/// git, highlight). Recibe campos individuales en vez de un struct
+/// para evitar dependencia circular (ui no importa app).
+///
+/// Allocaciones por frame: 2 Strings pequeños (bar + pct) — aceptable
+/// en fase de startup, fuera del event loop principal.
+pub fn render_loading(
+    frame: &mut Frame,
+    theme: &Theme,
+    step: &str,
+    progress: f32,
+    done: bool,
+) {
+    use ratatui::{
+        layout::Rect,
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, BorderType, Borders, Paragraph},
+    };
+
+    let area = frame.area();
+
+    // Fondo completo
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg_primary)),
+        area,
+    );
+
+    if area.width < 20 || area.height < 8 {
+        return;
+    }
+
+    // Caja central: 60% del ancho, 10 líneas, centrada
+    let box_w = (area.width * 60 / 100).clamp(40, 80);
+    let box_h: u16 = 10;
+    let box_x = area.width.saturating_sub(box_w) / 2;
+    let box_y = area.height.saturating_sub(box_h) / 2;
+    let box_area = Rect::new(box_x, box_y, box_w, box_h);
+
+    // Borde doble cyberpunk
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.fg_accent))
+        .style(Style::default().bg(theme.bg_secondary));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    if inner.height < 6 || inner.width < 10 {
+        return;
+    }
+
+    // Layout interno:
+    // +0: (blank)
+    // +1: título
+    // +2: subtítulo
+    // +3: (blank)
+    // +4: paso actual
+    // +5: (blank)
+    // +6: barra de progreso
+    // +7: porcentaje
+
+    // ── Título ──
+    let title = "\u{2588} IDE TUI \u{2588}"; // █ IDE TUI █
+    let title_len = title.chars().count() as u16;
+    let title_x = inner.x + inner.width.saturating_sub(title_len) / 2;
+    if inner.y + 1 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.fg_accent)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(title_x, inner.y + 1, title_len, 1),
+        );
+    }
+
+    // ── Subtítulo ──
+    let subtitle = "Rust TUI IDE \u{2014} RAM/CPU First"; // —
+    let sub_len = subtitle.chars().count() as u16;
+    let sub_x = inner.x + inner.width.saturating_sub(sub_len) / 2;
+    if inner.y + 2 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                subtitle,
+                Style::default().fg(theme.fg_secondary),
+            ))),
+            Rect::new(sub_x, inner.y + 2, sub_len, 1),
+        );
+    }
+
+    // ── Paso actual ──
+    let step_len = step.chars().count() as u16;
+    let step_display_w = step_len.min(inner.width.saturating_sub(2));
+    let step_x = inner.x + inner.width.saturating_sub(step_display_w) / 2;
+    if inner.y + 4 < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                step,
+                Style::default().fg(theme.fg_accent_alt),
+            ))),
+            Rect::new(step_x, inner.y + 4, step_display_w, 1),
+        );
+    }
+
+    // ── Barra de progreso ──
+    // Una String por frame en startup — aceptable (no es el event loop)
+    let bar_w = inner.width.saturating_sub(4) as usize;
+    if bar_w > 0 && inner.y + 6 < area.height {
+        let filled = ((progress * bar_w as f32) as usize).min(bar_w);
+        let empty = bar_w.saturating_sub(filled);
+
+        let mut bar = String::with_capacity(bar_w * 3 + 2);
+        bar.push('[');
+        for _ in 0..filled {
+            bar.push('\u{2588}'); // █
+        }
+        for _ in 0..empty {
+            bar.push('\u{2591}'); // ░
+        }
+        bar.push(']');
+
+        let bar_x = inner.x + 2;
+        let bar_color = if done { theme.diff_add } else { theme.fg_accent };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                bar,
+                Style::default().fg(bar_color),
+            ))),
+            Rect::new(bar_x, inner.y + 6, inner.width.saturating_sub(2), 1),
+        );
+    }
+
+    // ── Porcentaje ──
+    if inner.y + 7 < area.height {
+        let pct = (progress * 100.0) as u8;
+        let mut pct_str = String::with_capacity(8);
+        use std::fmt::Write;
+        let _ = write!(pct_str, "{}%", pct);
+        let pct_len = pct_str.len() as u16;
+        let pct_x = inner.x + inner.width.saturating_sub(pct_len) / 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                pct_str,
+                Style::default().fg(theme.fg_secondary),
+            ))),
+            Rect::new(pct_x, inner.y + 7, pct_len, 1),
+        );
+    }
+}
+
 /// Determina qué sub-panel de la sidebar está activo según el foco.
 ///
 /// Si el foco está en Explorer/Git/Search, ese es el panel activo.
