@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use syntect::highlighting::{Color, FontStyle, Style as SyntectStyle};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
+use super::buffer::TextBuffer;
 use super::highlighting::HighlightToken;
 
 // ─── Highlight names ──────────────────────────────────────────────────────────
@@ -292,6 +293,14 @@ pub struct TsHighlightEngine {
     lines: HashMap<usize, Vec<HighlightToken>>,
     /// Si el cache está dirty (buffer cambió).
     dirty: bool,
+    /// Bytes del archivo cacheados — evita reconstruir Vec<u8> en cada frame.
+    /// Se invalida cuando el buffer cambia (junto con `dirty = true`).
+    source_cache: Vec<u8>,
+    /// Heurística barata para detectar cambios de contenido sin comparar bytes.
+    /// (line_count, last_line_len as u8) — no criptográfica.
+    source_version: (usize, u8),
+    /// Último viewport procesado [start, end) — para evitar reprocesar en scroll sin cambios.
+    last_viewport: (usize, usize),
 }
 
 impl TsHighlightEngine {
@@ -301,13 +310,21 @@ impl TsHighlightEngine {
             config,
             lines: HashMap::new(),
             dirty: true,
+            source_cache: Vec::new(),
+            source_version: (0, 0),
+            last_viewport: (0, 0),
         }
     }
 
     /// Invalida el cache — fuerza re-highlight en el próximo `highlight_viewport()`.
+    ///
+    /// Marca `dirty = true` y fuerza rebuild de source en el próximo highlight.
+    /// No limpia `source_cache` — se reutiliza el Vec si el buffer no cambió demasiado.
     pub fn invalidate(&mut self) {
         self.dirty = true;
         self.lines.clear();
+        self.source_version = (0, 0); // forzar rebuild de source en próximo highlight
+        self.last_viewport = (0, 0);
     }
 
     /// Obtiene los tokens coloreados de una línea cacheada.
@@ -322,24 +339,62 @@ impl TsHighlightEngine {
 
     /// Destaca las líneas del viewport y las guarda en cache.
     ///
-    /// `source`: texto completo del archivo como bytes (UTF-8).
+    /// `buffer`: referencia al TextBuffer — el engine gestiona su propio source cache.
     /// `viewport_start`: primera línea visible (inclusive).
     /// `viewport_end`: última línea visible (exclusiva).
     ///
-    /// Solo guarda tokens para líneas dentro del rango [viewport_start, viewport_end).
-    /// El parsing cubre el archivo completo (tree-sitter lo necesita para contexto),
-    /// pero solo se generan tokens para el viewport.
+    /// Optimizaciones:
+    /// 1. Source cache: solo reconstruye bytes del buffer cuando el contenido cambió
+    ///    (detectado por heurística line_count + last_line_len).
+    /// 2. Viewport skip: si el viewport ya está cubierto por el último procesamiento
+    ///    y no hay cambios, retorna inmediatamente (0 trabajo por frame en scroll estable).
+    /// 3. Margen de 30 líneas: procesa líneas extra arriba/abajo del viewport visible
+    ///    para que scroll de ±30 líneas no re-trigger el highlight.
     pub fn highlight_viewport(
         &mut self,
-        source: &[u8],
+        buffer: &TextBuffer,
         viewport_start: usize,
         viewport_end: usize,
     ) {
-        self.lines.clear();
+        // ── 1. Verificar si el source cambió ──
+        // Heurística barata: comparar line_count + longitud de última línea.
+        // No criptográfica — si falla, la próxima edición llama invalidate().
+        let line_count = buffer.line_count();
+        let last_line = buffer.line(line_count.saturating_sub(1)).unwrap_or("");
+        let new_version = (line_count, last_line.len() as u8);
+
+        let source_changed = new_version != self.source_version;
+
+        if source_changed {
+            // Reconstruir source cache solo cuando el buffer cambió
+            rebuild_source_cache(&mut self.source_cache, buffer);
+            self.source_version = new_version;
+            self.dirty = true;
+            self.lines.clear();
+            self.last_viewport = (0, 0);
+        }
+
+        // ── 2. Verificar si el viewport ya está cubierto ──
+        if !self.dirty
+            && self.last_viewport.0 <= viewport_start
+            && self.last_viewport.1 >= viewport_end
+        {
+            return; // Cache hit — viewport ya procesado, sin trabajo
+        }
+
+        // ── 3. Ampliar viewport para evitar reprocesos frecuentes en scroll ──
+        // MARGIN líneas extra arriba y abajo del viewport visible.
+        const MARGIN: usize = 30;
+        let process_start = viewport_start.saturating_sub(MARGIN);
+        let process_end = (viewport_end + MARGIN).min(line_count);
+
+        // ── 4. Parsear con tree-sitter usando source cacheado ──
+        if self.source_cache.is_empty() {
+            return;
+        }
 
         let mut highlighter = Highlighter::new();
-
-        let events = match highlighter.highlight(&self.config, source, None, |_| None) {
+        let events = match highlighter.highlight(&self.config, &self.source_cache, None, |_| None) {
             Ok(e) => e,
             Err(_) => {
                 // Error en parsing — dejar dirty para retry en el próximo frame
@@ -347,17 +402,22 @@ impl TsHighlightEngine {
             }
         };
 
-        // Construir mapa de byte offsets → líneas
-        let line_starts = build_line_starts(source);
+        // ── 5. Construir mapa line_starts ──
+        let line_starts = build_line_starts(&self.source_cache);
+
+        // ── 6. Procesar eventos solo para el rango [process_start, process_end) ──
+        // Limpiar SOLO el rango que vamos a reprocesar (preservar líneas fuera del rango)
+        self.lines
+            .retain(|&line, _| line < process_start || line >= process_end);
 
         let mut current_style_idx: Option<usize> = None;
-        let mut tokens_by_line: HashMap<usize, Vec<HighlightToken>> =
-            HashMap::with_capacity(viewport_end.saturating_sub(viewport_start));
+        let mut new_tokens: HashMap<usize, Vec<HighlightToken>> =
+            HashMap::with_capacity(process_end.saturating_sub(process_start));
 
         for event in events.flatten() {
             match event {
                 HighlightEvent::Source { start, end } => {
-                    let text = match std::str::from_utf8(&source[start..end]) {
+                    let text = match std::str::from_utf8(&self.source_cache[start..end]) {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
@@ -377,13 +437,14 @@ impl TsHighlightEngine {
                             let segment = &text[segment_start_in_text..local_offset];
                             if !segment.is_empty() {
                                 let line_idx = byte_to_line(current_byte, &line_starts);
-                                if line_idx >= viewport_start && line_idx < viewport_end {
-                                    tokens_by_line.entry(line_idx).or_default().push(
-                                        HighlightToken {
+                                if line_idx >= process_start && line_idx < process_end {
+                                    new_tokens
+                                        .entry(line_idx)
+                                        .or_default()
+                                        .push(HighlightToken {
                                             style,
                                             text: segment.to_owned(),
-                                        },
-                                    );
+                                        });
                                 }
                             }
                             // Avanzar past the newline
@@ -392,12 +453,12 @@ impl TsHighlightEngine {
                         }
                     }
 
-                    // Último segmento después del último '\n' (o el único segmento si no hay '\n')
+                    // Último segmento después del último '\n' (o el único si no hay '\n')
                     let remaining = &text[segment_start_in_text..];
                     if !remaining.is_empty() {
                         let line_idx = byte_to_line(current_byte, &line_starts);
-                        if line_idx >= viewport_start && line_idx < viewport_end {
-                            tokens_by_line
+                        if line_idx >= process_start && line_idx < process_end {
+                            new_tokens
                                 .entry(line_idx)
                                 .or_default()
                                 .push(HighlightToken {
@@ -416,8 +477,10 @@ impl TsHighlightEngine {
             }
         }
 
-        self.lines = tokens_by_line;
+        // Merge new tokens into cache
+        self.lines.extend(new_tokens);
         self.dirty = false;
+        self.last_viewport = (process_start, process_end);
     }
 }
 
@@ -426,11 +489,37 @@ impl std::fmt::Debug for TsHighlightEngine {
         f.debug_struct("TsHighlightEngine")
             .field("lines_cached", &self.lines.len())
             .field("dirty", &self.dirty)
+            .field("source_cache_bytes", &self.source_cache.len())
+            .field("source_version", &self.source_version)
+            .field("last_viewport", &self.last_viewport)
             .finish()
     }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Reconstruye el source cache desde el buffer de texto.
+///
+/// Reutiliza el Vec existente (clear + extend) para evitar realocaciones
+/// cuando el tamaño del archivo no cambió significativamente.
+/// Estimación de capacidad: ~41 bytes por línea (avg 40 chars + newline).
+fn rebuild_source_cache(cache: &mut Vec<u8>, buffer: &TextBuffer) {
+    cache.clear();
+    let line_count = buffer.line_count();
+    // Pre-estimar capacidad: avg line ~40 chars + newline = 41 bytes.
+    // Solo reservar si el cache es demasiado pequeño.
+    let est_len = line_count * 41;
+    if cache.capacity() < est_len {
+        cache.reserve(est_len - cache.capacity());
+    }
+    for i in 0..line_count {
+        let line = buffer.line(i).unwrap_or("");
+        cache.extend_from_slice(line.as_bytes());
+        if i + 1 < line_count {
+            cache.push(b'\n');
+        }
+    }
+}
 
 /// Construye un vector de byte offsets donde empieza cada línea.
 ///
@@ -504,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_highlight_rust_source() {
-        let source = b"fn main() {\n    let x = 42;\n}\n";
+        let buffer = TextBuffer::from_text("fn main() {\n    let x = 42;\n}\n");
         let config = config_for_extension("rs").expect("Rust config");
         let mut engine = TsHighlightEngine::new(config);
 
@@ -512,7 +601,7 @@ mod tests {
         assert!(engine.get_line(0).is_none());
 
         // Highlight viewport completo (3 líneas)
-        engine.highlight_viewport(source, 0, 3);
+        engine.highlight_viewport(&buffer, 0, 3);
 
         // Después de highlight, debe haber tokens
         assert!(engine.get_line(0).is_some(), "línea 0 debe tener tokens");
@@ -526,32 +615,86 @@ mod tests {
 
     #[test]
     fn test_highlight_viewport_partial() {
-        let source = b"fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n";
+        // 4 líneas + trailing newline — con margen de 30, viewport 1..3 expande a 0..4
+        // Necesitamos >30 líneas para que el margen no cubra todo
+        let mut source = String::new();
+        for i in 0..40 {
+            source.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        let buffer = TextBuffer::from_text(&source);
         let config = config_for_extension("rs").expect("Rust config");
         let mut engine = TsHighlightEngine::new(config);
 
-        // Solo highlight líneas 1-2 (viewport parcial)
-        engine.highlight_viewport(source, 1, 3);
+        // Viewport líneas 35-37 — con margen 30, process_start=5, process_end=40
+        engine.highlight_viewport(&buffer, 35, 37);
 
-        // Línea 0 NO debe estar cacheada (fuera del viewport)
-        assert!(engine.get_line(0).is_none());
-        // Líneas 1-2 SÍ deben estar cacheadas
-        assert!(engine.get_line(1).is_some());
-        assert!(engine.get_line(2).is_some());
-        // Línea 3 NO debe estar cacheada
-        assert!(engine.get_line(3).is_none());
+        // Línea 4 NO debe estar cacheada (fuera del margen)
+        assert!(engine.get_line(4).is_none(), "línea 4 fuera del margen");
+        // Línea 5 SÍ debe estar cacheada (dentro del margen)
+        assert!(engine.get_line(5).is_some(), "línea 5 dentro del margen");
+        // Líneas 35-36 SÍ deben estar cacheadas (viewport)
+        assert!(engine.get_line(35).is_some(), "línea 35 en viewport");
+        assert!(engine.get_line(36).is_some(), "línea 36 en viewport");
     }
 
     #[test]
     fn test_invalidate_clears_cache() {
-        let source = b"let x = 1;\n";
+        let buffer = TextBuffer::from_text("let x = 1;\n");
         let config = config_for_extension("ts").expect("TS config");
         let mut engine = TsHighlightEngine::new(config);
 
-        engine.highlight_viewport(source, 0, 1);
+        engine.highlight_viewport(&buffer, 0, 1);
         assert!(engine.get_line(0).is_some());
 
         engine.invalidate();
         assert!(engine.get_line(0).is_none());
+    }
+
+    #[test]
+    fn test_viewport_cache_skip() {
+        // Verificar que un segundo highlight_viewport con el mismo viewport no reprocesa.
+        let buffer = TextBuffer::from_text("fn main() {\n    let x = 42;\n}\n");
+        let config = config_for_extension("rs").expect("Rust config");
+        let mut engine = TsHighlightEngine::new(config);
+
+        // Primer highlight — debe procesar
+        engine.highlight_viewport(&buffer, 0, 3);
+        assert!(engine.get_line(0).is_some());
+
+        // Segundo highlight con mismo viewport — debe ser cache hit (no dirty, viewport cubierto)
+        // Si el cache funciona, los tokens siguen ahí sin reprocesar.
+        engine.highlight_viewport(&buffer, 0, 3);
+        assert!(
+            engine.get_line(0).is_some(),
+            "cache hit debe mantener tokens"
+        );
+    }
+
+    #[test]
+    fn test_source_change_detection() {
+        let buffer1 = TextBuffer::from_text("fn a() {}\n");
+        let buffer2 = TextBuffer::from_text("fn a() {}\nfn b() {}\n");
+        let config = config_for_extension("rs").expect("Rust config");
+        let mut engine = TsHighlightEngine::new(config);
+
+        // Highlight con buffer1
+        engine.highlight_viewport(&buffer1, 0, 1);
+        assert!(engine.get_line(0).is_some());
+
+        // Highlight con buffer2 (diferente contenido) — debe detectar cambio
+        engine.highlight_viewport(&buffer2, 0, 2);
+        assert!(engine.get_line(0).is_some());
+        assert!(
+            engine.get_line(1).is_some(),
+            "nueva línea debe ser procesada"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_source_cache() {
+        let buffer = TextBuffer::from_text("hello\nworld\nfoo");
+        let mut cache = Vec::new();
+        rebuild_source_cache(&mut cache, &buffer);
+        assert_eq!(cache, b"hello\nworld\nfoo");
     }
 }

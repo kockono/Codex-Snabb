@@ -594,13 +594,12 @@ impl HighlightCache {
         viewport_height: usize,
     ) {
         // Si hay tree-sitter engine, usarlo en lugar de syntect.
-        // Construir source bytes desde buffer y delegar al motor tree-sitter.
+        // Pasar buffer directamente — TsHighlightEngine gestiona su propio source cache.
         if let Some(ref mut ts) = self.ts_engine {
-            let source = buffer_to_bytes(buffer);
             let effective_start = viewport_start.saturating_sub(VIEWPORT_MARGIN);
             let effective_end =
                 (viewport_start + viewport_height + VIEWPORT_MARGIN).min(buffer.line_count());
-            ts.highlight_viewport(&source, effective_start, effective_end);
+            ts.highlight_viewport(buffer, effective_start, effective_end);
             return; // No usar syntect
         }
 
@@ -959,25 +958,6 @@ impl HighlightCache {
     pub fn has_ts_engine(&self) -> bool {
         self.ts_engine.is_some()
     }
-}
-
-/// Construye los bytes UTF-8 del buffer completo, uniendo líneas con newlines.
-///
-/// Una sola allocation por llamada — aceptable porque se llama fuera del render loop.
-fn buffer_to_bytes(buffer: &TextBuffer) -> Vec<u8> {
-    let line_count = buffer.line_count();
-    let total_len: usize = (0..line_count)
-        .map(|i| buffer.line(i).map(|l| l.len() + 1).unwrap_or(1))
-        .sum();
-    let mut bytes = Vec::with_capacity(total_len);
-    for i in 0..line_count {
-        let line = buffer.line(i).unwrap_or("");
-        bytes.extend_from_slice(line.as_bytes());
-        if i + 1 < line_count {
-            bytes.push(b'\n');
-        }
-    }
-    bytes
 }
 
 impl std::fmt::Debug for HighlightCache {
