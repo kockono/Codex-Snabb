@@ -36,6 +36,14 @@ pub struct FolderPickerState {
     pub scroll_offset: usize,
     /// Ruta confirmada (Some cuando usuario confirmó).
     pub confirmed_path: Option<PathBuf>,
+    /// Texto del input de path editable (vacío = mostrar placeholder).
+    pub path_input: String,
+    /// Si el foco está en el input de path (true) o en el árbol (false).
+    pub path_input_focused: bool,
+    /// Mensaje de error efímero (path no encontrado, etc.).
+    pub path_error: Option<String>,
+    /// Countdown de ticks para limpiar `path_error`. 40 ticks ≈ 2s a 20 FPS.
+    pub path_error_ticks: u8,
 }
 
 impl FolderPickerState {
@@ -47,6 +55,10 @@ impl FolderPickerState {
             selected: 0,
             scroll_offset: 0,
             confirmed_path: None,
+            path_input: String::new(),
+            path_input_focused: false,
+            path_error: None,
+            path_error_ticks: 0,
         }
     }
 
@@ -56,6 +68,10 @@ impl FolderPickerState {
         self.selected = 0;
         self.scroll_offset = 0;
         self.confirmed_path = None;
+        self.path_input.clear();
+        self.path_input_focused = false;
+        self.path_error = None;
+        self.path_error_ticks = 0;
         // CLONE: necesario — root se mueve a current_root y también se usa para load_root
         self.current_root = root.clone();
         self.load_root(&root);
@@ -66,6 +82,10 @@ impl FolderPickerState {
         self.visible = false;
         self.entries.clear();
         self.confirmed_path = None;
+        self.path_input.clear();
+        self.path_input_focused = false;
+        self.path_error = None;
+        self.path_error_ticks = 0;
     }
 
     /// Carga el directorio raíz (primer nivel).
@@ -237,6 +257,78 @@ impl FolderPickerState {
             self.scroll_offset = self.selected;
         } else if self.selected >= self.scroll_offset + MAX_VISIBLE {
             self.scroll_offset = self.selected - MAX_VISIBLE + 1;
+        }
+    }
+
+    // ── Path input methods ──
+
+    /// Alterna el foco entre el input de path y el árbol de directorios.
+    pub fn toggle_focus(&mut self) {
+        self.path_input_focused = !self.path_input_focused;
+        self.path_error = None;
+        self.path_error_ticks = 0;
+    }
+
+    /// Agrega un carácter al input de path.
+    pub fn path_input_push(&mut self, ch: char) {
+        self.path_input.push(ch);
+    }
+
+    /// Elimina el último carácter del input de path.
+    pub fn path_input_backspace(&mut self) {
+        self.path_input.pop();
+    }
+
+    /// Intenta navegar al path escrito en el input.
+    ///
+    /// Si el path existe y es un directorio, actualiza `current_root`,
+    /// refresca las entradas, limpia el input y devuelve foco al árbol.
+    /// Si no existe, setea `path_error` con mensaje y retorna `false`.
+    pub fn try_navigate_to_input(&mut self) -> bool {
+        let path = PathBuf::from(&self.path_input);
+        if path.is_dir() {
+            // CLONE: necesario — path se mueve a current_root y también se usa para load_root
+            self.current_root = path.clone();
+            self.selected = 0;
+            self.scroll_offset = 0;
+            self.load_root(&path);
+            self.path_input.clear();
+            self.path_input_focused = false;
+            self.path_error = None;
+            self.path_error_ticks = 0;
+            true
+        } else {
+            self.path_error = Some(String::from("Path not found"));
+            self.path_error_ticks = 40; // ~2s a 20 FPS
+            false
+        }
+    }
+
+    /// Decrementa el countdown del error efímero. Limpia `path_error` cuando llega a 0.
+    pub fn tick_error(&mut self) {
+        if self.path_error_ticks > 0 {
+            self.path_error_ticks -= 1;
+            if self.path_error_ticks == 0 {
+                self.path_error = None;
+            }
+        }
+    }
+
+    /// Limpia el input de path y devuelve foco al árbol. NO cierra el picker.
+    pub fn path_input_escape(&mut self) {
+        self.path_input.clear();
+        self.path_input_focused = false;
+        self.path_error = None;
+        self.path_error_ticks = 0;
+    }
+
+    /// Retorna el texto a mostrar en el input: el texto escrito si no está vacío,
+    /// o el `current_root` como placeholder.
+    pub fn display_text(&self) -> &str {
+        if self.path_input.is_empty() {
+            self.current_root.to_str().unwrap_or("")
+        } else {
+            self.path_input.as_str()
         }
     }
 }
