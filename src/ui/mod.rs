@@ -15,6 +15,7 @@ pub mod palette;
 pub mod panels;
 pub mod projects_panel;
 pub mod quick_open;
+pub mod rename_modal;
 pub mod save_as_modal;
 pub mod search_panel;
 pub mod settings_panel;
@@ -151,85 +152,109 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         }
     }
 
-    // ── Editor area ──
+    // editor_focused se necesita aquí y también en la sección de LSP overlays
+    // (después del if/else), por eso se declara antes del bloque.
     let editor_focused = focused == PanelId::Editor;
-    let editor = state.tabs.active();
-    // Pre-computar info de tabs para la barra de pestañas
-    let tab_infos = state.tabs.tab_info();
-    // Obtener diagnósticos para el archivo actual (si hay LSP activo)
-    let current_diagnostics = editor
-        .buffer
-        .file_path()
-        .map(|p| state.lsp.diagnostics_for(p))
-        .unwrap_or(&[]);
-    // Path del archivo activo y workspace root para breadcrumbs
-    let active_file_path = editor.buffer.file_path();
-    let workspace_root = state.explorer.as_ref().map(|e| e.root.as_path());
-    panels::render_editor_area(
-        f,
-        layout.editor_area,
-        theme,
-        editor_focused,
-        editor,
-        current_diagnostics,
-        &tab_infos,
-        state.bracket_match,
-        active_file_path,
-        workspace_root,
-    );
 
-    // ── Hardware cursor: posicionar la línea vertical del terminal ──
-    // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
-    // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
-    if editor_focused
-        && state.cursor_visible
-        && !state.palette.visible
-        && !state.quick_open.visible
-        && !state.go_to_line.visible
-        && !state.branch_picker.visible
-        && !state.keybindings.visible
-        && !state.folder_picker.visible
-        && !state.save_as.visible
-    {
-        // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
-        let inner_x = layout.editor_area.x + 1;
-        // +1 borde superior, +1 tab bar, +1 breadcrumbs = +3 desde editor_area.y
-        let chrome_offset: u16 = 2; // tab bar (1) + breadcrumbs (1)
-        let inner_y = layout.editor_area.y + 1 + chrome_offset;
-        let inner_h = layout.editor_area.height.saturating_sub(2 + chrome_offset) as usize;
-
+    // ── Git diff overlay (ocupa editor_area + bottom_panel cuando show_diff == true) ──
+    // El sidebar permanece visible para navegar archivos.
+    // El editor y el terminal se ocultan y se reemplazan por el diff.
+    if state.git.show_diff {
+        use ratatui::layout::Rect;
+        // Calcular el área combinada: editor_area + bottom_panel si está visible
+        let diff_area = if layout.bottom_panel_visible {
+            Rect::new(
+                layout.editor_area.x,
+                layout.editor_area.y,
+                layout.editor_area.width,
+                layout.editor_area.height + layout.bottom_panel.height,
+            )
+        } else {
+            layout.editor_area
+        };
+        git_panel::render_diff_view(f, diff_area, &state.git, theme);
+    } else {
+        // ── Editor area (solo cuando show_diff == false) ──
         let editor = state.tabs.active();
-        let scroll = editor.viewport.scroll_offset;
-        let cursor_line = editor.cursors.primary().position.line;
-        let cursor_col = editor.cursors.primary().position.col;
-
-        // Verificar que el cursor está dentro del viewport visible
-        if cursor_line >= scroll && cursor_line < scroll + inner_h {
-            let visual_row = (cursor_line - scroll) as u16;
-
-            // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
-            let total_lines = editor.buffer.line_count();
-            let gutter_width = panels::digit_count(total_lines).max(4);
-            let separator_width: u16 = 2;
-            let text_offset = gutter_width as u16 + separator_width;
-
-            let abs_col = inner_x + text_offset + cursor_col as u16;
-            let abs_row = inner_y + visual_row;
-
-            f.set_cursor_position((abs_col, abs_row));
-        }
-    }
-
-    // ── Bottom panel ──
-    if layout.bottom_panel_visible {
-        let bottom_focused = focused == PanelId::Terminal;
-        panels::render_bottom_panel(
+        // Pre-computar info de tabs para la barra de pestañas
+        let tab_infos = state.tabs.tab_info();
+        // Obtener diagnósticos para el archivo actual (si hay LSP activo)
+        let current_diagnostics = editor
+            .buffer
+            .file_path()
+            .map(|p| state.lsp.diagnostics_for(p))
+            .unwrap_or(&[]);
+        // Path del archivo activo y workspace root para breadcrumbs
+        let active_file_path = editor.buffer.file_path();
+        let workspace_root = state.explorer.as_ref().map(|e| e.root.as_path());
+        panels::render_editor_area(
             f,
-            layout.bottom_panel,
+            layout.editor_area,
             theme,
-            bottom_focused,
-            state.terminal.session.as_ref(),
+            editor_focused,
+            editor,
+            current_diagnostics,
+            &tab_infos,
+            state.bracket_match,
+            active_file_path,
+            workspace_root,
         );
+
+        // ── Hardware cursor: posicionar la línea vertical del terminal ──
+        // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
+        // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
+        if editor_focused
+            && state.cursor_visible
+            && !state.palette.visible
+            && !state.quick_open.visible
+            && !state.go_to_line.visible
+            && !state.branch_picker.visible
+            && !state.keybindings.visible
+            && !state.folder_picker.visible
+            && !state.save_as.visible
+            && !state.rename.visible
+        {
+            // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
+            let inner_x = layout.editor_area.x + 1;
+            // +1 borde superior, +1 tab bar, +1 breadcrumbs = +3 desde editor_area.y
+            let chrome_offset: u16 = 2; // tab bar (1) + breadcrumbs (1)
+            let inner_y = layout.editor_area.y + 1 + chrome_offset;
+            let inner_h = layout.editor_area.height.saturating_sub(2 + chrome_offset) as usize;
+
+            let editor = state.tabs.active();
+            let scroll = editor.viewport.scroll_offset;
+            let cursor_line = editor.cursors.primary().position.line;
+            let cursor_col = editor.cursors.primary().position.col;
+
+            // Verificar que el cursor está dentro del viewport visible
+            if cursor_line >= scroll && cursor_line < scroll + inner_h {
+                let visual_row = (cursor_line - scroll) as u16;
+
+                // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
+                let total_lines = editor.buffer.line_count();
+                let gutter_width = panels::digit_count(total_lines).max(4);
+                let separator_width: u16 = 2;
+                let text_offset = gutter_width as u16 + separator_width;
+
+                let abs_col = inner_x + text_offset + cursor_col as u16;
+                let abs_row = inner_y + visual_row;
+
+                f.set_cursor_position((abs_col, abs_row));
+            }
+        }
+
+        // ── Bottom panel (solo cuando show_diff == false) ──
+        // Cuando el diff está activo, el bottom panel está incluido en diff_area.
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                state.terminal.session.as_ref(),
+            );
+        }
     }
 
     // ── Status bar ──
@@ -282,6 +307,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.keybindings.visible
         && !state.folder_picker.visible
         && !state.save_as.visible
+        && !state.rename.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -312,6 +338,17 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             f,
             &layout,
             &state.save_as,
+            theme,
+            state.cursor_visible,
+        );
+    }
+
+    // ── Rename modal ──
+    if state.rename.visible {
+        rename_modal::render_rename_modal(
+            f,
+            &layout,
+            &state.rename,
             theme,
             state.cursor_visible,
         );

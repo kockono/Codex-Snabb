@@ -45,6 +45,7 @@ pub(super) fn keymap(
     projects_selected: usize,
     save_as_visible: bool,
     context_menu_visible: bool,
+    rename_visible: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -102,6 +103,17 @@ pub(super) fn keymap(
             (KeyCode::Enter, _) => Action::SaveAsConfirm,
             (KeyCode::Backspace, _) => Action::SaveAsBackspace,
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::SaveAsChar(ch),
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Rename modal visible: prioridad máxima (modal) ──
+    if rename_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::RenameCancel,
+            (KeyCode::Enter, _) => Action::RenameConfirm,
+            (KeyCode::Backspace, _) => Action::RenameBackspace,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::RenameChar(ch),
             _ => Action::Noop,
         };
     }
@@ -267,6 +279,8 @@ pub(super) fn keymap(
             (KeyCode::Char('w'), KeyModifiers::ALT) => Action::SearchToggleWholeWord,
             // Alt+R → toggle regex
             (KeyCode::Char('r'), KeyModifiers::ALT) => Action::SearchToggleRegex,
+            // Alt+F → toggle filtros (include/exclude) expandidos/colapsados
+            (KeyCode::Char('f'), KeyModifiers::ALT) => Action::SearchToggleFilters,
             // Ctrl+Shift+H → toggle replace
             (KeyCode::Char('H'), mods)
                 if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
@@ -553,6 +567,7 @@ mod tests {
             0,     // projects_selected
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -579,6 +594,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -608,6 +624,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -634,6 +651,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -660,6 +678,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -686,6 +705,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -712,6 +732,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -740,6 +761,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -766,6 +788,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -792,6 +815,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -818,6 +842,7 @@ mod tests {
             0,
             false, // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineClose);
     }
@@ -844,6 +869,7 @@ mod tests {
             0,
             true,  // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SaveAsCancel);
     }
@@ -870,6 +896,7 @@ mod tests {
             0,
             true,  // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SaveAsConfirm);
     }
@@ -896,7 +923,89 @@ mod tests {
             0,
             true,  // save_as_visible
             false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SaveAsChar('a'));
+    }
+
+    #[test]
+    fn esc_in_rename_modal_returns_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameCancel);
+    }
+
+    #[test]
+    fn enter_in_rename_modal_returns_confirm() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameConfirm);
+    }
+
+    #[test]
+    fn char_in_rename_modal_returns_rename_char() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameChar('x'));
     }
 }

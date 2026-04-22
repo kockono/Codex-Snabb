@@ -65,8 +65,9 @@ pub fn render_search_panel(
         return;
     }
 
-    // Calcular cuántas líneas de input necesitamos
-    let input_lines: u16 = if state.replace_visible { 4 } else { 3 };
+    // Calcular cuántas líneas de input necesitamos:
+    // 3 base (query + replace_hint_or_input + filter_toggle) + 2 si filters_expanded
+    let input_lines: u16 = 3 + if state.filters_expanded { 2 } else { 0 };
     // Mínimo 1 línea para resultados + 1 para resumen
     let min_results_height: u16 = 2;
 
@@ -91,68 +92,184 @@ pub fn render_search_panel(
     render_summary(f, layout[2], state, theme);
 }
 
-/// Renderiza los campos de input (query, replace, include, exclude).
+/// Renderiza los campos de input con el nuevo layout colapsable.
+///
+/// Layout fijo de 3 filas base + filas condicionales:
+/// ```
+/// fila 0: query (siempre)
+/// fila 1: replace input (si replace_visible) o hint dimmed "⇄ Replace  Ctrl+Shift+H"
+/// fila 2: filter toggle row "▸/▾ files to include/exclude"
+/// fila 3: include (solo si filters_expanded)
+/// fila 4: exclude (solo si filters_expanded)
+/// ```
 fn render_input_fields(f: &mut Frame, area: Rect, state: &SearchState, theme: &Theme) {
     if area.height == 0 {
         return;
     }
 
-    let mut constraints = Vec::with_capacity(4);
+    // Construir constraints dinámicos — capacidad máxima 5
+    let mut constraints = Vec::with_capacity(5);
     constraints.push(Constraint::Length(1)); // query
-    if state.replace_visible {
-        constraints.push(Constraint::Length(1)); // replace
+    constraints.push(Constraint::Length(1)); // replace input o hint
+    constraints.push(Constraint::Length(1)); // filter toggle row
+    if state.filters_expanded {
+        constraints.push(Constraint::Length(1)); // include
+        constraints.push(Constraint::Length(1)); // exclude
     }
-    constraints.push(Constraint::Length(1)); // include
-    constraints.push(Constraint::Length(1)); // exclude
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
 
-    let mut idx = 0;
+    // ── Fila 0: query (siempre) ──
+    render_query_line(f, layout[0], state, theme);
 
-    // Query line con toggles
-    render_query_line(f, layout[idx], state, theme);
-    idx += 1;
-
-    // Replace (si visible)
-    if state.replace_visible && idx < layout.len() {
+    // ── Fila 1: replace input o hint ──
+    if state.replace_visible {
         render_field_line(
             f,
-            layout[idx],
+            layout[1],
             theme,
-            "\u{21d4} ", // ⇔
+            "\u{21d4} ", // ⇄
             &state.replace_text,
             state.active_field == SearchField::Replace,
         );
-        idx += 1;
+    } else {
+        render_replace_hint(f, layout[1], theme);
     }
 
-    // Include
-    if idx < layout.len() {
-        render_field_line(
+    // ── Fila 2: filter toggle row ──
+    render_filter_toggle_row(f, layout[2], state, theme);
+
+    // ── Filas 3 y 4: include + exclude (solo si filters_expanded) ──
+    if state.filters_expanded && layout.len() >= 5 {
+        // Pre-computar placeholder logic fuera del render — sin format!() en render
+        let include_text: &str = if state.options.include_pattern.is_empty() {
+            "e.g. *.rs,*.toml"
+        } else {
+            state.options.include_pattern.as_str()
+        };
+        let include_is_placeholder = state.options.include_pattern.is_empty();
+
+        let exclude_text: &str = if state.options.exclude_pattern.is_empty() {
+            "e.g. target/**"
+        } else {
+            state.options.exclude_pattern.as_str()
+        };
+        let exclude_is_placeholder = state.options.exclude_pattern.is_empty();
+
+        render_filter_field_line(
             f,
-            layout[idx],
+            layout[3],
             theme,
             "\u{1f4c1} ", // 📁
-            &state.options.include_pattern,
+            include_text,
+            include_is_placeholder,
             state.active_field == SearchField::Include,
         );
-        idx += 1;
-    }
-
-    // Exclude
-    if idx < layout.len() {
-        render_field_line(
+        render_filter_field_line(
             f,
-            layout[idx],
+            layout[4],
             theme,
             "\u{1f6ab} ", // 🚫
-            &state.options.exclude_pattern,
+            exclude_text,
+            exclude_is_placeholder,
             state.active_field == SearchField::Exclude,
         );
     }
+}
+
+/// Renderiza el hint dimmed de replace cuando el campo no está visible.
+///
+/// Muestra: "⇄  Replace               Ctrl+Shift+H" en estilo dim para indicar
+/// al usuario que el campo existe y cómo activarlo.
+fn render_replace_hint(f: &mut Frame, area: Rect, theme: &Theme) {
+    let hint_style = Style::default()
+        .fg(theme.fg_secondary)
+        .bg(theme.bg_secondary)
+        .add_modifier(Modifier::DIM);
+
+    // Pre-computado — string estático, cero allocaciones en render
+    let line = Line::from(Span::styled(
+        " \u{21d4}  Replace               Ctrl+Shift+H",
+        hint_style,
+    ));
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(p, area);
+}
+
+/// Renderiza la fila de toggle de filtros (▸/▾ files to include/exclude).
+///
+/// Esta fila es SIEMPRE visible y actúa como botón para expand/collapse.
+/// No es un campo de input — no muestra cursor ni recibe foco de texto.
+fn render_filter_toggle_row(f: &mut Frame, area: Rect, state: &SearchState, theme: &Theme) {
+    // Pre-computar indicador de fold — strings estáticos
+    let fold_indicator = if state.filters_expanded {
+        "\u{25be} " // ▾ expandido
+    } else {
+        "\u{25b8} " // ▸ colapsado
+    };
+
+    let toggle_style = Style::default()
+        .fg(theme.fg_secondary)
+        .bg(theme.bg_secondary);
+
+    let line = Line::from(vec![
+        Span::styled(" ", Style::default().bg(theme.bg_secondary)),
+        Span::styled(fold_indicator, toggle_style),
+        Span::styled("files to include/exclude", toggle_style),
+    ]);
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(p, area);
+}
+
+/// Renderiza una línea de campo de filtro con soporte de placeholder.
+///
+/// Igual que `render_field_line` pero acepta `is_placeholder` para aplicar
+/// estilo dim cuando el campo está vacío y se muestra el hint.
+fn render_filter_field_line(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    icon: &str,
+    text: &str,
+    is_placeholder: bool,
+    is_active: bool,
+) {
+    let cursor = if is_active && !is_placeholder {
+        "|"
+    } else {
+        ""
+    };
+    let cursor_style = Style::default().fg(theme.fg_accent).bg(theme.bg_secondary);
+
+    let text_style = if is_placeholder {
+        // Placeholder: dim, no importa si está activo o no
+        Style::default()
+            .fg(theme.fg_secondary)
+            .bg(theme.bg_secondary)
+            .add_modifier(Modifier::DIM)
+    } else if is_active {
+        Style::default().fg(theme.fg_primary).bg(theme.bg_secondary)
+    } else {
+        Style::default()
+            .fg(theme.fg_secondary)
+            .bg(theme.bg_secondary)
+    };
+
+    let icon_style = Style::default()
+        .fg(theme.fg_secondary)
+        .bg(theme.bg_secondary);
+
+    let line = Line::from(vec![
+        Span::styled(icon, icon_style),
+        Span::styled(text, text_style),
+        Span::styled(cursor, cursor_style),
+    ]);
+
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(p, area);
 }
 
 /// Renderiza la línea de query con los toggles de Aa, Ab, .*

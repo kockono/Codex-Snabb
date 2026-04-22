@@ -106,6 +106,20 @@ pub enum Action {
     /// Cancelar el modal Save As sin guardar.
     SaveAsCancel,
 
+    // ── Rename modal ──
+    /// Abrir el modal de rename para el path dado.
+    /// Disponible para keybinding futuro — se dispara directamente desde ContextMenuItem::Rename.
+    #[expect(dead_code, reason = "disponible para keybinding futuro — context menu llama state.rename.open() directamente")]
+    RenameOpen(PathBuf),
+    /// Escribir un carácter en el input de nombre del modal Rename.
+    RenameChar(char),
+    /// Borrar el último carácter del input de nombre del modal Rename.
+    RenameBackspace,
+    /// Confirmar y ejecutar el rename.
+    RenameConfirm,
+    /// Cancelar el modal Rename sin renombrar.
+    RenameCancel,
+
     // ── Tabs ──
     /// Ir a la pestaña siguiente (Ctrl+Tab).
     NextTab,
@@ -157,6 +171,8 @@ pub enum Action {
     SearchReplaceAllInFile,
     /// Toggle fold del file header seleccionado en resultados agrupados.
     SearchToggleFold,
+    /// Toggle expansión/colapso de la fila de filtros (include/exclude).
+    SearchToggleFilters,
     /// Abrir el match seleccionado y navegar al archivo/línea.
     SearchSelectAndOpen,
 

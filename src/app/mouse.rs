@@ -356,6 +356,15 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
 }
 
 /// Procesa click en el search panel — seleccionar item en la lista aplanada.
+///
+/// Layout interno (dentro del borde):
+///   - Fila 0:   query (siempre)
+///   - Fila 1:   replace input (si replace_visible) o hint "⇄ Replace…" (si !replace_visible)
+///   - Fila 2:   filter toggle row "▸/▾ files to include/exclude"
+///   - Fila 3:   include field (solo si filters_expanded)
+///   - Fila 4:   exclude field (solo si filters_expanded)
+///   - Filas siguientes: resultados (lista aplanada)
+///   - Última fila: resumen
 fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16) {
     // Calcular inner area de la sidebar (descontar bordes del Block)
     let inner_y = layout.sidebar.y + 1; // Borde superior + título
@@ -365,8 +374,20 @@ fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16)
         return;
     }
 
-    // Calcular cuántas filas de input hay (query + replace? + include + exclude)
-    let input_lines: u16 = if state.search.replace_visible { 4 } else { 3 };
+    // Calcular cuántas filas de input hay según el nuevo layout:
+    // 3 base (query + replace_hint_or_input + filter_toggle) + 2 si filters_expanded
+    let input_lines: u16 = 3 + if state.search.filters_expanded { 2 } else { 0 };
+
+    // Fila de filter toggle = inner_y + 1 (query) + (1 si replace_visible o siempre 1) = inner_y + 2
+    // La fila del filter toggle es siempre la tercera fila (índice 2 = query=0, replace_hint=1, filter=2)
+    let filter_toggle_row = inner_y + 2;
+
+    if row == filter_toggle_row {
+        // Click en la fila de toggle de filtros → toggle expand/collapse
+        state.search.toggle_filters();
+        return;
+    }
+
     // +1 para summary al fondo
     let results_start = inner_y + input_lines;
     let results_end = inner_y + inner_height - 1; // última fila es summary
@@ -829,19 +850,27 @@ pub(super) fn reduce_mouse_scroll(
             }
         }
         PanelId::Editor => {
-            let editor = state.tabs.active_mut();
-            let line_count = editor.buffer.line_count();
-            match direction {
-                ScrollDirection::Up => {
-                    editor.viewport.scroll_offset = editor
-                        .viewport
-                        .scroll_offset
-                        .saturating_sub(EDITOR_SCROLL_LINES);
+            // Si el diff de git está abierto, scrollear el diff en lugar del editor
+            if state.git.show_diff {
+                match direction {
+                    ScrollDirection::Up => state.git.scroll_diff_up(),
+                    ScrollDirection::Down => state.git.scroll_diff_down(),
                 }
-                ScrollDirection::Down => {
-                    let max_scroll = line_count.saturating_sub(1);
-                    editor.viewport.scroll_offset =
-                        (editor.viewport.scroll_offset + EDITOR_SCROLL_LINES).min(max_scroll);
+            } else {
+                let editor = state.tabs.active_mut();
+                let line_count = editor.buffer.line_count();
+                match direction {
+                    ScrollDirection::Up => {
+                        editor.viewport.scroll_offset = editor
+                            .viewport
+                            .scroll_offset
+                            .saturating_sub(EDITOR_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = line_count.saturating_sub(1);
+                        editor.viewport.scroll_offset =
+                            (editor.viewport.scroll_offset + EDITOR_SCROLL_LINES).min(max_scroll);
+                    }
                 }
             }
         }
@@ -850,6 +879,28 @@ pub(super) fn reduce_mouse_scroll(
                 match direction {
                     ScrollDirection::Up => session.scroll_up(MOUSE_SCROLL_LINES),
                     ScrollDirection::Down => session.scroll_down(MOUSE_SCROLL_LINES),
+                }
+            }
+        }
+        PanelId::Git => {
+            // Scroll sobre el sidebar git — scrollear lista de archivos o diff
+            if state.git.show_diff {
+                match direction {
+                    ScrollDirection::Up => state.git.scroll_diff_up(),
+                    ScrollDirection::Down => state.git.scroll_diff_down(),
+                }
+            } else {
+                let file_count = state.git.files.len();
+                match direction {
+                    ScrollDirection::Up => {
+                        state.git.scroll_offset =
+                            state.git.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = file_count.saturating_sub(1);
+                        state.git.scroll_offset =
+                            (state.git.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                    }
                 }
             }
         }

@@ -83,12 +83,6 @@ pub fn render_git_panel(
         return;
     }
 
-    // Si show_diff, renderizar vista de diff (ocupa todo el inner)
-    if state.show_diff {
-        render_diff_view(f, inner, state, theme);
-        return;
-    }
-
     // Layout VS Code style:
     // branch(1) + input(1) + button(1) + files(fill)
     // Mínimo requerido: 4 líneas para que todo sea visible.
@@ -403,7 +397,10 @@ fn render_file_entry<'a>(
 }
 
 /// Renderiza la vista de diff del archivo seleccionado.
-fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
+///
+/// Función pública — se llama desde `src/ui/mod.rs` para renderizar el diff
+/// en el área combinada (editor_area + bottom_panel) cuando `show_diff == true`.
+pub fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
     let visible_height = area.height as usize;
     if visible_height == 0 {
         return;
@@ -416,20 +413,22 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         .map(|f| f.path.as_str())
         .unwrap_or("(unknown)");
 
-    // Header: 1 línea para título
-    if area.height < 2 {
+    // Mínimo: 1 título + 1 contenido + 1 footer
+    if area.height < 3 {
         return;
     }
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // título
+            Constraint::Length(1), // título con nombre del archivo
             Constraint::Fill(1),   // contenido del diff
+            Constraint::Length(1), // footer con atajos de teclado
         ])
         .split(area);
 
-    // Título
+    // Título: " DIFF: " (accent bold) + filename (primary)
+    // Sin hint inline — el footer lo reemplaza
     let title_line = Line::from(vec![
         Span::styled(
             " DIFF: ",
@@ -441,12 +440,6 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         Span::styled(
             diff_title,
             Style::default().fg(theme.fg_primary).bg(theme.bg_secondary),
-        ),
-        Span::styled(
-            " (Esc/d to close)",
-            Style::default()
-                .fg(theme.fg_secondary)
-                .bg(theme.bg_secondary),
         ),
     ]);
     let title_p = Paragraph::new(title_line).style(Style::default().bg(theme.bg_secondary));
@@ -461,6 +454,8 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         )))
         .style(Style::default().bg(theme.bg_secondary));
         f.render_widget(p, layout[1]);
+        // Footer incluso cuando no hay contenido
+        render_diff_footer(f, layout[2], theme);
         return;
     };
 
@@ -474,6 +469,22 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
 
     let p = Paragraph::new(diff_lines).style(Style::default().bg(theme.bg_secondary));
     f.render_widget(p, layout[1]);
+
+    // Footer con atajos — pre-computado, sin format!() en render
+    render_diff_footer(f, layout[2], theme);
+}
+
+/// Renderiza el footer del diff con atajos de teclado.
+///
+/// Texto estático pre-computado — sin allocaciones en render.
+fn render_diff_footer(f: &mut Frame, area: Rect, theme: &Theme) {
+    // Texto fijo — &'static str, cero allocaciones
+    let footer_line = Line::from(Span::styled(
+        " [↑↓/jk] Scroll   [D/Esc] Cerrar",
+        Style::default().fg(theme.fg_secondary).bg(theme.bg_active),
+    ));
+    let p = Paragraph::new(footer_line).style(Style::default().bg(theme.bg_active));
+    f.render_widget(p, area);
 }
 
 /// Renderiza una línea de diff con colores semánticos.

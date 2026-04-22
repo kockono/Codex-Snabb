@@ -9,6 +9,7 @@ pub mod folder_picker;
 pub mod project;
 pub mod projects;
 pub mod quick_open;
+pub mod rename;
 pub mod save_as;
 pub mod tree;
 

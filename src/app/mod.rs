@@ -43,6 +43,7 @@ use crate::ui::palette::PaletteState;
 use crate::workspace::ExplorerState;
 use crate::workspace::QuickOpenState;
 use crate::workspace::quick_open::GoToLineState;
+use crate::workspace::rename::RenameState;
 use crate::workspace::save_as::SaveAsState;
 
 // ─── Loading Progress ──────────────────────────────────────────────────────────
@@ -122,6 +123,8 @@ pub struct AppState {
     pub folder_picker: crate::workspace::folder_picker::FolderPickerState,
     /// Modal "Guardar como" para buffers sin path asociado (untitled).
     pub save_as: SaveAsState,
+    /// Modal "Rename" para renombrar archivos/directorios desde el context menu.
+    pub rename: RenameState,
     /// Context menu flotante del explorer (aparece al hacer right-click).
     pub context_menu: ContextMenuState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
@@ -184,6 +187,7 @@ impl AppState {
             },
             folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
+            rename: RenameState::new(),
             context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file: String::from("[no file]"),
@@ -240,6 +244,7 @@ impl AppState {
             },
             folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
+            rename: RenameState::new(),
             context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file,
@@ -824,6 +829,11 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             }
             vec![]
         }
+        Action::SearchToggleFilters => {
+            state.search.toggle_filters();
+            tracing::debug!(expanded = state.search.filters_expanded, "toggle filtros");
+            vec![]
+        }
         Action::SearchSelectAndOpen => {
             // Enter: si hay resultados y estamos en la lista, actuar según item
             if state.search.flat_items.is_empty() {
@@ -1374,6 +1384,45 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        // ── Rename modal ──
+        Action::RenameOpen(path) => {
+            // CLONE: path comes from action, RenameState takes ownership
+            state.rename.open(path.clone());
+            tracing::debug!(path = %path.display(), "rename modal abierto");
+            vec![]
+        }
+        Action::RenameChar(ch) => {
+            state.rename.push_char(*ch);
+            vec![]
+        }
+        Action::RenameBackspace => {
+            state.rename.backspace();
+            vec![]
+        }
+        Action::RenameCancel => {
+            state.rename.close();
+            tracing::debug!("rename: cancelado por usuario");
+            vec![]
+        }
+        Action::RenameConfirm => {
+            match state.rename.confirm() {
+                Ok(new_path) => {
+                    // Refrescar explorer para reflejar el nuevo nombre
+                    if let Some(ref mut explorer) = state.explorer
+                        && let Err(e) = explorer.refresh()
+                    {
+                        tracing::error!(error = %e, "error al refrescar explorer después de rename");
+                    }
+                    tracing::info!(path = %new_path.display(), "archivo renombrado");
+                }
+                Err(msg) => {
+                    state.rename.error = Some(msg);
+                    state.rename.error_ticks = 40;
+                }
+            }
+            vec![]
+        }
+
         // ── Projects panel ──
         Action::ProjectsAddNew => {
             // Arrancar desde home del usuario → experiencia natural como file dialog
@@ -1672,8 +1721,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                             tracing::info!(path = %path.display(), "copy file (no impl)");
                         }
                         ContextMenuItem::Rename => {
-                            // Rename — no implementado aún (requiere input modal)
-                            tracing::info!(path = %path.display(), "rename (no impl aún)");
+                            // CLONE: path needed for rename modal — original_path stored in RenameState
+                            state.rename.open(path.clone());
                         }
                     }
                 }
@@ -1996,6 +2045,7 @@ async fn event_loop(
                     state.projects.selected,
                     state.save_as.visible,
                     state.context_menu.visible,
+                    state.rename.visible,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -2021,6 +2071,8 @@ async fn event_loop(
                 state.folder_picker.tick_error();
                 // Tick del error efímero del modal save as
                 state.save_as.tick_error();
+                // Tick del error efímero del modal rename
+                state.rename.tick_error();
                 // Consultar diálogo nativo de carpeta (no bloquea — try_recv)
                 if let Some(path) = state.projects.poll_native_picker() {
                     let effects = reduce(&mut state, &Action::ProjectsNativePickerResult(path));
