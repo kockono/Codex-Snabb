@@ -19,7 +19,7 @@ pub(super) fn get_workspace_root(state: &AppState) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Helper: envía notificación LSP did_change si hay server activo.
+/// Helpr: envía notificación LSP did_change si hay server activo.
 ///
 /// Usa debounce interno del LspState — no envía en cada keystroke.
 pub(super) fn notify_lsp_change(state: &mut AppState) {

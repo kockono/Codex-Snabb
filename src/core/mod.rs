@@ -93,6 +93,33 @@ pub enum Action {
     /// Cerrar el buffer activo.
     CloseBuffer,
 
+    // ── Save As modal ──
+    /// Abrir el modal "Guardar como" (buffer sin path asociado).
+    #[expect(dead_code, reason = "disponible para keybinding futuro — se dispara via SaveFile en buffers untitled")]
+    SaveAsOpen,
+    /// Escribir un carácter en el input de path del modal Save As.
+    SaveAsChar(char),
+    /// Borrar el último carácter del input de path del modal Save As.
+    SaveAsBackspace,
+    /// Confirmar el path y guardar el buffer.
+    SaveAsConfirm,
+    /// Cancelar el modal Save As sin guardar.
+    SaveAsCancel,
+
+    // ── Rename modal ──
+    /// Abrir el modal de rename para el path dado.
+    /// Disponible para keybinding futuro — se dispara directamente desde ContextMenuItem::Rename.
+    #[expect(dead_code, reason = "disponible para keybinding futuro — context menu llama state.rename.open() directamente")]
+    RenameOpen(PathBuf),
+    /// Escribir un carácter en el input de nombre del modal Rename.
+    RenameChar(char),
+    /// Borrar el último carácter del input de nombre del modal Rename.
+    RenameBackspace,
+    /// Confirmar y ejecutar el rename.
+    RenameConfirm,
+    /// Cancelar el modal Rename sin renombrar.
+    RenameCancel,
+
     // ── Tabs ──
     /// Ir a la pestaña siguiente (Ctrl+Tab).
     NextTab,
@@ -144,6 +171,8 @@ pub enum Action {
     SearchReplaceAllInFile,
     /// Toggle fold del file header seleccionado en resultados agrupados.
     SearchToggleFold,
+    /// Toggle expansión/colapso de la fila de filtros (include/exclude).
+    SearchToggleFilters,
     /// Abrir el match seleccionado y navegar al archivo/línea.
     SearchSelectAndOpen,
 
@@ -218,6 +247,14 @@ pub enum Action {
         /// Columna actual del drag (0-indexed, coordenada de terminal).
         col: u16,
         /// Fila actual del drag (0-indexed, coordenada de terminal).
+        row: u16,
+    },
+    /// Right-click del mouse en posición absoluta de terminal.
+    /// Abre el context menu del panel bajo el cursor.
+    MouseRightClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
         row: u16,
     },
 
@@ -358,6 +395,71 @@ pub enum Action {
     // ── Activity Bar ──
     /// Click en un icono de la activity bar para cambiar sección de sidebar.
     ActivityBarSelect(crate::core::settings::SidebarSection),
+
+    // ── Projects panel ──
+    /// Abrir diálogo nativo del SO para agregar nuevo proyecto.
+    ProjectsAddNew,
+    /// El diálogo nativo retornó una carpeta seleccionada por el usuario.
+    /// Contiene el path absoluto de la carpeta elegida.
+    ProjectsNativePickerResult(std::path::PathBuf),
+    /// Cancelar folder picker sin agregar proyecto.
+    #[expect(dead_code, reason = "disponible via command registry — FolderPickerCancel se usa directamente")]
+    ProjectsCancelAdd,
+    /// Seleccionar un proyecto de la lista (índice).
+    #[expect(dead_code, reason = "disponible para keybinding directo — se usa via ProjectsOpen")]
+    ProjectsSelect(usize),
+    /// Toggle del candado de un proyecto (índice).
+    ProjectsToggleLock(usize),
+    /// Eliminar proyecto de la lista (índice).
+    ProjectsRemove(usize),
+    /// Navegar arriba en la lista de proyectos.
+    ProjectsMoveUp,
+    /// Navegar abajo en la lista de proyectos.
+    ProjectsMoveDown,
+    /// Activar/abrir el proyecto seleccionado (switch workspace).
+    ProjectsOpen,
+
+    // ── Context menu (menú contextual del explorer) ──
+    /// Abrir context menu en posición (x, y) para el path del explorer seleccionado.
+    /// Se dispara via MouseRightClick — no hay keybinding directo.
+    ContextMenuOpen {
+        /// Columna de terminal donde aparece el menú.
+        x: u16,
+        /// Fila de terminal donde aparece el menú.
+        y: u16,
+    },
+    /// Cerrar el context menu.
+    ContextMenuClose,
+    /// Mover selección arriba en el context menu.
+    ContextMenuUp,
+    /// Mover selección abajo en el context menu.
+    ContextMenuDown,
+    /// Confirmar el item seleccionado en el context menu.
+    ContextMenuConfirm,
+
+    // ── Folder picker (modal de selección de carpeta) ──
+    /// Navegar arriba en el folder picker.
+    FolderPickerUp,
+    /// Navegar abajo en el folder picker.
+    FolderPickerDown,
+    /// Expandir/navegar al directorio seleccionado en el picker.
+    FolderPickerEnter,
+    /// Subir al directorio padre en el picker.
+    FolderPickerParent,
+    /// Confirmar directorio actual como proyecto.
+    FolderPickerConfirm,
+    /// Cancelar el folder picker.
+    FolderPickerCancel,
+    /// Alternar foco entre el input de path y el árbol en el folder picker.
+    FolderPickerToggleFocus,
+    /// Insertar un carácter en el input de path del folder picker.
+    FolderPickerPathInput(char),
+    /// Borrar último carácter del input de path del folder picker.
+    FolderPickerPathBackspace,
+    /// Confirmar el path escrito en el input (navegar al directorio).
+    FolderPickerPathConfirm,
+    /// Limpiar input de path y devolver foco al árbol (sin cerrar picker).
+    FolderPickerPathEscape,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
@@ -487,6 +589,8 @@ pub enum PanelId {
     /// Overlay del quick open.
     #[expect(dead_code, reason = "se usará en épica 5 — quick open")]
     QuickOpen,
+    /// Panel de proyectos guardados.
+    Projects,
 }
 
 impl PanelId {

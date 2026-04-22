@@ -40,6 +40,12 @@ pub(super) fn keymap(
     settings_visible: bool,
     settings_editing: bool,
     commands: &CommandRegistry,
+    folder_picker_visible: bool,
+    folder_picker_path_focused: bool,
+    projects_selected: usize,
+    save_as_visible: bool,
+    context_menu_visible: bool,
+    rename_visible: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -49,6 +55,10 @@ pub(super) fn keymap(
                 row: mouse.row,
             },
             MouseEventKind::Down(MouseButton::Middle) => Action::MouseMiddleClick {
+                col: mouse.column,
+                row: mouse.row,
+            },
+            MouseEventKind::Down(MouseButton::Right) => Action::MouseRightClick {
                 col: mouse.column,
                 row: mouse.row,
             },
@@ -73,6 +83,65 @@ pub(super) fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Context menu visible: prioridad máxima (antes de todos los overlays) ──
+    if context_menu_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::ContextMenuClose,
+            (KeyCode::Up | KeyCode::Char('k'), _) => Action::ContextMenuUp,
+            (KeyCode::Down | KeyCode::Char('j'), _) => Action::ContextMenuDown,
+            (KeyCode::Enter, _) => Action::ContextMenuConfirm,
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Save As modal visible: prioridad máxima (modal) ──
+    if save_as_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::SaveAsCancel,
+            (KeyCode::Enter, _) => Action::SaveAsConfirm,
+            (KeyCode::Backspace, _) => Action::SaveAsBackspace,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::SaveAsChar(ch),
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Rename modal visible: prioridad máxima (modal) ──
+    if rename_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::RenameCancel,
+            (KeyCode::Enter, _) => Action::RenameConfirm,
+            (KeyCode::Backspace, _) => Action::RenameBackspace,
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::RenameChar(ch),
+            _ => Action::Noop,
+        };
+    }
+
+    // ── Folder picker visible: prioridad máxima (modal) ──
+    if folder_picker_visible {
+        if folder_picker_path_focused {
+            // Input de path enfocado: capturar chars, backspace, enter, esc, tab
+            return match key.code {
+                KeyCode::Tab => Action::FolderPickerToggleFocus,
+                KeyCode::Enter => Action::FolderPickerPathConfirm,
+                KeyCode::Esc => Action::FolderPickerPathEscape,
+                KeyCode::Backspace => Action::FolderPickerPathBackspace,
+                KeyCode::Char(ch) => Action::FolderPickerPathInput(ch),
+                _ => Action::Noop,
+            };
+        }
+        // Árbol enfocado: navegación + Tab para cambiar a input
+        return match key.code {
+            KeyCode::Tab => Action::FolderPickerToggleFocus,
+            KeyCode::Up => Action::FolderPickerUp,
+            KeyCode::Down => Action::FolderPickerDown,
+            KeyCode::Enter => Action::FolderPickerEnter,
+            KeyCode::Char('s') | KeyCode::Char('S') => Action::FolderPickerConfirm,
+            KeyCode::Backspace => Action::FolderPickerParent,
+            KeyCode::Esc => Action::FolderPickerCancel,
+            _ => Action::Noop,
+        };
     }
 
     // ── Settings overlay visible: prioridad máxima ──
@@ -156,8 +225,8 @@ pub(super) fn keymap(
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => Action::QuickOpenUp,
             (KeyCode::Char('n'), KeyModifiers::CONTROL) => Action::QuickOpenDown,
             (KeyCode::Backspace, _) => Action::QuickOpenDeleteChar,
-            // ':' en Quick Open → switch a Go to Line mode
-            (KeyCode::Char(':'), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::OpenGoToLine,
+            // ':' se envía como char normal — QuickOpenState::insert_char() maneja
+            // el switch a go-to-line mode cuando es el primer carácter.
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 Action::QuickOpenInsertChar(ch)
             }
@@ -210,6 +279,8 @@ pub(super) fn keymap(
             (KeyCode::Char('w'), KeyModifiers::ALT) => Action::SearchToggleWholeWord,
             // Alt+R → toggle regex
             (KeyCode::Char('r'), KeyModifiers::ALT) => Action::SearchToggleRegex,
+            // Alt+F → toggle filtros (include/exclude) expandidos/colapsados
+            (KeyCode::Char('f'), KeyModifiers::ALT) => Action::SearchToggleFilters,
             // Ctrl+Shift+H → toggle replace
             (KeyCode::Char('H'), mods)
                 if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
@@ -238,6 +309,12 @@ pub(super) fn keymap(
 
     // ── Git panel activo: captura input cuando foco en Git ──
     if git_state.visible && focused_panel == PanelId::Git {
+        // Ctrl+Enter siempre confirma el commit (independiente del modo).
+        // Se verifica primero para que funcione tanto en commit_mode como en modo normal.
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::GitCommitConfirm;
+        }
+
         // Modo commit: capturar chars para el mensaje
         if git_state.commit_mode {
             return match (key.code, key.modifiers) {
@@ -266,6 +343,7 @@ pub(super) fn keymap(
         }
 
         // Modo normal: navegación de lista de archivos
+        // 'c' ahora activa el modo commit (foco en el input — commit_mode = true)
         return match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Action::GitClose,
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::GitUp,
@@ -413,7 +491,29 @@ pub(super) fn keymap(
             (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => Action::ExplorerCollapse,
             // Refresh
             (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ExplorerRefresh,
+            // Context menu — alternativa al right-click para Windows Terminal
+            // que intercepta el right-click antes de que llegue a la app
+            (KeyCode::Char('m'), KeyModifiers::NONE) | (KeyCode::F(10), KeyModifiers::SHIFT) => {
+                Action::ContextMenuOpen { x: 0, y: 0 }
+            }
 
+            _ => Action::Noop,
+        },
+
+        PanelId::Projects => match (key.code, key.modifiers) {
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ProjectsMoveUp,
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::ProjectsMoveDown,
+            (KeyCode::Enter, KeyModifiers::NONE) => Action::ProjectsOpen,
+            (KeyCode::Char('+') | KeyCode::Char('a'), KeyModifiers::NONE) => Action::ProjectsAddNew,
+            (KeyCode::Char('l') | KeyCode::Char('L'), KeyModifiers::NONE) => {
+                Action::ProjectsToggleLock(projects_selected)
+            }
+            (KeyCode::Char('d') | KeyCode::Char('D'), KeyModifiers::NONE) => {
+                Action::ProjectsRemove(projects_selected)
+            }
+            (KeyCode::Esc, _) => {
+                Action::ActivityBarSelect(crate::core::settings::SidebarSection::Explorer)
+            }
             _ => Action::Noop,
         },
 
@@ -462,6 +562,12 @@ mod tests {
             false, // settings
             false, // settings_editing
             &commands,
+            false, // folder_picker
+            false, // folder_picker_path_focused
+            0,     // projects_selected
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -483,6 +589,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -507,6 +619,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -528,6 +646,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -549,6 +673,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -570,6 +700,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -591,12 +727,20 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
 
     #[test]
-    fn colon_in_quick_open_returns_open_go_to_line() {
+    fn colon_in_quick_open_returns_insert_char() {
+        // ':' ya no abre un modal separado — se envía como char normal.
+        // QuickOpenState::insert_char() maneja el switch a go-to-line inline.
         let commands = test_commands();
         let event = key_event(KeyCode::Char(':'), KeyModifiers::SHIFT);
         let action = keymap(
@@ -612,8 +756,14 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
-        assert_eq!(action, Action::OpenGoToLine);
+        assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
 
     #[test]
@@ -633,6 +783,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -654,6 +810,12 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -675,7 +837,175 @@ mod tests {
             false,
             false,
             &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
         );
         assert_eq!(action, Action::GoToLineClose);
+    }
+
+    #[test]
+    fn esc_in_save_as_modal_returns_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            true,  // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
+        );
+        assert_eq!(action, Action::SaveAsCancel);
+    }
+
+    #[test]
+    fn enter_in_save_as_modal_returns_confirm() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            true,  // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
+        );
+        assert_eq!(action, Action::SaveAsConfirm);
+    }
+
+    #[test]
+    fn char_in_save_as_modal_returns_save_as_char() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            true,  // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
+        );
+        assert_eq!(action, Action::SaveAsChar('a'));
+    }
+
+    #[test]
+    fn esc_in_rename_modal_returns_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameCancel);
+    }
+
+    #[test]
+    fn enter_in_rename_modal_returns_confirm() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameConfirm);
+    }
+
+    #[test]
+    fn char_in_rename_modal_returns_rename_char() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            true,  // rename_visible
+        );
+        assert_eq!(action, Action::RenameChar('x'));
     }
 }

@@ -15,7 +15,7 @@ use ratatui::{
 
 use crate::ui::layout::{self, IdeLayout};
 use crate::ui::theme::Theme;
-use crate::workspace::quick_open::{QuickOpenState, MAX_VISIBLE_ITEMS};
+use crate::workspace::quick_open::{QuickOpenMode, QuickOpenState, MAX_VISIBLE_ITEMS};
 
 // ─── Render ────────────────────────────────────────────────────────────────────
 
@@ -28,13 +28,25 @@ use crate::workspace::quick_open::{QuickOpenState, MAX_VISIBLE_ITEMS};
 ///
 /// Precondición: `state.visible == true`.
 /// NO aloca `format!()` dentro del loop de items — pre-computa antes.
-pub fn render_quick_open(f: &mut Frame, layout: &IdeLayout, state: &QuickOpenState, theme: &Theme) {
+pub fn render_quick_open(
+    f: &mut Frame,
+    layout: &IdeLayout,
+    state: &QuickOpenState,
+    theme: &Theme,
+    active_file_name: &str,
+    cursor_visible: bool,
+) {
     if !state.visible {
         return;
     }
 
     // ── Calcular área del overlay via modal_rect ──
-    let visible_items = state.filtered.len().min(MAX_VISIBLE_ITEMS);
+    // En GoToLine mode el area de lista se reemplaza por un hint fijo de ~3 líneas.
+    let visible_items = if state.mode == QuickOpenMode::GoToLine {
+        3
+    } else {
+        state.filtered.len().min(MAX_VISIBLE_ITEMS)
+    };
     let modal_height = (visible_items as u16 + 5).max(6);
     let overlay_rect = layout::modal_rect(layout, modal_height);
 
@@ -75,58 +87,121 @@ pub fn render_quick_open(f: &mut Frame, layout: &IdeLayout, state: &QuickOpenSta
     let list_area = inner_layout[1];
     let footer_area = inner_layout[2];
 
-    // ── Render input field ──
-    let input_line = Line::from(vec![
-        Span::styled(
-            "\u{1f50d} ",
-            Style::default()
-                .fg(theme.fg_accent_alt)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(state.input.as_str(), Style::default().fg(theme.fg_primary)),
-        Span::styled(
-            "_",
-            Style::default()
-                .fg(theme.fg_accent_alt)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ]);
-    let input_paragraph = Paragraph::new(input_line).style(Style::default().bg(theme.bg_secondary));
-    f.render_widget(input_paragraph, input_area);
+    if state.mode == QuickOpenMode::GoToLine {
+        // ── GoToLine mode ──
 
-    // ── Render lista de archivos ──
-    if list_area.height == 0 {
-        return;
+        // Input line: ": 42_"
+        let input_line = Line::from(vec![
+            Span::styled(
+                ": ",
+                Style::default()
+                    .fg(theme.fg_accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(state.input.as_str(), Style::default().fg(theme.fg_primary)),
+            Span::styled(
+                if cursor_visible { "|" } else { "" },
+                Style::default().fg(theme.fg_accent_alt),
+            ),
+        ]);
+        let input_paragraph =
+            Paragraph::new(input_line).style(Style::default().bg(theme.bg_secondary));
+        f.render_widget(input_paragraph, input_area);
+
+        // Hint area: file name + range + parsed line
+        // Pre-format strings — one allocation each, outside any loop
+        let file_hint = format!("  Ir a l\u{00ed}nea en {active_file_name}");
+        let range_hint = format!("  1 \u{2013} {}", state.total_lines);
+        let line_hint = match state.parsed_line() {
+            Some(n) => format!("  \u{2192} L\u{00ed}nea {n}"),
+            None => String::from("  Escrib\u{00ed} un n\u{00fa}mero"),
+        };
+
+        if list_area.height > 0 {
+            let hint_lines = vec![
+                Line::from(Span::styled(
+                    file_hint,
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    range_hint,
+                    Style::default().fg(theme.fg_secondary),
+                )),
+                Line::from(Span::styled(
+                    line_hint,
+                    Style::default().fg(theme.fg_accent_alt),
+                )),
+            ];
+            let hint_paragraph =
+                Paragraph::new(hint_lines).style(Style::default().bg(theme.bg_secondary));
+            f.render_widget(hint_paragraph, list_area);
+        }
+
+        // Footer for go-to-line mode
+        let footer = Paragraph::new(Line::from(Span::styled(
+            " [Enter] Ir a l\u{00ed}nea   [\u{232b}] Volver   [Esc] Cerrar",
+            Style::default().fg(theme.fg_secondary),
+        )))
+        .alignment(Alignment::Left)
+        .style(Style::default().bg(theme.bg_active));
+        f.render_widget(footer, footer_area);
+    } else {
+        // ── FileSearch mode (existing behavior) ──
+
+        // Render input field
+        let input_line = Line::from(vec![
+            Span::styled(
+                "\u{1f50d} ",
+                Style::default()
+                    .fg(theme.fg_accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(state.input.as_str(), Style::default().fg(theme.fg_primary)),
+            Span::styled(
+                if cursor_visible { "|" } else { "" },
+                Style::default().fg(theme.fg_accent_alt),
+            ),
+        ]);
+        let input_paragraph =
+            Paragraph::new(input_line).style(Style::default().bg(theme.bg_secondary));
+        f.render_widget(input_paragraph, input_area);
+
+        // Render lista de archivos
+        if list_area.height == 0 {
+            return;
+        }
+
+        let visible_count = (list_area.height as usize)
+            .min(state.filtered.len().saturating_sub(state.scroll_offset));
+
+        // Pre-computar las líneas fuera del render — sin format!() en el loop
+        let lines: Vec<Line<'_>> = state
+            .filtered
+            .iter()
+            .skip(state.scroll_offset)
+            .take(visible_count)
+            .enumerate()
+            .map(|(i, &file_idx)| {
+                let path = &state.file_index[file_idx];
+                let is_selected = state.scroll_offset + i == state.selected_index;
+                render_file_item(path, is_selected, list_area.width as usize, theme)
+            })
+            .collect();
+
+        let list_paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
+        f.render_widget(list_paragraph, list_area);
+
+        // Footer con atajos
+        let footer = Paragraph::new(Line::from(Span::styled(
+            " [\u{2191}\u{2193}] Navegar   [Enter] Abrir   [:] L\u{00ed}nea   [Esc] Cerrar",
+            Style::default().fg(theme.fg_secondary),
+        )))
+        .alignment(Alignment::Left)
+        .style(Style::default().bg(theme.bg_active));
+        f.render_widget(footer, footer_area);
     }
-
-    let visible_count =
-        (list_area.height as usize).min(state.filtered.len().saturating_sub(state.scroll_offset));
-
-    // Pre-computar las líneas fuera del render — sin format!() en el loop
-    let lines: Vec<Line<'_>> = state
-        .filtered
-        .iter()
-        .skip(state.scroll_offset)
-        .take(visible_count)
-        .enumerate()
-        .map(|(i, &file_idx)| {
-            let path = &state.file_index[file_idx];
-            let is_selected = state.scroll_offset + i == state.selected_index;
-            render_file_item(path, is_selected, list_area.width as usize, theme)
-        })
-        .collect();
-
-    let list_paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
-    f.render_widget(list_paragraph, list_area);
-
-    // ── Footer con atajos ──
-    let footer = Paragraph::new(Line::from(Span::styled(
-        " [\u{2191}\u{2193}] Navegar   [Enter] Abrir   [:] Línea   [Esc] Cerrar",
-        Style::default().fg(theme.fg_secondary),
-    )))
-    .alignment(Alignment::Left)
-    .style(Style::default().bg(theme.bg_active));
-    f.render_widget(footer, footer_area);
 }
 
 /// Renderiza un item de archivo como una `Line` de ratatui.

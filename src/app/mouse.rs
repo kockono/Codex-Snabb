@@ -84,8 +84,76 @@ pub(super) fn hit_test_panel(layout: &IdeLayout, col: u16, row: u16) -> Option<H
 
 // ─── Mouse click ───────────────────────────────────────────────────────────────
 
+/// Procesa un right-click de mouse — abre context menu si es en el explorer.
+pub(super) fn reduce_mouse_right_click(state: &mut AppState, col: u16, row: u16) {
+    let Some(layout) = state.last_layout else {
+        return; // Sin layout aún — primer frame
+    };
+
+    let Some(hit) = hit_test_panel(&layout, col, row) else {
+        return; // Click en zona no interactiva
+    };
+
+    // Redirigir correctamente igual que en reduce_mouse_click
+    let panel = match hit {
+        HitTestResult::Panel(p) => {
+            if p == PanelId::Explorer && state.search.visible {
+                PanelId::Search
+            } else if p == PanelId::Explorer && state.git.visible {
+                PanelId::Git
+            } else if p == PanelId::Explorer && state.projects.visible {
+                PanelId::Projects
+            } else {
+                p
+            }
+        }
+        HitTestResult::ActivityBar { .. } => return, // No context menu en activity bar
+    };
+
+    if panel == PanelId::Explorer {
+        // Resolver qué archivo está en la fila clickeada
+        if let Some(path) = get_explorer_path_at_row(state, &layout, row) {
+            state.context_menu.open(col, row, path);
+            tracing::debug!(col, row, "context menu abierto via right-click");
+        }
+    }
+}
+
+/// Retorna el path del archivo/directorio en la fila visual del explorer.
+///
+/// Extrae la lógica de resolución de fila → path del `reduce_mouse_click_explorer`
+/// para reusar en el right-click handler sin duplicar código.
+fn get_explorer_path_at_row(
+    state: &AppState,
+    layout: &IdeLayout,
+    row: u16,
+) -> Option<std::path::PathBuf> {
+    let explorer = state.explorer.as_ref()?;
+
+    // Calcular el inner area de la sidebar (misma lógica que reduce_mouse_click_explorer)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return None; // Click en el borde del panel
+    }
+
+    let visual_row = (row - inner_y) as usize;
+    let flat_index = explorer.scroll_offset + visual_row;
+
+    let flat = explorer.flatten();
+    // CLONE: necesario — el path se retorna como owned, el Vec se destruye al salir
+    flat.get(flat_index).map(|e| e.path.clone())
+}
+
 /// Procesa un click de mouse — resuelve panel, cambia foco, ejecuta acción contextual.
 pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
+    // Si el context menu está visible, cerrarlo al hacer left-click
+    // El click se sigue procesando normalmente después de cerrar el menú.
+    if state.context_menu.visible {
+        state.context_menu.close();
+    }
+
     let Some(layout) = state.last_layout else {
         return; // Sin layout aún — primer frame
     };
@@ -179,6 +247,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                     0 => Some(SidebarSection::Explorer),
                     1 => Some(SidebarSection::Git),
                     2 => Some(SidebarSection::Search),
+                    3 => Some(SidebarSection::Projects),
                     _ => None,
                 };
                 if let Some(section) = section {
@@ -188,11 +257,13 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
             }
         }
         HitTestResult::Panel(panel) => {
-            // Si la sidebar muestra search o git, redirigir foco al panel activo
+            // Si la sidebar muestra search, git o projects, redirigir foco al panel activo
             let panel = if panel == PanelId::Explorer && state.search.visible {
                 PanelId::Search
             } else if panel == PanelId::Explorer && state.git.visible {
                 PanelId::Git
+            } else if panel == PanelId::Explorer && state.projects.visible {
+                PanelId::Projects
             } else {
                 panel
             };
@@ -206,11 +277,18 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                     // Click en search panel — resolver qué flat item fue clickeado
                     reduce_mouse_click_search(state, &layout, row);
                 }
+                PanelId::Git => {
+                    // Click en git panel — input row, button row o file list
+                    reduce_mouse_click_git(state, &layout, row);
+                }
                 PanelId::Explorer => {
                     reduce_mouse_click_explorer(state, &layout, row);
                 }
                 PanelId::Editor => {
                     reduce_mouse_click_editor(state, &layout, col, row);
+                }
+                PanelId::Projects => {
+                    reduce_mouse_click_projects(state, &layout, col, row);
                 }
                 // Terminal y otros: solo cambio de foco por ahora
                 _ => {}
@@ -278,6 +356,15 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
 }
 
 /// Procesa click en el search panel — seleccionar item en la lista aplanada.
+///
+/// Layout interno (dentro del borde):
+///   - Fila 0:   query (siempre)
+///   - Fila 1:   replace input (si replace_visible) o hint "⇄ Replace…" (si !replace_visible)
+///   - Fila 2:   filter toggle row "▸/▾ files to include/exclude"
+///   - Fila 3:   include field (solo si filters_expanded)
+///   - Fila 4:   exclude field (solo si filters_expanded)
+///   - Filas siguientes: resultados (lista aplanada)
+///   - Última fila: resumen
 fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16) {
     // Calcular inner area de la sidebar (descontar bordes del Block)
     let inner_y = layout.sidebar.y + 1; // Borde superior + título
@@ -287,8 +374,20 @@ fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16)
         return;
     }
 
-    // Calcular cuántas filas de input hay (query + replace? + include + exclude)
-    let input_lines: u16 = if state.search.replace_visible { 4 } else { 3 };
+    // Calcular cuántas filas de input hay según el nuevo layout:
+    // 3 base (query + replace_hint_or_input + filter_toggle) + 2 si filters_expanded
+    let input_lines: u16 = 3 + if state.search.filters_expanded { 2 } else { 0 };
+
+    // Fila de filter toggle = inner_y + 1 (query) + (1 si replace_visible o siempre 1) = inner_y + 2
+    // La fila del filter toggle es siempre la tercera fila (índice 2 = query=0, replace_hint=1, filter=2)
+    let filter_toggle_row = inner_y + 2;
+
+    if row == filter_toggle_row {
+        // Click en la fila de toggle de filtros → toggle expand/collapse
+        state.search.toggle_filters();
+        return;
+    }
+
     // +1 para summary al fondo
     let results_start = inner_y + input_lines;
     let results_end = inner_y + inner_height - 1; // última fila es summary
@@ -315,6 +414,69 @@ fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16)
         crate::search::FlatSearchItem::MatchLine { match_index, .. } => {
             state.search.selected_match = match_index;
             super::navigate_to_search_match(state);
+        }
+    }
+}
+
+/// Procesa click en el git panel — foco en input, trigger commit, o selección de archivo.
+///
+/// Layout interno del panel (dentro del borde):
+///   - Fila 0: branch name           → ignorar (solo informativo)
+///   - Fila 1: commit input row      → activar commit_mode (dar foco al input)
+///   - Fila 2: commit button row     → ejecutar commit si commit_input no está vacío
+///   - Fila 3: separador             → ignorar
+///   - Filas 4+: lista de archivos   → seleccionar archivo (future: stage toggle)
+fn reduce_mouse_click_git(state: &mut AppState, layout: &IdeLayout, row: u16) {
+    // inner_y = sidebar.y + 1 (borde superior del Block + título ocupa 1 fila)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // click en borde
+    }
+
+    let visual_row = (row - inner_y) as usize;
+
+    match visual_row {
+        0 => {
+            // Branch line — ignorar (no interactivo)
+        }
+        1 => {
+            // Commit input row — dar foco (activar commit_mode)
+            state.git.commit_mode = true;
+            tracing::debug!("git panel: foco en commit input via mouse click");
+        }
+        2 => {
+            // Commit button row — ejecutar commit si hay mensaje
+            if !state.git.commit_input.trim().is_empty() {
+                let root = get_workspace_root(state);
+                match state.git.commit(&root) {
+                    Ok(()) => {
+                        tracing::info!("git panel: commit via mouse click en botón ✓ Commit");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "git panel: error al hacer commit via mouse");
+                    }
+                }
+            } else {
+                // Sin mensaje: dar foco al input para que el usuario escriba
+                state.git.commit_mode = true;
+                tracing::debug!("git panel: click en botón Commit sin mensaje → foco en input");
+            }
+        }
+        3 => {
+            // Separador — ignorar
+        }
+        visual => {
+            // Lista de archivos — seleccionar (visual 4+ → índice = visual - 4 + scroll)
+            let list_row = visual - 4;
+            // El scroll_offset gestiona el viewport de la lista.
+            // No stage/toggle por click aquí: el usuario usa Enter/'s' con teclado.
+            let idx = state.git.scroll_offset + list_row;
+            if idx < state.git.files.len() {
+                state.git.selected_index = idx;
+                tracing::debug!(idx, "git panel: archivo seleccionado via mouse click");
+            }
         }
     }
 }
@@ -491,6 +653,69 @@ pub(super) fn reduce_mouse_middle_click(state: &mut AppState, col: u16, row: u16
     }
 }
 
+// ─── Projects panel click ──────────────────────────────────────────────────────
+
+/// Procesa click en el panel de proyectos.
+///
+/// Layout interno del panel (dentro del borde):
+///   - Fila 0: `[+] Nuevo proyecto` → abre diálogo nativo de carpeta
+///   - Fila 1: separador            → ignorar
+///   - Filas 2+: lista de proyectos → seleccionar + abrir
+///
+/// En filas 2+, si el click cae en la zona ` [x]` (últimos 4 chars del inner area),
+/// elimina el proyecto inmediatamente sin confirmación.
+fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u16, row: u16) {
+    // inner_y = sidebar.y + 1 (borde superior del Block)
+    let inner_y = layout.sidebar.y + 1;
+    let inner_height = layout.sidebar.height.saturating_sub(2);
+
+    if row < inner_y || row >= inner_y + inner_height {
+        return; // click en borde
+    }
+
+    let visual_row = (row - inner_y) as usize;
+
+    match visual_row {
+        0 => {
+            // Click en [+] Nuevo proyecto → abrir diálogo nativo del SO
+            let effects = super::reduce(state, &crate::core::Action::ProjectsAddNew);
+            super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+            tracing::debug!("projects: diálogo nativo iniciado via mouse click");
+        }
+        1 => { /* separador — ignorar */ }
+        visual => {
+            // Click en la lista de proyectos (visual 2+ → índice visual - 2)
+            let list_row = visual - 2;
+            let idx = state.projects.scroll_offset + list_row;
+            if idx >= state.projects.projects.len() {
+                return;
+            }
+
+            // Detectar click en el botón " [x]" (últimos 4 chars del inner area).
+            // inner_x = sidebar.x + 1 (borde izquierdo del Block)
+            // inner_width = sidebar.width - 2 (bordes izquierdo y derecho)
+            // Zona de delete: desde (inner_x + inner_width - 4) hasta el borde derecho.
+            let inner_x = layout.sidebar.x + 1;
+            let inner_width = layout.sidebar.width.saturating_sub(2);
+            // delete_btn_width = 4 (" [x]") — debe coincidir con render en projects_panel.rs
+            let delete_zone_start = inner_x + inner_width.saturating_sub(4);
+
+            if col >= delete_zone_start {
+                // Click en [x] → eliminar proyecto inmediatamente (sin confirmación)
+                state.projects.remove(idx);
+                tracing::debug!(idx, "projects: proyecto eliminado via botón [x]");
+            } else if state.projects.selected == idx {
+                // Segundo click en el mismo proyecto → abrir
+                let effects = super::reduce(state, &crate::core::Action::ProjectsOpen);
+                super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+            } else {
+                // Primer click → solo seleccionar
+                state.projects.selected = idx;
+            }
+        }
+    }
+}
+
 // ─── Mouse drag ────────────────────────────────────────────────────────────────
 
 /// Procesa drag del mouse — selección de texto arrastrando.
@@ -625,19 +850,27 @@ pub(super) fn reduce_mouse_scroll(
             }
         }
         PanelId::Editor => {
-            let editor = state.tabs.active_mut();
-            let line_count = editor.buffer.line_count();
-            match direction {
-                ScrollDirection::Up => {
-                    editor.viewport.scroll_offset = editor
-                        .viewport
-                        .scroll_offset
-                        .saturating_sub(EDITOR_SCROLL_LINES);
+            // Si el diff de git está abierto, scrollear el diff en lugar del editor
+            if state.git.show_diff {
+                match direction {
+                    ScrollDirection::Up => state.git.scroll_diff_up(),
+                    ScrollDirection::Down => state.git.scroll_diff_down(),
                 }
-                ScrollDirection::Down => {
-                    let max_scroll = line_count.saturating_sub(1);
-                    editor.viewport.scroll_offset =
-                        (editor.viewport.scroll_offset + EDITOR_SCROLL_LINES).min(max_scroll);
+            } else {
+                let editor = state.tabs.active_mut();
+                let line_count = editor.buffer.line_count();
+                match direction {
+                    ScrollDirection::Up => {
+                        editor.viewport.scroll_offset = editor
+                            .viewport
+                            .scroll_offset
+                            .saturating_sub(EDITOR_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = line_count.saturating_sub(1);
+                        editor.viewport.scroll_offset =
+                            (editor.viewport.scroll_offset + EDITOR_SCROLL_LINES).min(max_scroll);
+                    }
                 }
             }
         }
@@ -646,6 +879,28 @@ pub(super) fn reduce_mouse_scroll(
                 match direction {
                     ScrollDirection::Up => session.scroll_up(MOUSE_SCROLL_LINES),
                     ScrollDirection::Down => session.scroll_down(MOUSE_SCROLL_LINES),
+                }
+            }
+        }
+        PanelId::Git => {
+            // Scroll sobre el sidebar git — scrollear lista de archivos o diff
+            if state.git.show_diff {
+                match direction {
+                    ScrollDirection::Up => state.git.scroll_diff_up(),
+                    ScrollDirection::Down => state.git.scroll_diff_down(),
+                }
+            } else {
+                let file_count = state.git.files.len();
+                match direction {
+                    ScrollDirection::Up => {
+                        state.git.scroll_offset =
+                            state.git.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                    }
+                    ScrollDirection::Down => {
+                        let max_scroll = file_count.saturating_sub(1);
+                        state.git.scroll_offset =
+                            (state.git.scroll_offset + MOUSE_SCROLL_LINES).min(max_scroll);
+                    }
                 }
             }
         }

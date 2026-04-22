@@ -3,22 +3,24 @@
 //! Se muestra cuando `GitState::visible` es `true`, reemplazando el explorer
 //! en la sidebar (prioridad: search > git > explorer).
 //!
-//! Layout:
-//! - Branch name arriba
-//! - Sección "Staged Changes" con conteo
-//! - Sección "Changes" con conteo
-//! - Input de commit (si commit_mode)
-//! - Diff viewer (si show_diff)
+//! Layout (VS Code style — siempre visible):
+//! - Branch name arriba (1 línea)
+//! - Input de commit — SIEMPRE visible (1 línea)
+//! - Botón "✓ Commit" — SIEMPRE visible (1 línea)
+//! - Separador (1 línea)
+//! - Lista de archivos (resto del espacio)
+//! - Diff viewer (si show_diff — reemplaza todo lo anterior)
 //!
 //! Reglas de render:
 //! - Sin `format!()` dentro de loops
 //! - Sin allocaciones innecesarias
 //! - Viewport virtual para listas
 //! - Datos pre-computados desde `GitState`
+//! - Sin `Modifier::SLOW_BLINK` — usar `cursor_visible: bool` para blink
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
@@ -29,7 +31,17 @@ use crate::git::GitState;
 use crate::ui::theme::Theme;
 
 /// Renderiza el panel de Git / source control dentro de la sidebar.
-pub fn render_git_panel(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme, focused: bool) {
+///
+/// `cursor_visible` controla el blink del cursor en el input de commit.
+/// `true` = cursor visible; `false` = cursor oculto (blink off).
+pub fn render_git_panel(
+    f: &mut Frame,
+    area: Rect,
+    state: &GitState,
+    theme: &Theme,
+    focused: bool,
+    cursor_visible: bool,
+) {
     // Bloque exterior con estilo de foco
     let (border_color, border_type, title_style) = if focused {
         (
@@ -71,18 +83,11 @@ pub fn render_git_panel(f: &mut Frame, area: Rect, state: &GitState, theme: &The
         return;
     }
 
-    // Si show_diff, renderizar vista de diff
-    if state.show_diff {
-        render_diff_view(f, inner, state, theme);
-        return;
-    }
-
-    // Calcular alturas: branch(1) + commit(si aplica) + resto para archivos
-    let commit_height: u16 = if state.commit_mode { 2 } else { 0 };
-    let min_file_height: u16 = 1;
-
-    if inner.height < 1 + commit_height + min_file_height {
-        // Espacio insuficiente — solo branch
+    // Layout VS Code style:
+    // branch(1) + input(1) + button(1) + files(fill)
+    // Mínimo requerido: 4 líneas para que todo sea visible.
+    let min_height: u16 = 4;
+    if inner.height < min_height {
         render_branch_line(f, inner, state, theme);
         return;
     }
@@ -90,18 +95,17 @@ pub fn render_git_panel(f: &mut Frame, area: Rect, state: &GitState, theme: &The
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // branch
-            Constraint::Fill(1),               // archivos
-            Constraint::Length(commit_height), // commit input (si aplica)
+            Constraint::Length(1), // branch
+            Constraint::Length(1), // commit input (siempre visible)
+            Constraint::Length(1), // botón [ ✓ Commit ]
+            Constraint::Fill(1),   // archivos
         ])
         .split(inner);
 
     render_branch_line(f, layout[0], state, theme);
-    render_file_list(f, layout[1], state, theme);
-
-    if state.commit_mode {
-        render_commit_input(f, layout[2], state, theme);
-    }
+    render_commit_input_row(f, layout[1], state, theme, cursor_visible);
+    render_commit_button_row(f, layout[2], theme);
+    render_file_list(f, layout[3], state, theme);
 }
 
 /// Renderiza la línea del branch actual.
@@ -118,7 +122,7 @@ fn render_branch_line(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme
 
     let line = Line::from(vec![
         Span::styled(
-            " \u{e0a0} ", // nerd font branch icon (fallback: usamos texto plano)
+            " \u{e0a0} ", // nerd font branch icon
             Style::default()
                 .fg(theme.fg_accent_alt)
                 .bg(theme.bg_secondary),
@@ -130,6 +134,104 @@ fn render_branch_line(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme
                 .bg(theme.bg_secondary)
                 .add_modifier(Modifier::BOLD),
         ),
+    ]);
+
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
+    f.render_widget(p, area);
+}
+
+/// Renderiza la fila del input de commit (siempre visible, estilo VS Code).
+///
+/// - Fondo: `theme.bg_active` para distinguirlo visualmente del file list.
+/// - Vacío + sin foco: muestra placeholder `"Message (Ctrl+Enter)..."` en dim.
+/// - Con texto o con foco: muestra el texto del input.
+/// - Cursor: `"|"` si `commit_mode && cursor_visible`, sino `""`.
+fn render_commit_input_row(
+    f: &mut Frame,
+    area: Rect,
+    state: &GitState,
+    theme: &Theme,
+    cursor_visible: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let bg = theme.bg_active;
+
+    let (content_span, cursor_span) = if state.commit_input.is_empty() && !state.commit_mode {
+        // Placeholder: vacío + sin foco
+        let placeholder = Span::styled(
+            "  Message (Ctrl+Enter)...",
+            Style::default()
+                .fg(theme.fg_secondary)
+                .bg(bg)
+                .add_modifier(Modifier::DIM),
+        );
+        let cursor = Span::styled("", Style::default().bg(bg));
+        (placeholder, cursor)
+    } else {
+        // Texto real o modo activo
+        let text = Span::styled(
+            // CLONE: necesario — commit_input es &String, Span necesita owned o 'static
+            // Usamos as_str() para obtener &str — no hay clone aquí.
+            state.commit_input.as_str(),
+            Style::default().fg(theme.fg_primary).bg(bg),
+        );
+        // Cursor: visible solo cuando commit_mode Y cursor_visible (blink)
+        let cursor_str = if state.commit_mode && cursor_visible {
+            "|"
+        } else {
+            ""
+        };
+        let cursor = Span::styled(cursor_str, Style::default().fg(theme.fg_accent).bg(bg));
+        (text, cursor)
+    };
+
+    let prefix = Span::styled("  ", Style::default().bg(bg));
+    let line = if state.commit_input.is_empty() && !state.commit_mode {
+        // Placeholder: no prefix adicional — el placeholder ya tiene 2 espacios
+        Line::from(vec![content_span, cursor_span])
+    } else {
+        Line::from(vec![prefix, content_span, cursor_span])
+    };
+
+    let p = Paragraph::new(line).style(Style::default().bg(bg));
+    f.render_widget(p, area);
+}
+
+/// Renderiza el botón "✓ Commit" en 1 fila con corchetes y gris bajo.
+///
+/// ```text
+///   [ ✓ Commit ]
+/// ```
+fn render_commit_button_row(f: &mut Frame, area: Rect, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+
+    // Gris bajo sutil — se diferencia del bg sin ser llamativo
+    let btn_bg = Color::Rgb(35, 40, 48); // #232830 — gris azulado oscuro
+    let btn_fg = Color::Rgb(180, 185, 192); // #b4b9c0 — gris claro legible
+    let bracket_fg = Color::Rgb(100, 108, 118); // #646c76 — corchetes más dim
+
+    // Centrar el botón: "[ ✓ Commit ]" = 13 chars visibles
+    // pad_left = (area_width - 13) / 2, mínimo 0
+    let btn_visible_width = 19usize; // "[ ✓ Commit ]"
+    let pad_left = (area.width as usize).saturating_sub(btn_visible_width) / 2;
+    let pad_str = " ".repeat(pad_left);
+
+    let line = Line::from(vec![
+        Span::styled(pad_str, Style::default().bg(theme.bg_secondary)),
+        Span::styled("[    ", Style::default().fg(bracket_fg).bg(btn_bg)),
+        Span::styled(
+            "\u{2713} Commit",
+            Style::default()
+                .fg(btn_fg)
+                .bg(btn_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("    ]", Style::default().fg(bracket_fg).bg(btn_bg)),
     ]);
 
     let p = Paragraph::new(line).style(Style::default().bg(theme.bg_secondary));
@@ -294,39 +396,11 @@ fn render_file_entry<'a>(
     ])
 }
 
-/// Renderiza el input de commit message.
-fn render_commit_input(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
-    if area.height == 0 {
-        return;
-    }
-
-    let label_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(theme.bg_secondary)
-        .add_modifier(Modifier::BOLD);
-
-    let input_style = Style::default().fg(theme.fg_primary).bg(theme.bg_secondary);
-
-    let cursor_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(theme.bg_secondary)
-        .add_modifier(Modifier::SLOW_BLINK);
-
-    let lines = vec![
-        Line::from(Span::styled(" Commit:", label_style)),
-        Line::from(vec![
-            Span::styled(" ", Style::default().bg(theme.bg_secondary)),
-            Span::styled(state.commit_input.as_str(), input_style),
-            Span::styled("_", cursor_style),
-        ]),
-    ];
-
-    let p = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
-    f.render_widget(p, area);
-}
-
 /// Renderiza la vista de diff del archivo seleccionado.
-fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
+///
+/// Función pública — se llama desde `src/ui/mod.rs` para renderizar el diff
+/// en el área combinada (editor_area + bottom_panel) cuando `show_diff == true`.
+pub fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
     let visible_height = area.height as usize;
     if visible_height == 0 {
         return;
@@ -339,20 +413,22 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         .map(|f| f.path.as_str())
         .unwrap_or("(unknown)");
 
-    // Header: 1 línea para título
-    if area.height < 2 {
+    // Mínimo: 1 título + 1 contenido + 1 footer
+    if area.height < 3 {
         return;
     }
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // título
+            Constraint::Length(1), // título con nombre del archivo
             Constraint::Fill(1),   // contenido del diff
+            Constraint::Length(1), // footer con atajos de teclado
         ])
         .split(area);
 
-    // Título
+    // Título: " DIFF: " (accent bold) + filename (primary)
+    // Sin hint inline — el footer lo reemplaza
     let title_line = Line::from(vec![
         Span::styled(
             " DIFF: ",
@@ -364,12 +440,6 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         Span::styled(
             diff_title,
             Style::default().fg(theme.fg_primary).bg(theme.bg_secondary),
-        ),
-        Span::styled(
-            " (Esc/d to close)",
-            Style::default()
-                .fg(theme.fg_secondary)
-                .bg(theme.bg_secondary),
         ),
     ]);
     let title_p = Paragraph::new(title_line).style(Style::default().bg(theme.bg_secondary));
@@ -384,6 +454,8 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
         )))
         .style(Style::default().bg(theme.bg_secondary));
         f.render_widget(p, layout[1]);
+        // Footer incluso cuando no hay contenido
+        render_diff_footer(f, layout[2], theme);
         return;
     };
 
@@ -397,6 +469,22 @@ fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
 
     let p = Paragraph::new(diff_lines).style(Style::default().bg(theme.bg_secondary));
     f.render_widget(p, layout[1]);
+
+    // Footer con atajos — pre-computado, sin format!() en render
+    render_diff_footer(f, layout[2], theme);
+}
+
+/// Renderiza el footer del diff con atajos de teclado.
+///
+/// Texto estático pre-computado — sin allocaciones en render.
+fn render_diff_footer(f: &mut Frame, area: Rect, theme: &Theme) {
+    // Texto fijo — &'static str, cero allocaciones
+    let footer_line = Line::from(Span::styled(
+        " [↑↓/jk] Scroll   [D/Esc] Cerrar",
+        Style::default().fg(theme.fg_secondary).bg(theme.bg_active),
+    ));
+    let p = Paragraph::new(footer_line).style(Style::default().bg(theme.bg_active));
+    f.render_widget(p, area);
 }
 
 /// Renderiza una línea de diff con colores semánticos.

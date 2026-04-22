@@ -107,6 +107,8 @@ pub struct SearchState {
     pub replace_text: String,
     /// Si el campo de replace está visible.
     pub replace_visible: bool,
+    /// Si la fila de filtros (include/exclude) está expandida.
+    pub filters_expanded: bool,
     /// Resultados agrupados por archivo (se construyen después de ejecutar búsqueda).
     pub file_groups: Vec<FileGroup>,
     /// Índices de file groups colapsados (fold).
@@ -130,6 +132,7 @@ impl SearchState {
             cursor_pos: 0,
             replace_text: String::with_capacity(64),
             replace_visible: false,
+            filters_expanded: false,
             file_groups: Vec::new(),
             collapsed_files: HashSet::new(),
             flat_items: Vec::new(),
@@ -199,19 +202,43 @@ impl SearchState {
         }
     }
 
+    /// Toggle expansión/colapso de la fila de filtros (include/exclude).
+    ///
+    /// Al colapsar, si el foco estaba en Include o Exclude, mueve el foco
+    /// de vuelta a Query para evitar que el campo activo quede fuera del layout.
+    pub fn toggle_filters(&mut self) {
+        self.filters_expanded = !self.filters_expanded;
+        // Al colapsar: mover foco a query si estaba en include/exclude
+        if !self.filters_expanded
+            && matches!(self.active_field, SearchField::Include | SearchField::Exclude)
+        {
+            self.active_field = SearchField::Query;
+            self.cursor_pos = self.options.query.len();
+        }
+    }
+
     /// Avanzar al siguiente campo (Tab).
     ///
-    /// Ciclo: Query → Replace (si visible) → Include → Exclude → Query
+    /// Ciclo (filters_expanded=true):  Query → Replace (si visible) → Include → Exclude → Query
+    /// Ciclo (filters_expanded=false): Query → Replace (si visible) → Query (sin include/exclude)
     pub fn next_field(&mut self) {
         self.active_field = match self.active_field {
             SearchField::Query => {
                 if self.replace_visible {
                     SearchField::Replace
-                } else {
+                } else if self.filters_expanded {
                     SearchField::Include
+                } else {
+                    SearchField::Query // wrap: no hay más campos visibles
                 }
             }
-            SearchField::Replace => SearchField::Include,
+            SearchField::Replace => {
+                if self.filters_expanded {
+                    SearchField::Include
+                } else {
+                    SearchField::Query
+                }
+            }
             SearchField::Include => SearchField::Exclude,
             SearchField::Exclude => SearchField::Query,
         };
@@ -219,9 +246,19 @@ impl SearchState {
     }
 
     /// Retroceder al campo anterior (Shift+Tab).
+    ///
+    /// Respeta el estado de filters_expanded: no salta a include/exclude si están colapsados.
     pub fn prev_field(&mut self) {
         self.active_field = match self.active_field {
-            SearchField::Query => SearchField::Exclude,
+            SearchField::Query => {
+                if self.filters_expanded {
+                    SearchField::Exclude
+                } else if self.replace_visible {
+                    SearchField::Replace
+                } else {
+                    SearchField::Query // wrap: no hay más campos visibles
+                }
+            }
             SearchField::Replace => SearchField::Query,
             SearchField::Include => {
                 if self.replace_visible {

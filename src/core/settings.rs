@@ -39,6 +39,8 @@ pub enum SidebarSection {
     Git,
     /// Panel de búsqueda global.
     Search,
+    /// Panel de proyectos guardados.
+    Projects,
 }
 
 // ─── KeybindingsState ──────────────────────────────────────────────────────────
