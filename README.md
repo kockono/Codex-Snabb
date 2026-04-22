@@ -16,7 +16,7 @@
 
 <br/>
 
-![Codex-Snabb — Keybindings panel](img/keybindings.png)
+![Codex-Snabb — Keybindings panel](img/main.png)
 
 </div>
 
