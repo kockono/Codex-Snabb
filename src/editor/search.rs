@@ -35,7 +35,6 @@ pub struct BufferSearch {
 
 impl BufferSearch {
     /// Crea una búsqueda nueva con el query dado.
-    #[expect(dead_code, reason = "se usará cuando se implemente búsqueda en editor")]
     pub fn new(query: &str, case_sensitive: bool) -> Self {
         Self {
             query: query.to_owned(),
@@ -49,7 +48,6 @@ impl BufferSearch {
     ///
     /// Limpia coincidencias previas. Si el query está vacío, no busca.
     /// La búsqueda es lineal — O(n) sobre el contenido del buffer.
-    #[expect(dead_code, reason = "se usará cuando se implemente búsqueda en editor")]
     pub fn search(&mut self, buffer: &TextBuffer) {
         self.matches.clear();
         self.current_match = None;
@@ -94,10 +92,6 @@ impl BufferSearch {
     }
 
     /// Avanza a la siguiente coincidencia (wrap around al final).
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se implemente navegación de búsqueda"
-    )]
     pub fn next_match(&mut self) {
         if self.matches.is_empty() {
             return;
@@ -109,10 +103,6 @@ impl BufferSearch {
     }
 
     /// Retrocede a la coincidencia anterior (wrap around al inicio).
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se implemente navegación de búsqueda"
-    )]
     pub fn prev_match(&mut self) {
         if self.matches.is_empty() {
             return;
@@ -132,7 +122,6 @@ impl BufferSearch {
     }
 
     /// Cantidad de coincidencias encontradas.
-    #[expect(dead_code, reason = "se usará para mostrar conteo en status bar")]
     pub fn match_count(&self) -> usize {
         self.matches.len()
     }

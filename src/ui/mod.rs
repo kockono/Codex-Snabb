@@ -7,17 +7,20 @@
 
 pub mod branch_picker;
 pub mod context_menu;
-pub mod git_panel;
+// git_panel movido a source_control_git/render.rs
+pub use crate::source_control_git::render as git_panel;
 pub mod go_to_line;
 pub mod icons;
 pub mod layout;
 pub mod palette;
 pub mod panels;
-pub mod projects_panel;
+// projects_panel movido a projects/render.rs
+pub use crate::projects::render as projects_panel;
 pub mod quick_open;
 pub mod rename_modal;
 pub mod save_as_modal;
-pub mod search_panel;
+// search_panel movido a search/render.rs
+pub use crate::search::render as search_panel;
 pub mod settings_panel;
 pub mod theme;
 
@@ -128,7 +131,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 layout.sidebar,
                 &state.git,
                 theme,
-                sidebar_focused,
+                focused == PanelId::Git, // foco específico del git panel, no genérico
                 state.cursor_visible,
             );
         } else if state.projects.visible {
@@ -156,25 +159,42 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // (después del if/else), por eso se declara antes del bloque.
     let editor_focused = focused == PanelId::Editor;
 
-    // ── Git diff overlay (ocupa editor_area + bottom_panel cuando show_diff == true) ──
-    // El sidebar permanece visible para navegar archivos.
-    // El editor y el terminal se ocultan y se reemplazan por el diff.
-    if state.git.show_diff {
-        use ratatui::layout::Rect;
-        // Calcular el área combinada: editor_area + bottom_panel si está visible
-        let diff_area = if layout.bottom_panel_visible {
-            Rect::new(
-                layout.editor_area.x,
-                layout.editor_area.y,
-                layout.editor_area.width,
-                layout.editor_area.height + layout.bottom_panel.height,
-            )
-        } else {
-            layout.editor_area
-        };
-        git_panel::render_diff_view(f, diff_area, &state.git, theme);
+    // ── Editor area: tab normal vs tab virtual de diff ──
+    //
+    // Si la tab activa es una tab virtual de diff (ver `EditorState::diff_view`),
+    // se renderiza con `render_diff_tab` (sin gutter, sin highlighting, scroll
+    // desacoplado). Caso contrario, render normal del editor.
+    //
+    // El bloque legacy `if state.git.show_diff` se eliminó: el reducer ya no
+    // setea ese flag — los diffs se abren como tabs virtuales.
+    let active_is_diff_tab = state.tabs.active_is_diff();
+
+    if active_is_diff_tab {
+        // Pre-computar info de tabs (incluye la tab virtual de diff)
+        let tab_infos = state.tabs.tab_info();
+        let editor = state.tabs.active();
+        panels::render_diff_tab(
+            f,
+            layout.editor_area,
+            theme,
+            editor_focused,
+            editor,
+            &tab_infos,
+        );
+
+        // Bottom panel visible solo si está activado (no se oculta por diff)
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                &state.terminal,
+            );
+        }
     } else {
-        // ── Editor area (solo cuando show_diff == false) ──
+        // ── Editor area: tab normal ──
         let editor = state.tabs.active();
         // Pre-computar info de tabs para la barra de pestañas
         let tab_infos = state.tabs.tab_info();
@@ -252,7 +272,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
                 layout.bottom_panel,
                 theme,
                 bottom_focused,
-                state.terminal.session.as_ref(),
+                &state.terminal,
             );
         }
     }

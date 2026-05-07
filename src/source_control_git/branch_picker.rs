@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::git::commands::{self, BranchInfo};
+use crate::source_control_git::commands::{self, BranchInfo};
 
 // ─── BranchPicker ──────────────────────────────────────────────────────────────
 

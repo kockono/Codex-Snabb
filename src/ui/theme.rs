@@ -66,8 +66,10 @@ pub struct Theme {
     pub diff_add: Color,
     /// Git: línea eliminada — rojo.
     pub diff_remove: Color,
-    /// Coincidencia de búsqueda — fondo highlight.
+    /// Coincidencia de búsqueda — fondo highlight (matches secundarios).
     pub search_match: Color,
+    /// Match activo de búsqueda — fondo más brillante para distinguir el actual.
+    pub search_match_active: Color,
 }
 
 impl Theme {
@@ -106,7 +108,8 @@ impl Theme {
             border_unfocused: Color::Rgb(48, 54, 61), // #30363d — gris oscuro
             diff_add: Color::Rgb(63, 185, 80),  // #3fb950 — verde
             diff_remove: Color::Rgb(248, 81, 73), // #f85149 — rojo
-            search_match: Color::Rgb(159, 130, 0), // #9f8200 — amarillo oscuro
+            search_match: Color::Rgb(100, 80, 0),        // #644f00 — amarillo oscuro (matches secundarios)
+            search_match_active: Color::Rgb(255, 200, 0), // #ffc800 — amarillo brillante (match activo)
         }
     }
 }

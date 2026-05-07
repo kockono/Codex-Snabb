@@ -10,10 +10,12 @@
 mod app;
 mod core;
 mod editor;
-mod git;
+mod explorer;
 mod lsp;
 mod observe;
+mod projects;
 mod search;
+mod source_control_git;
 mod terminal;
 mod ui;
 mod workspace;

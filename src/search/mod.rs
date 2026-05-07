@@ -14,6 +14,7 @@
 //! - `collapsed_files`: file groups colapsados (fold/unfold)
 
 pub mod engine;
+pub mod render;
 
 use std::collections::HashSet;
 use std::path::Path;

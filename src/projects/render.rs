@@ -12,10 +12,10 @@ use ratatui::{
     Frame,
 };
 
+use super::ProjectsState;
+use crate::explorer::folder_picker::FolderPickerState;
 use crate::ui::layout::{self, IdeLayout};
 use crate::ui::theme::Theme;
-use crate::workspace::folder_picker::FolderPickerState;
-use crate::workspace::projects::ProjectsState;
 
 /// Renderiza el panel de proyectos en la sidebar.
 pub fn render_projects_panel(

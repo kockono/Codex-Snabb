@@ -30,8 +30,8 @@ use crate::core::{Action, AppConfig, Effect, Event, PanelId};
 use crate::editor::EditorState;
 use crate::editor::highlighting::HighlightEngine;
 use crate::editor::tabs::TabState;
-use crate::git::branch_picker::BranchPicker;
-use crate::git::GitState;
+use crate::source_control_git::branch_picker::BranchPicker;
+use crate::source_control_git::GitState;
 use crate::lsp::LspState;
 use crate::observe::{FrameTimer, Metrics};
 use crate::search::SearchState;
@@ -40,7 +40,7 @@ use crate::ui::context_menu::ContextMenuState;
 use crate::ui::layout::IdeLayout;
 use crate::ui::{self, Theme};
 use crate::ui::palette::PaletteState;
-use crate::workspace::ExplorerState;
+use crate::explorer::ExplorerState;
 use crate::workspace::QuickOpenState;
 use crate::workspace::quick_open::GoToLineState;
 use crate::workspace::rename::RenameState;
@@ -118,9 +118,9 @@ pub struct AppState {
     /// Estado del overlay de settings / keybindings editor.
     pub keybindings: KeybindingsState,
     /// Panel de proyectos guardados.
-    pub projects: crate::workspace::projects::ProjectsState,
+    pub projects: crate::projects::ProjectsState,
     /// Folder picker modal para selección de carpeta.
-    pub folder_picker: crate::workspace::folder_picker::FolderPickerState,
+    pub folder_picker: crate::explorer::folder_picker::FolderPickerState,
     /// Modal "Guardar como" para buffers sin path asociado (untitled).
     pub save_as: SaveAsState,
     /// Modal "Rename" para renombrar archivos/directorios desde el context menu.
@@ -157,11 +157,12 @@ impl AppState {
     /// Solo inicializa partes rápidas (structs vacíos, registros).
     /// Las operaciones lentas (explorer, quick_open, git) se difieren
     /// a la loading phase en `event_loop()` para mostrar progreso.
-    fn new(config: AppConfig) -> Self {
+    fn new(config: AppConfig) -> Result<Self> {
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
+        load_keybindings(&mut commands);
 
-        Self {
+        Ok(Self {
             running: true,
             focused_panel: PanelId::Editor,
             config,
@@ -181,11 +182,11 @@ impl AppState {
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
             projects: {
-                let mut ps = crate::workspace::projects::ProjectsState::new();
+                let mut ps = crate::projects::ProjectsState::new();
                 ps.load(); // cargar desde disco al arrancar
                 ps
             },
-            folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
+            folder_picker: crate::explorer::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
             rename: RenameState::new(),
             context_menu: ContextMenuState::new(),
@@ -197,7 +198,7 @@ impl AppState {
             bracket_match: None,
             cursor_visible: true,
             cursor_blink_counter: 0,
-        }
+        })
     }
 
     /// Crea un nuevo estado con un archivo abierto.
@@ -217,6 +218,7 @@ impl AppState {
 
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
+        load_keybindings(&mut commands);
 
         Ok(Self {
             running: true,
@@ -238,11 +240,11 @@ impl AppState {
             lsp: LspState::new(),
             keybindings: KeybindingsState::new(),
             projects: {
-                let mut ps = crate::workspace::projects::ProjectsState::new();
+                let mut ps = crate::projects::ProjectsState::new();
                 ps.load(); // cargar desde disco al arrancar
                 ps
             },
-            folder_picker: crate::workspace::folder_picker::FolderPickerState::new(),
+            folder_picker: crate::explorer::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
             rename: RenameState::new(),
             context_menu: ContextMenuState::new(),
@@ -320,13 +322,25 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.running = false;
             vec![Effect::Quit]
         }
+        Action::FocusExplorer => {
+            // Asegurar que la sidebar esté visible antes de enfocar
+            state.sidebar_visible = true;
+            // Activar la sección Explorer en la activity bar
+            if let Some(ref mut explorer) = state.explorer {
+                let _ = explorer; // asegurar que existe
+            }
+            state.focused_panel = PanelId::Explorer;
+            tracing::debug!("foco directo al Explorer");
+            vec![]
+        }
         Action::FocusNext => {
-            state.focused_panel = state.focused_panel.next();
+            // Ciclo dinámico según paneles visibles en la sidebar
+            state.focused_panel = focus_next_panel(state);
             tracing::debug!(panel = ?state.focused_panel, "foco siguiente");
             vec![]
         }
         Action::FocusPrev => {
-            state.focused_panel = state.focused_panel.prev();
+            state.focused_panel = focus_prev_panel(state);
             tracing::debug!(panel = ?state.focused_panel, "foco anterior");
             vec![]
         }
@@ -385,6 +399,127 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.update_status_cache();
             vec![]
         }
+
+        // ── Select All ──
+        Action::SelectAll => {
+            // Tab de diff virtual → no editable, ignorar
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().select_all();
+            state.update_status_cache();
+            vec![]
+        }
+
+        // ── Clipboard: Copy / Cut / Paste ──
+        Action::CopySelection => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            // Extraer el texto seleccionado del cursor primario.
+            // selected_text retorna String owned — necesario porque el portapapeles
+            // requiere ownership y la selección puede abarcar múltiples líneas.
+            let editor = state.tabs.active();
+            let text = editor
+                .cursors
+                .primary()
+                .selection
+                .filter(|s| !s.is_empty())
+                .map(|sel| sel.selected_text(&editor.buffer))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                copy_text_to_clipboard(&text);
+            }
+            vec![]
+        }
+        Action::CutSelection => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            let text = {
+                let editor = state.tabs.active();
+                editor
+                    .cursors
+                    .primary()
+                    .selection
+                    .filter(|s| !s.is_empty())
+                    .map(|sel| sel.selected_text(&editor.buffer))
+                    .unwrap_or_default()
+            };
+            if !text.is_empty() {
+                copy_text_to_clipboard(&text);
+                state.tabs.active_mut().delete_primary_selection();
+                state.update_status_cache();
+                notify_lsp_change(state);
+            }
+            vec![]
+        }
+        Action::PasteClipboard => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.get_text() {
+                    Ok(text) if !text.is_empty() => {
+                        let editor = state.tabs.active_mut();
+                        // Si hay selección, reemplazarla — el insert_str ya hace esto
+                        // implícitamente porque insert_char/newline borran selección.
+                        // Pero para multiline correcto, borramos ANTES con un solo paso.
+                        if editor.cursors.primary().selection.is_some_and(|s| !s.is_empty()) {
+                            editor.delete_primary_selection();
+                        }
+                        editor.insert_str(&text);
+                        state.update_status_cache();
+                        notify_lsp_change(state);
+                    }
+                    Ok(_) => {} // texto vacío — no hacer nada
+                    Err(e) => tracing::warn!(error = %e, "clipboard get_text failed"),
+                },
+                Err(e) => tracing::warn!(error = %e, "clipboard init failed"),
+            }
+            vec![]
+        }
+
+        // ── File search (Ctrl+F dentro del editor) ──
+        Action::OpenFileSearch => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().open_file_search();
+            state.update_status_cache();
+            tracing::debug!("file search abierto");
+            vec![]
+        }
+        Action::FileSearchInsertChar(ch) => {
+            state.tabs.active_mut().file_search_insert(*ch);
+            state.update_status_cache();
+            vec![]
+        }
+        Action::FileSearchDeleteChar => {
+            state.tabs.active_mut().file_search_delete();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::FileSearchNext => {
+            state.tabs.active_mut().file_search_next();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::FileSearchPrev => {
+            state.tabs.active_mut().file_search_prev();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::FileSearchClose => {
+            state.tabs.active_mut().file_search_close();
+            tracing::debug!("file search cerrado");
+            vec![]
+        }
+        Action::FileSearchToggleCase => {
+            state.tabs.active_mut().file_search_toggle_case();
+            state.update_status_cache();
+            vec![]
+        }
         Action::ClearMultiCursor => {
             if state.tabs.active_mut().has_multicursors() {
                 // Con multicursores activos, Esc limpia los secundarios
@@ -431,6 +566,10 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::SaveFile => {
+            // Tab de diff virtual → no editable, ignorar save
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
             let has_path = state.tabs.active().buffer.file_path().is_some();
             if has_path {
                 match state.tabs.active_mut().save() {
@@ -521,6 +660,137 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 && let Err(e) = explorer.refresh()
             {
                 tracing::error!(error = %e, "error al refrescar explorer");
+            }
+            vec![]
+        }
+
+        // ── Explorer: nuevo archivo / nueva carpeta / eliminar ──
+        Action::ExplorerNewFile => {
+            if let Some(ref mut explorer) = state.explorer {
+                explorer.start_new_file();
+                tracing::debug!("explorer: input nuevo archivo abierto");
+            }
+            vec![]
+        }
+        Action::ExplorerNewFolder => {
+            if let Some(ref mut explorer) = state.explorer {
+                explorer.start_new_folder();
+                tracing::debug!("explorer: input nueva carpeta abierto");
+            }
+            vec![]
+        }
+        Action::ExplorerNewFileInput(ch) => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some(ref mut input) = explorer.new_file_input
+            {
+                input.push(*ch);
+            }
+            vec![]
+        }
+        Action::ExplorerNewFileBackspace => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some(ref mut input) = explorer.new_file_input
+            {
+                input.pop();
+            }
+            vec![]
+        }
+        Action::ExplorerNewFileConfirm => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some((parent, name)) = explorer.confirm_new_file()
+            {
+                let path = parent.join(&name);
+                match std::fs::File::create(&path) {
+                    Ok(_) => {
+                        tracing::info!(path = %path.display(), "archivo creado");
+                        if let Err(e) = explorer.refresh() {
+                            tracing::warn!(error = %e, "error refrescando explorer post-create");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "error creando archivo");
+                    }
+                }
+            }
+            vec![]
+        }
+        Action::ExplorerNewFileCancel => {
+            if let Some(ref mut explorer) = state.explorer {
+                explorer.cancel_new_file();
+            }
+            vec![]
+        }
+        Action::ExplorerNewFolderInput(ch) => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some(ref mut input) = explorer.new_folder_input
+            {
+                input.push(*ch);
+            }
+            vec![]
+        }
+        Action::ExplorerNewFolderBackspace => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some(ref mut input) = explorer.new_folder_input
+            {
+                input.pop();
+            }
+            vec![]
+        }
+        Action::ExplorerNewFolderConfirm => {
+            if let Some(ref mut explorer) = state.explorer
+                && let Some((parent, name)) = explorer.confirm_new_folder()
+            {
+                let path = parent.join(&name);
+                match std::fs::create_dir_all(&path) {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "carpeta creada");
+                        if let Err(e) = explorer.refresh() {
+                            tracing::warn!(error = %e, "error refrescando explorer post-mkdir");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "error creando carpeta");
+                    }
+                }
+            }
+            vec![]
+        }
+        Action::ExplorerNewFolderCancel => {
+            if let Some(ref mut explorer) = state.explorer {
+                explorer.cancel_new_folder();
+            }
+            vec![]
+        }
+        Action::ExplorerDeleteSelected => {
+            // Capturamos el path antes del &mut para poder loggearlo y refrescar.
+            // CLONE: el path se clona porque selected_path() ya retorna PathBuf owned,
+            // pero para mantener simetría con el resto de las acciones lo bindeamos local.
+            let path_opt = state
+                .explorer
+                .as_ref()
+                .and_then(|e| e.selected_path());
+            if let Some(path) = path_opt {
+                let result = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else if path.is_file() {
+                    std::fs::remove_file(&path)
+                } else {
+                    // El item no existe en disco — refrescar sin error
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "explorer: item eliminado");
+                        if let Some(ref mut explorer) = state.explorer
+                            && let Err(e) = explorer.refresh()
+                        {
+                            tracing::warn!(error = %e, "error refrescando explorer post-delete");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "error eliminando item");
+                    }
+                }
             }
             vec![]
         }
@@ -892,7 +1162,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::TerminalInput(ch) => {
-            if let Some(ref mut session) = state.terminal.session
+            if let Some(session) = state.terminal.session_mut()
                 && let Err(e) = session.send_key(*ch)
             {
                 tracing::error!(error = %e, "error al enviar key al terminal");
@@ -900,7 +1170,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::TerminalEnter => {
-            if let Some(ref mut session) = state.terminal.session
+            if let Some(session) = state.terminal.session_mut()
                 && let Err(e) = session.send_enter()
             {
                 tracing::error!(error = %e, "error al enviar Enter al terminal");
@@ -908,7 +1178,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::TerminalCtrlC => {
-            if let Some(ref mut session) = state.terminal.session
+            if let Some(session) = state.terminal.session_mut()
                 && let Err(e) = session.send_ctrl_c()
             {
                 tracing::error!(error = %e, "error al enviar Ctrl+C al terminal");
@@ -916,13 +1186,13 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::TerminalScrollUp => {
-            if let Some(ref mut session) = state.terminal.session {
+            if let Some(session) = state.terminal.session_mut() {
                 session.scroll_up(3);
             }
             vec![]
         }
         Action::TerminalScrollDown => {
-            if let Some(ref mut session) = state.terminal.session {
+            if let Some(session) = state.terminal.session_mut() {
                 session.scroll_down(3);
             }
             vec![]
@@ -953,10 +1223,15 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             // Abrir panel git en sidebar, foco en Git
             state.sidebar_visible = true;
             state.git.visible = true;
-            state.git.refresh(
-                &get_workspace_root(state),
-            );
+            state.git.refresh(&get_workspace_root(state));
             state.focused_panel = PanelId::Git;
+            // Resetear posición al abrir para que siempre haya algo seleccionado
+            state.git.selected_index = 0;
+            state.git.scroll_offset = 0;
+            // Sin archivos → ir directo al commit input
+            if state.git.files.is_empty() {
+                state.git.commit_mode = true;
+            }
             tracing::debug!("git panel abierto");
             vec![]
         }
@@ -988,17 +1263,98 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             }
             vec![]
         }
-        Action::GitToggleDiff => {
+        Action::GitStageFile(idx) => {
             let root = get_workspace_root(state);
-            state.git.toggle_diff(&root);
+            if let Err(e) = state.git.stage_file_at(&root, *idx) {
+                tracing::warn!(error = %e, idx = *idx, "git stage error");
+            }
+            vec![]
+        }
+        Action::GitDiscardFile(idx) => {
+            let root = get_workspace_root(state);
+            if let Err(e) = state.git.discard_file_at(&root, *idx) {
+                tracing::warn!(error = %e, idx = *idx, "git discard error");
+            }
+            vec![]
+        }
+        Action::GitStageAll => {
+            let root = get_workspace_root(state);
+            if let Err(e) = state.git.stage_all(&root) {
+                tracing::warn!(error = %e, "git stage all error");
+            }
+            vec![]
+        }
+        Action::GitUnstageAll => {
+            let root = get_workspace_root(state);
+            if let Err(e) = state.git.unstage_all(&root) {
+                tracing::warn!(error = %e, "git unstage all error");
+            }
+            vec![]
+        }
+        Action::GitToggleDiff | Action::GitOpenDiffTab => {
+            let root = get_workspace_root(state);
+
+            // Toggle: si la tab activa YA es una tab de diff y hay más de una tab,
+            // cerrar la tab de diff y devolver foco al editor. No togglear si solo
+            // hay una tab — close_active() crearía un editor vacío y eso confunde
+            // al usuario que probablemente quería volver al archivo anterior.
+            if state.tabs.active_is_diff() && state.tabs.tab_count() > 1 {
+                state.tabs.close_active();
+                state.update_status_cache();
+                state.git.show_diff = false; // legacy: garantizar off
+                return vec![];
+            }
+
+            // Cargar el diff del archivo seleccionado del git panel
+            state.git.load_diff(&root);
+
+            // CLONE: el contenido se mueve a la tab — diff_content sigue en
+            // GitState para legacy, pero la tab tiene su propia copia owned.
+            let content = state.git.diff_content.clone().unwrap_or_default();
+            let is_file_content = state.git.showing_file_content;
+            let file_path = state
+                .git
+                .files
+                .get(state.git.selected_index)
+                .map(|f| root.join(&f.path));
+
+            // Abrir o reusar tab de diff
+            let _idx = state.tabs.open_diff_tab(content, file_path, is_file_content);
+
+            // Si era reuso, el contenido ya quedó al estado anterior — refrescarlo
+            // explícitamente con el diff recién cargado para asegurar consistencia.
+            // CLONE: necesario — diff_content se vuelve a clonar para la tab.
+            state.tabs.update_active_diff(
+                state.git.diff_content.clone().unwrap_or_default(),
+                is_file_content,
+            );
+
+            // Foco al editor (donde vive la nueva tab) y desactivar overlay legacy.
+            state.focused_panel = PanelId::Editor;
+            state.git.show_diff = false;
+            state.update_status_cache();
             vec![]
         }
         Action::GitDiffScrollUp => {
-            state.git.scroll_diff_up();
+            // Si hay una tab de diff activa, scrollea esa tab; si no, el git state legacy.
+            if state.tabs.active_is_diff() {
+                if let Some(ref mut dv) = state.tabs.active_mut().diff_view {
+                    dv.scroll_offset = dv.scroll_offset.saturating_sub(3);
+                }
+            } else {
+                state.git.scroll_diff_up();
+            }
             vec![]
         }
         Action::GitDiffScrollDown => {
-            state.git.scroll_diff_down();
+            if state.tabs.active_is_diff() {
+                if let Some(ref mut dv) = state.tabs.active_mut().diff_view {
+                    let max = dv.content.lines().count().saturating_sub(1);
+                    dv.scroll_offset = (dv.scroll_offset + 3).min(max);
+                }
+            } else {
+                state.git.scroll_diff_down();
+            }
             vec![]
         }
         Action::GitStartCommit => {
@@ -1039,7 +1395,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::GitFetch => {
             let root = get_workspace_root(state);
-            match crate::git::commands::fetch(&root) {
+            match crate::source_control_git::commands::fetch(&root) {
                 Ok(()) => {
                     // Re-fetch ahead/behind después del fetch
                     state.git.refresh(&root);
@@ -1228,6 +1584,8 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             // Aplicar cambios al registry antes de cerrar
             state.keybindings.apply_to_registry(&mut state.commands);
             state.keybindings.close();
+            // Persistir cambios a disco
+            save_keybindings(&state.commands);
             tracing::debug!("settings overlay cerrado");
             vec![]
         }
@@ -1325,6 +1683,18 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::CloseTab | Action::CloseBuffer => {
+            // Tab de diff virtual → cerrar sin preguntar
+            if state.tabs.active_is_diff() {
+                let had_multiple = state.tabs.tab_count() > 1;
+                state.tabs.close_active();
+                state.update_status_cache();
+                // Si era la única tab → foco al Explorer si la sidebar está visible
+                if !had_multiple && state.sidebar_visible {
+                    state.focused_panel = PanelId::Explorer;
+                }
+                tracing::debug!(tabs = state.tabs.tab_count(), "tab diff cerrada");
+                return vec![];
+            }
             let active = state.tabs.active();
             if active.buffer.is_dirty() && active.buffer.file_path().is_none() {
                 // Buffer untitled con cambios sin guardar — preguntar antes de cerrar
@@ -1332,8 +1702,14 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 state.save_as.open(root);
                 tracing::debug!("save as: modal abierto al cerrar buffer untitled dirty");
             } else {
+                let had_multiple = state.tabs.tab_count() > 1;
                 state.tabs.close_active();
                 state.update_status_cache();
+                // Si era la última tab → foco al Explorer si la sidebar está visible
+                if !had_multiple && state.sidebar_visible {
+                    state.focused_panel = PanelId::Explorer;
+                    tracing::debug!("última tab cerrada → foco al Explorer");
+                }
                 tracing::debug!(tabs = state.tabs.tab_count(), "tab cerrada");
             }
             vec![]
@@ -1502,7 +1878,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     // Cambiar explorer al root del proyecto
                     // CLONE: necesario — project es borrow de state.projects, necesitamos path owned
                     let root = project.path.clone();
-                    state.explorer = crate::workspace::ExplorerState::new(&root).ok();
+                    state.explorer = crate::explorer::ExplorerState::new(&root).ok();
                     // Refrescar git
                     state.git.refresh(&root);
                     // Refrescar quick open index — silencioso en error
@@ -1629,6 +2005,23 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                 if let Some(path) = path {
                     use crate::ui::context_menu::ContextMenuItem;
                     match item {
+                        ContextMenuItem::NewFile => {
+                            // Abrir el input modal inline en el explorer.
+                            // El path target del context menu indica el contexto:
+                            // si es archivo, el padre es el directorio destino;
+                            // si es directorio, ese es el destino.
+                            // El input se resuelve via selected_dir_path() del explorer.
+                            if let Some(ref mut explorer) = state.explorer {
+                                explorer.start_new_file();
+                            }
+                            state.focused_panel = PanelId::Explorer;
+                        }
+                        ContextMenuItem::NewFolder => {
+                            if let Some(ref mut explorer) = state.explorer {
+                                explorer.start_new_folder();
+                            }
+                            state.focused_panel = PanelId::Explorer;
+                        }
                         ContextMenuItem::Delete => {
                             if path.is_dir() {
                                 if let Err(e) = std::fs::remove_dir_all(&path) {
@@ -1730,15 +2123,89 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
 
+        Action::FocusPanel(panel) => {
+            state.focused_panel = *panel;
+            tracing::debug!(panel = ?panel, "foco directo a panel");
+            vec![]
+        }
+
         // Acciones no implementadas aún — no producen efectos
         Action::Noop
-        | Action::FocusPanel(_)
         | Action::OpenFile(_) => vec![],
+
+        // ── Terminal multi-pane ──
+        Action::TerminalSendBytes(bytes) => {
+            if let Err(e) = state.terminal.send_bytes_to_active(bytes) {
+                tracing::warn!(error = %e, "terminal send error");
+            }
+            vec![]
+        }
+        Action::TerminalSplitHorizontal => {
+            let (cols, rows) = get_terminal_default_size(state);
+            if let Err(e) = state.terminal.split(
+                crate::terminal::tree::Orientation::Horizontal,
+                cols, rows,
+            ) {
+                tracing::warn!(error = %e, "terminal split horizontal error");
+            }
+            vec![]
+        }
+        Action::TerminalSplitVertical => {
+            let (cols, rows) = get_terminal_default_size(state);
+            if let Err(e) = state.terminal.split(
+                crate::terminal::tree::Orientation::Vertical,
+                cols, rows,
+            ) {
+                tracing::warn!(error = %e, "terminal split vertical error");
+            }
+            vec![]
+        }
+        Action::TerminalClosePane => {
+            state.terminal.close_active_pane();
+            // Si no quedan panes, ocultar bottom panel
+            if !state.terminal.has_session() {
+                state.bottom_panel_visible = false;
+                state.focused_panel = PanelId::Editor;
+            }
+            vec![]
+        }
+        Action::TerminalFocusNext => {
+            state.terminal.focus_next();
+            vec![]
+        }
+        Action::TerminalFocusPrev => {
+            state.terminal.focus_prev();
+            vec![]
+        }
+        Action::TerminalFocusPane(id) => {
+            state.terminal.focus_pane(*id);
+            vec![]
+        }
     }
 }
 
 mod helpers;
-use helpers::{buffer_full_text, get_workspace_root, notify_lsp_change};
+use helpers::{
+    buffer_full_text, focus_next_panel, focus_prev_panel, get_terminal_default_size,
+    get_workspace_root, load_keybindings, notify_lsp_change, save_keybindings,
+};
+
+/// Copia texto al portapapeles del sistema (Windows / macOS / Linux).
+///
+/// Encapsula la inicialización de `arboard::Clipboard` y el manejo de errores.
+/// Los errores se loggean pero no se propagan — copiar al portapapeles no debe
+/// nunca tirar el reducer. La operación es síncrona y rápida en todas las
+/// plataformas; no se ejecuta dentro de un render loop.
+fn copy_text_to_clipboard(text: &str) {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => {
+            if let Err(e) = cb.set_text(text) {
+                tracing::warn!(error = %e, "clipboard set_text failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "clipboard init failed"),
+    }
+}
 
 // ─── Search navigation helper ──────────────────────────────────────────────────
 
@@ -1876,7 +2343,7 @@ async fn event_loop(
         AppState::with_file(config, path)
             .with_context(|| format!("no se pudo abrir: {}", path.display()))?
     } else {
-        AppState::new(config)
+        AppState::new(config)?
     };
 
     // Inicializar status cache
@@ -2046,6 +2513,16 @@ async fn event_loop(
                     state.save_as.visible,
                     state.context_menu.visible,
                     state.rename.visible,
+                    state.tabs.active_is_diff(),
+                    state.tabs.active().search.is_some(),
+                    state
+                        .explorer
+                        .as_ref()
+                        .is_some_and(|e| e.new_file_input.is_some()),
+                    state
+                        .explorer
+                        .as_ref()
+                        .is_some_and(|e| e.new_folder_input.is_some()),
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -2159,6 +2636,11 @@ async fn event_loop(
             state.bottom_panel_visible,
         );
         state.last_layout = Some(layout);
+
+        // 7.4. Actualizar layout de panes de terminal (resize PTYs si cambió el área).
+        if state.bottom_panel_visible && state.terminal.has_session() {
+            state.terminal.update_layout(layout.bottom_panel);
+        }
 
         // 7.5. Actualizar viewport del editor con el tamaño real del editor area.
         //      Se hace ANTES del render para que ensure_cursor_visible funcione

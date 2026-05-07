@@ -162,7 +162,7 @@ pub fn render_settings(f: &mut Frame, layout: &IdeLayout, state: &KeybindingsSta
             let cmd_display = format!("{}: {}", entry.category, entry.command_label);
             let cmd_text = truncate_and_pad(&cmd_display, cmd_col_width);
 
-            // Keybinding: modo edición vs display normal
+            // Keybinding normal con indicador de edición si seleccionado
             let kb_text = if state.editing_index == Some(entry_idx) {
                 // Modo edición: "Press key combination..."
                 pad_right("Press key...", kb_col_width)
@@ -173,10 +173,11 @@ pub fn render_settings(f: &mut Frame, layout: &IdeLayout, state: &KeybindingsSta
             } else {
                 // Keybinding normal con indicador de edición si seleccionado
                 let display = if is_selected {
-                    format!("{}  [\u{270E}]", entry.keybinding)
+                    format!("{} [\u{270E}]", entry.keybinding)
                 } else {
                     entry.keybinding.clone() // CLONE: necesario — keybinding es String, necesitamos ownership para format condicional
                 };
+
                 truncate_and_pad(&display, kb_col_width)
             };
 

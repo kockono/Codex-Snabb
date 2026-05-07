@@ -26,8 +26,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::git::commands::FileChangeType;
-use crate::git::GitState;
+use crate::source_control_git::commands::FileChangeType;
+use crate::source_control_git::GitState;
 use crate::ui::theme::Theme;
 
 /// Renderiza el panel de Git / source control dentro de la sidebar.
@@ -274,14 +274,12 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
             use std::fmt::Write;
             let _ = write!(count_buf, " Staged Changes ({staged_count})");
         }
-        display_lines.push(Line::from(Span::styled(
-            // CLONE: necesario — count_buf se reutiliza, Span toma ownership
-            count_buf.clone(),
-            Style::default()
-                .fg(theme.fg_accent)
-                .bg(theme.bg_secondary)
-                .add_modifier(Modifier::BOLD),
-        )));
+        display_lines.push(render_section_header(
+            &count_buf,
+            Some("[-]"), // unstage all
+            area.width,
+            theme,
+        ));
         // Índice especial para header — no corresponde a archivo
         file_to_display.push(usize::MAX);
 
@@ -290,12 +288,7 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
                 continue;
             }
             let selected = i == state.selected_index;
-            display_lines.push(render_file_entry(
-                file,
-                selected,
-                area.width as usize,
-                theme,
-            ));
+            display_lines.push(render_file_entry(file, selected, area.width, theme));
             file_to_display.push(i);
         }
     }
@@ -307,14 +300,12 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
             use std::fmt::Write;
             let _ = write!(count_buf, " Changes ({unstaged_count})");
         }
-        display_lines.push(Line::from(Span::styled(
-            // CLONE: necesario — count_buf se reutiliza, Span toma ownership
-            count_buf.clone(),
-            Style::default()
-                .fg(theme.fg_accent)
-                .bg(theme.bg_secondary)
-                .add_modifier(Modifier::BOLD),
-        )));
+        display_lines.push(render_section_header(
+            &count_buf,
+            Some("[+]"), // stage all
+            area.width,
+            theme,
+        ));
         file_to_display.push(usize::MAX);
 
         for (i, file) in state.files.iter().enumerate() {
@@ -322,12 +313,7 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
                 continue;
             }
             let selected = i == state.selected_index;
-            display_lines.push(render_file_entry(
-                file,
-                selected,
-                area.width as usize,
-                theme,
-            ));
+            display_lines.push(render_file_entry(file, selected, area.width, theme));
             file_to_display.push(i);
         }
     }
@@ -346,60 +332,182 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) 
     f.render_widget(p, area);
 }
 
-/// Renderiza una entrada de archivo en la lista.
+/// Renderiza un header de sección ("Staged Changes (N)" / "Changes (N)").
 ///
-/// Formato: `  [indicador] X  path/to/file`
-/// donde X es la letra de status con color semántico.
-fn render_file_entry<'a>(
-    file: &crate::git::commands::GitFileStatus,
-    selected: bool,
-    max_width: usize,
-    theme: &'a Theme,
-) -> Line<'a> {
-    let bg = if selected {
+/// `btn`: botón opcional alineado a la derecha — `Some("[+]")` para stage all,
+/// `Some("[-]")` para unstage all, `None` para header sin botón.
+fn render_section_header(
+    text: &str,
+    btn: Option<&'static str>,
+    inner_width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = theme.bg_secondary;
+    let header_style = Style::default()
+        .fg(theme.fg_accent)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+
+    let Some(btn_label) = btn else {
+        // Header simple — sin botón
+        // CLONE: necesario — Span<'static> requiere ownership del texto
+        return Line::from(Span::styled(text.to_string(), header_style));
+    };
+
+    // Botón al final — " [X]" = 1 + 3 = 4 chars
+    const BTN_LEN: u16 = 4;
+    let btn_style = Style::default()
+        .fg(if btn_label == "[+]" { theme.fg_warning } else { theme.diff_add })
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+
+    let text_chars = text.chars().count();
+    let target = (inner_width as usize).saturating_sub(BTN_LEN as usize);
+    let padding = target.saturating_sub(text_chars);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    // CLONE: necesario — Span<'static>
+    spans.push(Span::styled(text.to_string(), header_style));
+    if padding > 0 {
+        spans.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
+    }
+    spans.push(Span::styled(" ", Style::default().bg(bg)));
+    spans.push(Span::styled(btn_label, btn_style));
+
+    Line::from(spans)
+}
+
+/// Renderiza una entrada de archivo en la lista con botones inline.
+///
+/// Formato según estado:
+/// - Unstaged Modified/Deleted: `M  path/to/file ──── [+] [↺]`  (restore)
+/// - Unstaged Added/Untracked:  `A  new_file.rs  ──── [+] [↺]`  (clean -f)
+/// - Staged:                    `M  path/to/file ──────────── [-]`
+///
+/// `[+]` amarillo (stage pendiente),
+/// `[-]` verde (ya staged → unstage al click), `[↺]` rojo (discard).
+///
+/// `inner_width` es el ancho útil del file list area (sin bordes).
+/// El selected highlight aplica solo al path, no al botón — los botones
+/// mantienen su color semántico para que se distingan visualmente.
+fn render_file_entry(
+    file: &crate::source_control_git::commands::GitFileStatus,
+    is_selected: bool,
+    inner_width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = if is_selected {
         theme.bg_active
     } else {
         theme.bg_secondary
     };
 
-    let indicator = if selected { " \u{25b8} " } else { "   " };
-    let indicator_style = Style::default()
-        .fg(theme.fg_accent)
-        .bg(bg)
-        .add_modifier(Modifier::BOLD);
+    // ── Pre-cómputo ──
+    let stage_btn = if file.staged { "[-]" } else { "[+]" };
 
-    // Letra y color según tipo de cambio
     let (status_char, status_color) = match file.status {
-        FileChangeType::Modified => ("M", theme.fg_accent_alt), // amarillo/magenta
-        FileChangeType::Added => ("A", theme.diff_add),         // verde
+        FileChangeType::Modified => ("M", theme.fg_accent_alt), // magenta
+        FileChangeType::Added | FileChangeType::Untracked => ("A", theme.diff_add), // verde
         FileChangeType::Deleted => ("D", theme.diff_remove),    // rojo
         FileChangeType::Renamed => ("R", theme.fg_accent),      // cyan
-        FileChangeType::Untracked => ("?", theme.fg_secondary), // gris
         FileChangeType::Copied => ("C", theme.fg_accent),       // cyan
     };
 
+    // Todos los archivos unstaged muestran [↺]:
+    //   Modified/Deleted → git restore (vuelve al index)
+    //   Added/Untracked  → git clean -f (elimina del disco)
+    let has_discard = !file.staged;
+
+    // Layout de anchos — todo en chars de display:
+    //   "M" (1) + "  " (2) = prefix 3
+    //   sufijo (has_discard):  " [+] [↺]" = 8 chars
+    //   sufijo (solo stage):   " [+]"     = 4 chars
+    const PREFIX_LEN: u16 = 3;
+    let suffix_len: u16 = if has_discard { 8 } else { 4 };
+    let path_width = inner_width.saturating_sub(PREFIX_LEN + suffix_len) as usize;
+
+    // Truncar path char-safe (multi-byte) usando helper del módulo ui.
+    let display_path: String = if path_width == 0 {
+        String::new()
+    } else {
+        crate::ui::truncate_str(&file.path, path_width).to_string()
+    };
+    let display_path_chars = display_path.chars().count();
+
+    // ── Estilos ──
+    let stage_style = if file.staged {
+        // [-] = ya staged → click descontará. Verde para indicar "OK ya está".
+        Style::default()
+            .fg(theme.diff_add)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // [+] = pendiente de stage. Amarillo para llamar la atención.
+        Style::default()
+            .fg(theme.fg_warning)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    };
     let status_style = Style::default().fg(status_color).bg(bg);
-    let path_style = Style::default().fg(theme.fg_primary).bg(bg);
+    let path_style = if is_selected {
+        Style::default()
+            .fg(theme.fg_primary)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_primary).bg(bg)
+    };
+    let discard_style = Style::default()
+        .fg(theme.fg_error)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
 
-    // Truncar path al ancho disponible — char-safe para multi-byte
-    let prefix_len = indicator.len() + 2 + 1; // indicator + "X " + espacio
-    let path_max = max_width.saturating_sub(prefix_len);
-    let display_path = crate::ui::truncate_str(&file.path, path_max);
+    // ── Construcción de spans (sin format!() — todo &'static o ya owned) ──
+    // Layout final por fila:
+    //   has_discard:  "M  path/to/file ──── [+] [↺]"
+    //   solo stage:   "M  path/to/file ──── [+]"
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(if has_discard { 7 } else { 5 });
 
-    Line::from(vec![
-        Span::styled(indicator, indicator_style),
-        Span::styled(status_char, status_style),
-        Span::styled("  ", Style::default().bg(bg)),
-        // CLONE: necesario — display_path es slice del GitFileStatus.path,
-        // Span necesita ownership para mantener el contenido vivo
-        Span::styled(display_path.to_string(), path_style),
-    ])
+    // status char "M"/"A"/"D"/...
+    spans.push(Span::styled(status_char.to_string(), status_style));
+    // "  " (dos espacios separadores)
+    spans.push(Span::styled("  ", Style::default().bg(bg)));
+    // path
+    spans.push(Span::styled(display_path, path_style));
+
+    // Padding hasta los botones del final
+    let used = PREFIX_LEN as usize + display_path_chars;
+    let target = (inner_width as usize).saturating_sub(suffix_len as usize);
+    let padding = target.saturating_sub(used);
+    if padding > 0 {
+        spans.push(Span::styled(
+            " ".repeat(padding),
+            Style::default().bg(bg),
+        ));
+    }
+
+    // " [+]" / " [-]" siempre al final
+    spans.push(Span::styled(" ", Style::default().bg(bg)));
+    spans.push(Span::styled(stage_btn.to_string(), stage_style));
+
+    if has_discard {
+        // " [↺]" a la derecha del [+]
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        spans.push(Span::styled("[\u{21ba}]".to_string(), discard_style));
+    }
+
+    Line::from(spans)
 }
 
 /// Renderiza la vista de diff del archivo seleccionado.
 ///
-/// Función pública — se llama desde `src/ui/mod.rs` para renderizar el diff
-/// en el área combinada (editor_area + bottom_panel) cuando `show_diff == true`.
+/// LEGACY: este overlay global fue reemplazado por tabs virtuales de diff
+/// (`EditorState::diff_view`). Se mantiene como referencia hasta el cleanup
+/// — `ui::mod.rs` ya no lo llama.
+#[expect(
+    dead_code,
+    reason = "legacy del overlay de diff — reemplazado por panels::render_diff_tab"
+)]
 pub fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &Theme) {
     let visible_height = area.height as usize;
     if visible_height == 0 {
@@ -427,11 +535,11 @@ pub fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &The
         ])
         .split(area);
 
-    // Título: " DIFF: " (accent bold) + filename (primary)
-    // Sin hint inline — el footer lo reemplaza
+    // Título: " DIFF: " o " FILE: " (accent bold) + filename (primary)
+    let title_prefix = if state.showing_file_content { " FILE: " } else { " DIFF: " };
     let title_line = Line::from(vec![
         Span::styled(
-            " DIFF: ",
+            title_prefix,
             Style::default()
                 .fg(theme.fg_accent)
                 .bg(theme.bg_secondary)
@@ -477,6 +585,10 @@ pub fn render_diff_view(f: &mut Frame, area: Rect, state: &GitState, theme: &The
 /// Renderiza el footer del diff con atajos de teclado.
 ///
 /// Texto estático pre-computado — sin allocaciones en render.
+///
+/// LEGACY: solo invocada desde `render_diff_view` (también legacy). Cuando
+/// el caller está marcado como `dead_code` el lint no dispara aquí, por eso
+/// no llevamos `#[expect]` en esta función.
 fn render_diff_footer(f: &mut Frame, area: Rect, theme: &Theme) {
     // Texto fijo — &'static str, cero allocaciones
     let footer_line = Line::from(Span::styled(
@@ -493,7 +605,10 @@ fn render_diff_footer(f: &mut Frame, area: Rect, theme: &Theme) {
 /// - Líneas con `-` → rojo (diff_remove)
 /// - Headers `@@` → cyan (fg_accent)
 /// - Resto → texto normal
-fn render_diff_line<'a>(line: &str, max_width: usize, theme: &'a Theme) -> Line<'a> {
+///
+/// Visibilidad `pub(crate)` — se reusa desde `ui::panels` para renderizar
+/// el contenido de tabs virtuales de diff dentro del área del editor.
+pub(crate) fn render_diff_line<'a>(line: &str, max_width: usize, theme: &'a Theme) -> Line<'a> {
     let display = crate::ui::truncate_str(line, max_width);
 
     let style = if display.starts_with('+') {

@@ -192,7 +192,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                 if col == fetch_col {
                     // Click en ⟳ → git fetch
                     let root = get_workspace_root(state);
-                    match crate::git::commands::fetch(&root) {
+                    match crate::source_control_git::commands::fetch(&root) {
                         Ok(()) => {
                             state.git.refresh(&root);
                             tracing::info!("git fetch via mouse click");
@@ -279,7 +279,8 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                 }
                 PanelId::Git => {
                     // Click en git panel — input row, button row o file list
-                    reduce_mouse_click_git(state, &layout, row);
+                    // (col se necesita para hit-test de [+]/[-]/[×] en file rows)
+                    reduce_mouse_click_git_with_col(state, &layout, col, row);
                 }
                 PanelId::Explorer => {
                     reduce_mouse_click_explorer(state, &layout, row);
@@ -418,17 +419,77 @@ fn reduce_mouse_click_search(state: &mut AppState, layout: &IdeLayout, row: u16)
     }
 }
 
-/// Procesa click en el git panel — foco en input, trigger commit, o selección de archivo.
+/// Tipo de fila visible en la sección de archivos del git panel.
+///
+/// Construido en orden por `git_panel_display_kinds` para mapear
+/// el `display_idx` (visible row) a la acción correspondiente.
+#[derive(Debug, Clone, Copy)]
+enum GitDisplayRow {
+    /// Header "Staged Changes (N)" — sin botón [+] (no aplica stage-all).
+    StagedHeader,
+    /// Header "Changes (N)" — con botón [+] al final (stage-all).
+    UnstagedHeader,
+    /// Fila de archivo, índice en `state.git.files`.
+    File(usize),
+}
+
+/// Construye la secuencia de filas que produce `render_file_list`,
+/// en el mismo orden visual: staged_header → staged files → unstaged_header → unstaged files.
+///
+/// Pre-cómputo barato: vector pequeño (≤ files.len() + 2). Permite resolver
+/// click → fila sin duplicar la lógica de render.
+fn git_panel_display_kinds(state: &AppState) -> Vec<GitDisplayRow> {
+    let staged_count = state.git.files.iter().filter(|f| f.staged).count();
+    let unstaged_count = state.git.files.iter().filter(|f| !f.staged).count();
+    let mut out: Vec<GitDisplayRow> = Vec::with_capacity(state.git.files.len() + 2);
+
+    if staged_count > 0 {
+        out.push(GitDisplayRow::StagedHeader);
+        for (i, file) in state.git.files.iter().enumerate() {
+            if file.staged {
+                out.push(GitDisplayRow::File(i));
+            }
+        }
+    }
+    if unstaged_count > 0 {
+        out.push(GitDisplayRow::UnstagedHeader);
+        for (i, file) in state.git.files.iter().enumerate() {
+            if !file.staged {
+                out.push(GitDisplayRow::File(i));
+            }
+        }
+    }
+
+    out
+}
+
+/// Procesa click en el git panel — foco en input, trigger commit, o acciones por archivo.
 ///
 /// Layout interno del panel (dentro del borde):
 ///   - Fila 0: branch name           → ignorar (solo informativo)
 ///   - Fila 1: commit input row      → activar commit_mode (dar foco al input)
 ///   - Fila 2: commit button row     → ejecutar commit si commit_input no está vacío
-///   - Fila 3: separador             → ignorar
-///   - Filas 4+: lista de archivos   → seleccionar archivo (future: stage toggle)
-fn reduce_mouse_click_git(state: &mut AppState, layout: &IdeLayout, row: u16) {
-    // inner_y = sidebar.y + 1 (borde superior del Block + título ocupa 1 fila)
+///   - Filas 3+: lista de archivos   → headers o file rows con hit-test por columna
+///
+/// En las file rows se distinguen tres zonas por columna:
+///   - rel_col < 3              → click en `[+]`/`[-]` → GitStageFile(idx)
+///   - rel_col >= width - 3     → click en `[×]` (si visible) → GitDiscardFile(idx)
+///   - resto                    → seleccionar + cargar diff
+///
+/// Si `col == u16::MAX`, se ignora la columna y solo se selecciona el archivo
+/// (útil para flujos sintéticos donde no hay columna real disponible).
+fn reduce_mouse_click_git_with_col(
+    state: &mut AppState,
+    layout: &IdeLayout,
+    col: u16,
+    row: u16,
+) {
+    use crate::core::Action;
+
+    // inner area de la sidebar (sin bordes del Block)
+    let inner_x = layout.sidebar.x + 1;
     let inner_y = layout.sidebar.y + 1;
+    let inner_width = layout.sidebar.width.saturating_sub(2);
     let inner_height = layout.sidebar.height.saturating_sub(2);
 
     if row < inner_y || row >= inner_y + inner_height {
@@ -437,14 +498,17 @@ fn reduce_mouse_click_git(state: &mut AppState, layout: &IdeLayout, row: u16) {
 
     let visual_row = (row - inner_y) as usize;
 
+    // Filas 0..3 son fijas (branch / input / button).
     match visual_row {
         0 => {
             // Branch line — ignorar (no interactivo)
+            return;
         }
         1 => {
             // Commit input row — dar foco (activar commit_mode)
             state.git.commit_mode = true;
             tracing::debug!("git panel: foco en commit input via mouse click");
+            return;
         }
         2 => {
             // Commit button row — ejecutar commit si hay mensaje
@@ -463,20 +527,97 @@ fn reduce_mouse_click_git(state: &mut AppState, layout: &IdeLayout, row: u16) {
                 state.git.commit_mode = true;
                 tracing::debug!("git panel: click en botón Commit sin mensaje → foco en input");
             }
+            return;
         }
-        3 => {
-            // Separador — ignorar
-        }
-        visual => {
-            // Lista de archivos — seleccionar (visual 4+ → índice = visual - 4 + scroll)
-            let list_row = visual - 4;
-            // El scroll_offset gestiona el viewport de la lista.
-            // No stage/toggle por click aquí: el usuario usa Enter/'s' con teclado.
-            let idx = state.git.scroll_offset + list_row;
-            if idx < state.git.files.len() {
-                state.git.selected_index = idx;
-                tracing::debug!(idx, "git panel: archivo seleccionado via mouse click");
+        _ => {}
+    }
+
+    // Filas 3+: lista de archivos. Mapear visual_row → display_idx
+    // file_list area empieza en visual_row 3, con scroll_offset aplicado.
+    let list_visual_row = visual_row - 3;
+    let display_idx = state.git.scroll_offset + list_visual_row;
+
+    let kinds = git_panel_display_kinds(state);
+    let Some(&kind) = kinds.get(display_idx) else {
+        return; // click más allá de la última fila visible
+    };
+
+    // Columna relativa al inner area (col puede ser u16::MAX si no se proveyó).
+    let rel_col = if col == u16::MAX {
+        u16::MAX
+    } else {
+        col.saturating_sub(inner_x)
+    };
+
+    match kind {
+        GitDisplayRow::StagedHeader => {
+            // Header "Staged Changes (N)" con botón [-] alineado a la derecha.
+            // BTN_LEN = 4 (" [-]"), [-] ocupa los últimos 3 chars.
+            if rel_col != u16::MAX && rel_col >= inner_width.saturating_sub(3) {
+                let effects = reduce(state, &Action::GitUnstageAll);
+                process_effects(&effects, &CancellationToken::new());
+                tracing::debug!("git panel: unstage all via [-] header click");
             }
+        }
+        GitDisplayRow::UnstagedHeader => {
+            // Header "Changes (N)" con botón [+] alineado a la derecha (últimos 3 chars).
+            // BTN_LEN = 4 (" [+]"), [+] ocupa los últimos 3.
+            if rel_col != u16::MAX && rel_col >= inner_width.saturating_sub(3) {
+                let effects = reduce(state, &Action::GitStageAll);
+                process_effects(&effects, &CancellationToken::new());
+                tracing::debug!("git panel: stage all via [+] header click");
+            }
+        }
+        GitDisplayRow::File(file_idx) => {
+            if file_idx >= state.git.files.len() {
+                return; // safety
+            }
+
+            // Recoger info del archivo antes de mutar (CLONE de status — Copy, sin alloc)
+            let file_staged = state.git.files[file_idx].staged;
+            // Todos los archivos unstaged tienen [↺]:
+            //   Modified/Deleted → git restore, Added/Untracked → git clean -f
+            let has_discard = !file_staged;
+
+            // Hit-test por columna sólo si tenemos col real.
+            // Layout final: "M  path ──── [+] [↺]"
+            //   has_discard → sufijo " [+] [↺]" = 8 chars al final
+            //     [↺] ocupa últimos 3: (w-3)..w
+            //     [+] ocupa chars 5-7 desde el final: (w-7)..(w-4)
+            //   solo stage  → sufijo " [+]" = 4 chars al final
+            //     [+] ocupa últimos 3: (w-3)..w
+            if rel_col != u16::MAX {
+                if has_discard {
+                    // Zona [↺]: últimos 3 chars
+                    if rel_col >= inner_width.saturating_sub(3) {
+                        let effects = reduce(state, &Action::GitDiscardFile(file_idx));
+                        process_effects(&effects, &CancellationToken::new());
+                        return;
+                    }
+                    // Zona [+]: chars (w-7)..(w-4)
+                    let btn_start = inner_width.saturating_sub(7);
+                    let btn_end = inner_width.saturating_sub(4);
+                    if rel_col >= btn_start && rel_col < btn_end {
+                        let effects = reduce(state, &Action::GitStageFile(file_idx));
+                        process_effects(&effects, &CancellationToken::new());
+                        return;
+                    }
+                } else {
+                    // Zona [+]/[-]: últimos 3 chars
+                    if rel_col >= inner_width.saturating_sub(3) {
+                        let effects = reduce(state, &Action::GitStageFile(file_idx));
+                        process_effects(&effects, &CancellationToken::new());
+                        return;
+                    }
+                }
+            }
+
+            // Zona central (o flujo sin columna): seleccionar + abrir diff como tab.
+            // Equivalente a presionar 'd' — usa el mismo reducer GitToggleDiff.
+            state.git.selected_index = file_idx;
+            let effects = reduce(state, &Action::GitToggleDiff);
+            process_effects(&effects, &CancellationToken::new());
+            tracing::debug!(file_idx, "git panel: archivo seleccionado + diff tab abierta");
         }
     }
 }
@@ -875,7 +1016,7 @@ pub(super) fn reduce_mouse_scroll(
             }
         }
         PanelId::Terminal => {
-            if let Some(ref mut session) = state.terminal.session {
+            if let Some(session) = state.terminal.session_mut() {
                 match direction {
                     ScrollDirection::Up => session.scroll_up(MOUSE_SCROLL_LINES),
                     ScrollDirection::Down => session.scroll_down(MOUSE_SCROLL_LINES),

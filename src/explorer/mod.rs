@@ -4,11 +4,14 @@
 //! Aplana el árbol para renderizado eficiente con viewport virtual.
 //! Solo las entries visibles se renderizan — nunca el árbol completo.
 
+pub mod folder_picker;
+pub mod tree;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::tree::{load_directory, FileEntry};
+use self::tree::{load_directory, FileEntry};
 
 /// Entry aplanado para renderizado — una fila visible del explorer.
 ///
@@ -47,6 +50,12 @@ pub struct ExplorerState {
     pub selected_index: usize,
     /// Offset de scroll para viewport virtual.
     pub scroll_offset: usize,
+    /// Input modal inline para crear archivo nuevo.
+    /// `None` = inactivo. `Some(name)` = el usuario está escribiendo el nombre.
+    pub new_file_input: Option<String>,
+    /// Input modal inline para crear carpeta nueva.
+    /// `None` = inactivo. `Some(name)` = el usuario está escribiendo el nombre.
+    pub new_folder_input: Option<String>,
     /// Cache del árbol aplanado — evita recomputar cada frame.
     flat_cache: Option<Vec<FlatEntry>>,
     /// Flag de invalidación — `true` cuando el árbol mutó y el cache es stale.
@@ -67,6 +76,8 @@ impl ExplorerState {
             entries,
             selected_index: 0,
             scroll_offset: 0,
+            new_file_input: None,
+            new_folder_input: None,
             flat_cache: None,
             cache_dirty: true,
         })
@@ -233,6 +244,75 @@ impl ExplorerState {
         collapse_entry_by_path(&mut self.entries, &target_path)?;
         self.invalidate_cache();
         Ok(true)
+    }
+
+    // ─── New file / new folder modal inline ────────────────────────────────────
+
+    /// Devuelve el directorio en el que se debe crear un nuevo archivo/carpeta.
+    ///
+    /// Reglas (estilo VS Code):
+    /// - Si la selección es un directorio, el nuevo item se crea adentro.
+    /// - Si la selección es un archivo, se crea en el directorio padre.
+    /// - Si no hay selección válida, se crea en el root del workspace.
+    ///
+    /// CLONE: el resultado debe ser owned porque el caller lo usa fuera del
+    /// borrow del flatten temporal.
+    pub fn selected_dir_path(&self) -> PathBuf {
+        let flat = self.flatten();
+        match flat.get(self.selected_index) {
+            Some(entry) if entry.is_dir => entry.path.clone(),
+            Some(entry) => entry
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.root.clone()),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Inicia el input modal inline para crear un archivo nuevo.
+    pub fn start_new_file(&mut self) {
+        // Cancelar el otro input si estaba activo — solo uno a la vez
+        self.new_folder_input = None;
+        self.new_file_input = Some(String::new());
+    }
+
+    /// Inicia el input modal inline para crear una carpeta nueva.
+    pub fn start_new_folder(&mut self) {
+        self.new_file_input = None;
+        self.new_folder_input = Some(String::new());
+    }
+
+    /// Confirma el input de archivo nuevo.
+    ///
+    /// Retorna `Some((parent_dir, name))` si hay un nombre no vacío,
+    /// `None` si el input estaba vacío o inactivo. El input se cierra
+    /// en cualquier caso.
+    pub fn confirm_new_file(&mut self) -> Option<(PathBuf, String)> {
+        let name = self.new_file_input.take()?;
+        if name.is_empty() {
+            return None;
+        }
+        Some((self.selected_dir_path(), name))
+    }
+
+    /// Confirma el input de carpeta nueva.
+    pub fn confirm_new_folder(&mut self) -> Option<(PathBuf, String)> {
+        let name = self.new_folder_input.take()?;
+        if name.is_empty() {
+            return None;
+        }
+        Some((self.selected_dir_path(), name))
+    }
+
+    /// Cancela el input de archivo nuevo (si está activo).
+    pub fn cancel_new_file(&mut self) {
+        self.new_file_input = None;
+    }
+
+    /// Cancela el input de carpeta nueva (si está activo).
+    pub fn cancel_new_folder(&mut self) {
+        self.new_folder_input = None;
     }
 }
 
