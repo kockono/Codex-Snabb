@@ -166,6 +166,33 @@ pub fn unstage_file(repo_path: &Path, file_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Descarta cambios del working tree de un archivo (restore al index).
+///
+/// Ejecuta `git restore -- <file>`. Solo afecta el working tree —
+/// no toca el index. Para archivos unstaged Modified/Deleted, vuelve
+/// el archivo al estado del index. No aplica a archivos staged ni untracked.
+pub fn discard_file(repo_path: &Path, file_path: &str) -> Result<()> {
+    run_git(repo_path, &["restore", "--", file_path])?;
+    Ok(())
+}
+
+/// Elimina un archivo no rastreado del disco (`git clean -f -- <file>`).
+///
+/// Solo aplica a archivos Untracked o Added sin stagear. No toca archivos
+/// ya tracked por git (Modified, Deleted, Renamed).
+pub fn delete_untracked_file(repo_path: &Path, file_path: &str) -> Result<()> {
+    run_git(repo_path, &["clean", "-f", "--", file_path])?;
+    Ok(())
+}
+
+/// Quita todos los archivos del staging area (`git restore --staged .`).
+///
+/// Equivalente a unstage de todo sin descartar cambios del working tree.
+pub fn unstage_all(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["restore", "--staged", "."])?;
+    Ok(())
+}
+
 /// Ejecuta un commit con el mensaje dado.
 ///
 /// Ejecuta `git commit -m <message>`. Retorna el output del commit.

@@ -32,6 +32,12 @@ serde_json = "1"
 # Terminal PTY
 portable-pty = "0.8"
 
+# Terminal VT emulation — alacritty_terminal as pure state machine
+alacritty_terminal = { version = "0.26", default-features = false }
+
+# Small stack-allocated vectors for key-to-bytes conversion
+smallvec = { version = "1", features = ["union"] }
+
 # Search
 regex = "1"
 globset = "0.4"
@@ -69,6 +75,9 @@ tree-sitter-bash       = "0.25"   # req ^0.25
 
 # Diálogo nativo de selección de carpeta/archivo (usa WinAPI / AppKit / GTK)
 rfd = { version = "0.15", default-features = false }
+
+# Clipboard multiplataforma (Windows / macOS / Linux X11/Wayland) — funciona en terminales
+arboard = "3"
 
 # Observabilidad
 tracing = "0.1"

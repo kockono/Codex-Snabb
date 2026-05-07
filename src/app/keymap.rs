@@ -9,7 +9,8 @@ use crossterm::event::{
 
 use crate::core::command::CommandRegistry;
 use crate::core::{Action, Direction, PanelId};
-use crate::git::GitState;
+use crate::source_control_git::GitState;
+use crate::terminal::input::key_to_bytes;
 
 /// Mapea un evento de crossterm a una acción del sistema.
 ///
@@ -46,6 +47,10 @@ pub(super) fn keymap(
     save_as_visible: bool,
     context_menu_visible: bool,
     rename_visible: bool,
+    editor_active_is_diff: bool,
+    editor_file_search_active: bool,
+    explorer_new_file_active: bool,
+    explorer_new_folder_active: bool,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -381,6 +386,18 @@ pub(super) fn keymap(
         (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
         (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
+        // Ctrl+Shift+E → foco directo al Explorer (estilo VS Code)
+        (KeyCode::Char('E'), mods)
+            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+        {
+            return Action::FocusExplorer;
+        }
+        // Ctrl+Shift+G → foco directo al Git panel (estilo VS Code)
+        (KeyCode::Char('G'), mods)
+            if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+        {
+            return Action::OpenGitPanel;
+        }
         (KeyCode::Char('j'), KeyModifiers::CONTROL) => return Action::ToggleBottomPanel,
         // Ctrl+` abre/cierra terminal (con spawn automático si no hay sesión)
         (KeyCode::Char('`'), KeyModifiers::CONTROL) => return Action::ToggleTerminal,
@@ -416,28 +433,105 @@ pub(super) fn keymap(
     // ── Context-aware: match sobre (panel enfocado, tecla) ──
     match focused_panel {
         PanelId::Terminal => match (key.code, key.modifiers) {
-            // Esc sale del foco del terminal
-            (KeyCode::Esc, _) => Action::FocusNext,
-            // Ctrl+C → enviar Ctrl+C al terminal
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::TerminalCtrlC,
-            // Enter → enviar Enter al terminal
-            (KeyCode::Enter, KeyModifiers::NONE) => Action::TerminalEnter,
-            // Shift+Up / PageUp → scroll up del terminal
-            (KeyCode::Up, mods) if mods.contains(KeyModifiers::SHIFT) => Action::TerminalScrollUp,
-            (KeyCode::PageUp, _) => Action::TerminalScrollUp,
-            // Shift+Down / PageDown → scroll down del terminal
-            (KeyCode::Down, mods) if mods.contains(KeyModifiers::SHIFT) => {
+            // ── Bindings especiales que NO van al PTY ──
+
+            // Esc: salir del foco del terminal → volver al editor
+            (KeyCode::Esc, _) => Action::FocusPanel(PanelId::Editor),
+            // Ctrl+Shift+5: split horizontal (lado a lado)
+            (KeyCode::Char('5'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::TerminalSplitHorizontal
+            }
+            // Ctrl+Shift+\: split vertical (arriba/abajo)
+            (KeyCode::Char('\\'), mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::TerminalSplitVertical
+            }
+            // Ctrl+W: cerrar pane activo del terminal
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => Action::TerminalClosePane,
+            // Alt+Right / Alt+Left: navegar entre panes de terminal
+            (KeyCode::Right, mods) if mods.contains(KeyModifiers::ALT) => Action::TerminalFocusNext,
+            (KeyCode::Left, mods) if mods.contains(KeyModifiers::ALT) => Action::TerminalFocusPrev,
+            // Shift+PageUp/PageDown: scroll del terminal (legacy compat)
+            (KeyCode::PageUp, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::TerminalScrollUp
+            }
+            (KeyCode::PageDown, mods) if mods.contains(KeyModifiers::SHIFT) => {
                 Action::TerminalScrollDown
             }
-            (KeyCode::PageDown, _) => Action::TerminalScrollDown,
-            // Caracteres → input al terminal
-            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                Action::TerminalInput(ch)
+
+            // ── Todo lo demás → enviar como bytes crudos al PTY ──
+            _ => {
+                let bytes = key_to_bytes(*key);
+                if bytes.is_empty() {
+                    Action::Noop
+                } else {
+                    Action::TerminalSendBytes(bytes.into_vec())
+                }
             }
-            _ => Action::Noop,
         },
 
-        PanelId::Editor => match (key.code, key.modifiers) {
+        PanelId::Editor => {
+            // ── Tab virtual de diff: solo scroll y noop ──
+            // El bloque captura ANTES de los bindings normales del editor para
+            // evitar que cualquier tecla edite el contenido (que es read-only).
+            // Ctrl+W (cerrar tab) ya se procesó en los atajos globales — sigue
+            // funcionando porque es un return temprano arriba.
+            if editor_active_is_diff {
+                return match (key.code, key.modifiers) {
+                    (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+                        Action::GitDiffScrollUp
+                    }
+                    (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+                        Action::GitDiffScrollDown
+                    }
+                    (KeyCode::PageUp, _) => Action::GitDiffScrollUp,
+                    (KeyCode::PageDown, _) => Action::GitDiffScrollDown,
+                    // Todo lo demás: noop — la tab no es editable
+                    _ => Action::Noop,
+                };
+            }
+
+            // ── File search bar activo: captura teclas del input ──
+            // Aparece al hacer Ctrl+F dentro del editor. Captura Esc, Enter,
+            // F3, Backspace y caracteres normales — el resto del editor no
+            // recibe input mientras el search bar está activo.
+            if editor_file_search_active {
+                return match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => Action::FileSearchClose,
+                    (KeyCode::Enter, KeyModifiers::NONE) => Action::FileSearchNext,
+                    (KeyCode::Enter, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                        Action::FileSearchPrev
+                    }
+                    (KeyCode::F(3), KeyModifiers::NONE) => Action::FileSearchNext,
+                    (KeyCode::F(3), mods) if mods.contains(KeyModifiers::SHIFT) => {
+                        Action::FileSearchPrev
+                    }
+                    (KeyCode::Backspace, _) => Action::FileSearchDeleteChar,
+                    // Alt+C → toggle case sensitive
+                    (KeyCode::Char('c'), KeyModifiers::ALT) => Action::FileSearchToggleCase,
+                    (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        Action::FileSearchInsertChar(ch)
+                    }
+                    _ => Action::Noop,
+                };
+            }
+
+            match (key.code, key.modifiers) {
+            // ── Ctrl+F → abrir search bar del archivo actual ──
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => Action::OpenFileSearch,
+            // ── Clipboard (solo cuando el foco es Editor) ──
+            // Ctrl+A → seleccionar todo el buffer
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Action::SelectAll,
+            // Ctrl+C → copiar selección al portapapeles del SO
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::CopySelection,
+            // Ctrl+X → cortar selección al portapapeles
+            (KeyCode::Char('x'), KeyModifiers::CONTROL) => Action::CutSelection,
+            // Ctrl+V → pegar contenido del portapapeles
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) => Action::PasteClipboard,
+
             // ── LSP ──
             // Ctrl+Space → autocompletado
             (KeyCode::Char(' '), KeyModifiers::CONTROL) => Action::LspCompletion,
@@ -477,28 +571,71 @@ pub(super) fn keymap(
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => Action::InsertChar(ch),
 
             _ => Action::Noop,
-        },
-
-        PanelId::Explorer => match (key.code, key.modifiers) {
-            // Navegación
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ExplorerUp,
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::ExplorerDown,
-            // Abrir/expandir
-            (KeyCode::Enter | KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
-                Action::ExplorerToggle
             }
-            // Colapsar
-            (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => Action::ExplorerCollapse,
-            // Refresh
-            (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ExplorerRefresh,
-            // Context menu — alternativa al right-click para Windows Terminal
-            // que intercepta el right-click antes de que llegue a la app
-            (KeyCode::Char('m'), KeyModifiers::NONE) | (KeyCode::F(10), KeyModifiers::SHIFT) => {
-                Action::ContextMenuOpen { x: 0, y: 0 }
-            }
+        }
 
-            _ => Action::Noop,
-        },
+        PanelId::Explorer => {
+            // ── Input modal inline: nuevo archivo ──
+            // Captura todas las teclas mientras el input está activo.
+            if explorer_new_file_active {
+                return match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => Action::ExplorerNewFileCancel,
+                    (KeyCode::Enter, _) => Action::ExplorerNewFileConfirm,
+                    (KeyCode::Backspace, _) => Action::ExplorerNewFileBackspace,
+                    (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        Action::ExplorerNewFileInput(ch)
+                    }
+                    _ => Action::Noop,
+                };
+            }
+            // ── Input modal inline: nueva carpeta ──
+            if explorer_new_folder_active {
+                return match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => Action::ExplorerNewFolderCancel,
+                    (KeyCode::Enter, _) => Action::ExplorerNewFolderConfirm,
+                    (KeyCode::Backspace, _) => Action::ExplorerNewFolderBackspace,
+                    (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        Action::ExplorerNewFolderInput(ch)
+                    }
+                    _ => Action::Noop,
+                };
+            }
+            match (key.code, key.modifiers) {
+                // Esc → volver al editor
+                (KeyCode::Esc, _) => Action::FocusPanel(PanelId::Editor),
+                // Navegación
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ExplorerUp,
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Action::ExplorerDown,
+                // Abrir/expandir
+                (KeyCode::Enter | KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
+                    Action::ExplorerToggle
+                }
+                // Colapsar
+                (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => {
+                    Action::ExplorerCollapse
+                }
+                // Refresh
+                (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ExplorerRefresh,
+                // 'n' → nuevo archivo, Shift+N → nueva carpeta (estilo VS Code).
+                // crossterm reporta Shift+N como 'N' mayúscula.
+                (KeyCode::Char('n'), KeyModifiers::NONE) => Action::ExplorerNewFile,
+                (KeyCode::Char('N'), mods) if mods.contains(KeyModifiers::SHIFT) => {
+                    Action::ExplorerNewFolder
+                }
+                // Delete / 'd' → eliminar archivo o carpeta seleccionada
+                (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                    Action::ExplorerDeleteSelected
+                }
+                // Context menu — alternativa al right-click para Windows Terminal
+                // que intercepta el right-click antes de que llegue a la app
+                (KeyCode::Char('m'), KeyModifiers::NONE)
+                | (KeyCode::F(10), KeyModifiers::SHIFT) => {
+                    Action::ContextMenuOpen { x: 0, y: 0 }
+                }
+
+                _ => Action::Noop,
+            }
+        }
 
         PanelId::Projects => match (key.code, key.modifiers) {
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Action::ProjectsMoveUp,
@@ -568,6 +705,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -595,6 +736,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -625,6 +770,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -652,6 +801,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -679,6 +832,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -706,6 +863,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -733,6 +894,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -762,6 +927,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -789,6 +958,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -816,6 +989,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -843,6 +1020,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::GoToLineClose);
     }
@@ -870,6 +1051,10 @@ mod tests {
             true,  // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::SaveAsCancel);
     }
@@ -897,6 +1082,10 @@ mod tests {
             true,  // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::SaveAsConfirm);
     }
@@ -924,6 +1113,10 @@ mod tests {
             true,  // save_as_visible
             false, // context_menu_visible
             false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::SaveAsChar('a'));
     }
@@ -951,6 +1144,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             true,  // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::RenameCancel);
     }
@@ -978,6 +1175,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             true,  // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::RenameConfirm);
     }
@@ -1005,6 +1206,10 @@ mod tests {
             false, // save_as_visible
             false, // context_menu_visible
             true,  // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
         );
         assert_eq!(action, Action::RenameChar('x'));
     }

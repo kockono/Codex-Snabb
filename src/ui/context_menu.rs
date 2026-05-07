@@ -35,6 +35,8 @@ use crate::ui::Theme;
 /// Items disponibles en el context menu del explorer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMenuItem {
+    NewFile,
+    NewFolder,
     Rename,
     Delete,
     Copy,
@@ -66,6 +68,8 @@ pub struct ContextMenuState {
 ///
 /// Los separadores son manejados por el renderer — no son items seleccionables.
 static MENU_ITEMS: &[ContextMenuItem] = &[
+    ContextMenuItem::NewFile,
+    ContextMenuItem::NewFolder,
     ContextMenuItem::Rename,
     ContextMenuItem::Delete,
     ContextMenuItem::Copy,
@@ -140,33 +144,41 @@ const MENU_WIDTH: u16 = 27;
 
 /// Separadores en el menú: índices de FILA (no de item) donde aparece la línea horizontal.
 /// El layout de filas (dentro del bloque, excluyendo borders):
-///   0 → Rename
-///   1 → Delete
+///   0 → New File
+///   1 → New Folder
 ///   2 → ── separador ──
-///   3 → Copy
-///   4 → Copy Path
-///   5 → Copy Relative Path
-///   6 → ── separador ──
-///   7 → Reveal in File Explorer
-const MENU_INNER_HEIGHT: u16 = 8; // 6 items + 2 separadores
+///   3 → Rename
+///   4 → Delete
+///   5 → ── separador ──
+///   6 → Copy
+///   7 → Copy Path
+///   8 → Copy Relative Path
+///   9 → ── separador ──
+///  10 → Reveal in File Explorer
+const MENU_INNER_HEIGHT: u16 = 11; // 8 items + 3 separadores
 
 /// Mapeo de fila interna → item index (None = separador).
 ///
 /// Pre-computado para evitar cualquier cómputo en render.
-/// Índices: fila 0..7
+/// Índices: fila 0..11
 static ROW_TO_ITEM: &[Option<usize>] = &[
-    Some(0), // Rename
-    Some(1), // Delete
+    Some(0), // New File
+    Some(1), // New Folder
     None,    // separador
-    Some(2), // Copy
-    Some(3), // Copy Path
-    Some(4), // Copy Relative Path
+    Some(2), // Rename
+    Some(3), // Delete
     None,    // separador
-    Some(5), // Reveal in File Explorer
+    Some(4), // Copy
+    Some(5), // Copy Path
+    Some(6), // Copy Relative Path
+    None,    // separador
+    Some(7), // Reveal in File Explorer
 ];
 
 /// Labels de items — orden debe coincidir con `MENU_ITEMS` y `ROW_TO_ITEM`.
 static ITEM_LABELS: &[&str] = &[
+    "New File",
+    "New Folder",
     "Rename",
     "Delete",
     "Copy",

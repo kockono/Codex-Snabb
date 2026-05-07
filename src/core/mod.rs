@@ -33,14 +33,12 @@ pub enum Action {
 
     // ── Navegación ──
     /// Mover foco al siguiente panel en orden.
+    /// Enfocar el Explorer directamente — abre sidebar si estaba cerrada.
+    FocusExplorer,
     FocusNext,
     /// Mover foco al panel anterior en orden.
     FocusPrev,
     /// Mover foco a un panel específico.
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se implemente navegación directa a paneles"
-    )]
     FocusPanel(PanelId),
 
     // ── Editor ──
@@ -80,6 +78,14 @@ pub enum Action {
     ClearMultiCursor,
     /// Mover cursor extendiendo la selección (Shift + flechas).
     MoveCursorSelecting(Direction),
+    /// Seleccionar todo el contenido del buffer (Ctrl+A).
+    SelectAll,
+    /// Copiar la selección activa al portapapeles del sistema (Ctrl+C).
+    CopySelection,
+    /// Cortar la selección activa al portapapeles del sistema (Ctrl+X).
+    CutSelection,
+    /// Pegar el contenido del portapapeles del sistema (Ctrl+V).
+    PasteClipboard,
 
     // ── Archivos ──
     /// Abrir un archivo por path.
@@ -179,11 +185,14 @@ pub enum Action {
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.
     ToggleTerminal,
-    /// Enviar un carácter al terminal.
+    /// Enviar un carácter al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalInput(char),
-    /// Enviar Enter al terminal.
+    /// Enviar Enter al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalEnter,
-    /// Enviar Ctrl+C al terminal.
+    /// Enviar Ctrl+C al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalCtrlC,
     /// Scrollear output del terminal hacia arriba.
     TerminalScrollUp,
@@ -192,6 +201,40 @@ pub enum Action {
     /// Crear nueva sesión de terminal si no existe.
     #[expect(dead_code, reason = "se dispara internamente via ToggleTerminal")]
     TerminalSpawn,
+
+    // ── Terminal multi-pane ──
+    /// Split horizontal del pane activo (side-by-side).
+    TerminalSplitHorizontal,
+    /// Split vertical del pane activo (top/bottom).
+    TerminalSplitVertical,
+    /// Cerrar el pane activo de terminal.
+    TerminalClosePane,
+    /// Mover foco al siguiente pane de terminal.
+    TerminalFocusNext,
+    /// Mover foco al pane anterior de terminal.
+    TerminalFocusPrev,
+    /// Mover foco a un pane específico por ID.
+    #[expect(dead_code, reason = "reducer lo maneja — no hay keybinding directo aún, se usará via mouse click en pane")]
+    TerminalFocusPane(u32),
+    /// Bytes crudos para enviar al PTY del pane activo.
+    /// Reemplaza conceptualmente TerminalInput/Enter/CtrlC.
+    TerminalSendBytes(Vec<u8>),
+
+    // ── File search (Ctrl+F dentro del editor) ──
+    /// Abrir el search bar del archivo actual (Ctrl+F).
+    OpenFileSearch,
+    /// Insertar carácter en el query del file search.
+    FileSearchInsertChar(char),
+    /// Borrar carácter del query del file search (Backspace).
+    FileSearchDeleteChar,
+    /// Saltar al siguiente match del file search (Enter / F3).
+    FileSearchNext,
+    /// Saltar al match anterior del file search (Shift+Enter / Shift+F3).
+    FileSearchPrev,
+    /// Cerrar el file search (Esc).
+    FileSearchClose,
+    /// Toggle case-sensitive del file search (Alt+C).
+    FileSearchToggleCase,
 
     // ── Explorer ──
     /// Mover selección arriba en el explorer.
@@ -204,6 +247,28 @@ pub enum Action {
     ExplorerRefresh,
     /// Colapsar directorio seleccionado en el explorer.
     ExplorerCollapse,
+    /// Iniciar creación de archivo nuevo en el explorer (input modal inline).
+    ExplorerNewFile,
+    /// Iniciar creación de carpeta nueva en el explorer (input modal inline).
+    ExplorerNewFolder,
+    /// Eliminar el archivo o carpeta seleccionado en el explorer.
+    ExplorerDeleteSelected,
+    /// Insertar carácter en el input de nuevo archivo del explorer.
+    ExplorerNewFileInput(char),
+    /// Borrar carácter del input de nuevo archivo del explorer.
+    ExplorerNewFileBackspace,
+    /// Confirmar creación del nuevo archivo.
+    ExplorerNewFileConfirm,
+    /// Cancelar creación del nuevo archivo.
+    ExplorerNewFileCancel,
+    /// Insertar carácter en el input de nueva carpeta del explorer.
+    ExplorerNewFolderInput(char),
+    /// Borrar carácter del input de nueva carpeta del explorer.
+    ExplorerNewFolderBackspace,
+    /// Confirmar creación de la nueva carpeta.
+    ExplorerNewFolderConfirm,
+    /// Cancelar creación de la nueva carpeta.
+    ExplorerNewFolderCancel,
 
     // ── Paneles ──
     /// Alternar visibilidad de la sidebar (Ctrl+B).
@@ -271,8 +336,30 @@ pub enum Action {
     GitDown,
     /// Toggle stage/unstage del archivo seleccionado.
     GitStageToggle,
+    /// Stage o unstage un archivo específico por índice (click en `[+]`/`[-]` del row).
+    GitStageFile(usize),
+    /// Descartar cambios del working tree de un archivo específico por índice
+    /// (click en `[×]` del row). Solo aplica a archivos unstaged Modified/Deleted.
+    GitDiscardFile(usize),
+    /// Stage de todos los archivos unstaged a la vez (click en `[+]` del header "Changes").
+    GitStageAll,
+    GitUnstageAll,
     /// Toggle mostrar/ocultar diff del archivo seleccionado.
+    ///
+    /// En el modelo de tabs virtuales de diff, abre (o reusa) una tab de diff
+    /// para el archivo seleccionado. Si la tab activa ya es esa tab de diff
+    /// y hay más de una tab abierta, la cierra (toggle).
     GitToggleDiff,
+    /// Abre el diff del archivo seleccionado como tab virtual.
+    ///
+    /// Idempotente: si ya hay una tab de diff para el archivo, la activa
+    /// y refresca su contenido. Equivalente a `GitToggleDiff` cuando la
+    /// tab activa NO es la del diff de ese archivo.
+    #[expect(
+        dead_code,
+        reason = "se construirá desde el command palette / context menu — alias semántico de GitToggleDiff"
+    )]
+    GitOpenDiffTab,
     /// Scrollear diff hacia arriba.
     GitDiffScrollUp,
     /// Scrollear diff hacia abajo.
@@ -593,37 +680,7 @@ pub enum PanelId {
     Projects,
 }
 
-impl PanelId {
-    /// Paneles navegables en orden de ciclo (Tab / Shift+Tab).
-    ///
-    /// Solo incluye paneles persistentes, no overlays como CommandPalette
-    /// o QuickOpen que son modales y capturan foco mientras están abiertos.
-    const CYCLE_ORDER: &[PanelId] = &[PanelId::Explorer, PanelId::Editor, PanelId::Terminal];
 
-    /// Retorna el siguiente panel en el ciclo de navegación.
-    pub fn next(self) -> Self {
-        let current_idx = Self::CYCLE_ORDER
-            .iter()
-            .position(|&p| p == self)
-            .unwrap_or(0);
-        let next_idx = (current_idx + 1) % Self::CYCLE_ORDER.len();
-        Self::CYCLE_ORDER[next_idx]
-    }
-
-    /// Retorna el panel anterior en el ciclo de navegación.
-    pub fn prev(self) -> Self {
-        let current_idx = Self::CYCLE_ORDER
-            .iter()
-            .position(|&p| p == self)
-            .unwrap_or(0);
-        let prev_idx = if current_idx == 0 {
-            Self::CYCLE_ORDER.len() - 1
-        } else {
-            current_idx - 1
-        };
-        Self::CYCLE_ORDER[prev_idx]
-    }
-}
 
 // ─── Direction ─────────────────────────────────────────────────────────────────
 

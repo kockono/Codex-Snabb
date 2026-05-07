@@ -304,6 +304,11 @@ impl CommandRegistry {
         &self.commands
     }
 
+    /// Retorna todos los overrides de keybindings (para persistencia).
+    pub fn overrides(&self) -> &HashMap<&'static str, Option<String>> {
+        &self.keybind_overrides
+    }
+
     /// Busca un comando por su ID.
     #[expect(
         dead_code,

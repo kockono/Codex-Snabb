@@ -17,7 +17,7 @@ pub mod ts_highlight;
 pub mod undo;
 pub mod viewport;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -31,6 +31,25 @@ use undo::{EditOperation, UndoStack};
 use viewport::Viewport;
 
 use crate::core::Direction;
+
+// ─── DiffViewContent ───────────────────────────────────────────────────────────
+
+/// Contenido de una tab virtual de diff/file (read-only, no editable).
+///
+/// Cuando un `EditorState` tiene `diff_view = Some(...)`, esa tab se renderiza
+/// como vista de diff/archivo en lugar de buffer editable. Las operaciones
+/// de edición se ignoran sobre estas tabs — solo permiten scroll y cierre.
+#[derive(Debug, Clone)]
+pub struct DiffViewContent {
+    /// Contenido completo (diff coloreado o texto del archivo).
+    pub content: String,
+    /// Path del archivo fuente del diff.
+    pub file_path: Option<PathBuf>,
+    /// `true` = mostrando archivo completo, `false` = mostrando diff real.
+    pub is_file_content: bool,
+    /// Offset de scroll actual (en líneas).
+    pub scroll_offset: usize,
+}
 
 /// Estado completo del editor.
 ///
@@ -49,7 +68,6 @@ pub struct EditorState {
     /// Historial de undo/redo.
     pub undo_stack: UndoStack,
     /// Búsqueda local activa (None si no hay búsqueda).
-    #[expect(dead_code, reason = "se usará cuando se implemente búsqueda en editor")]
     pub search: Option<search::BufferSearch>,
     /// Cache de syntax highlighting para este buffer.
     pub highlight_cache: HighlightCache,
@@ -58,6 +76,11 @@ pub struct EditorState {
     /// Se activa al abrir un archivo nuevo para no bloquear el frame
     /// del open con trabajo pesado. El siguiente frame lo procesa normal.
     pub highlight_deferred: bool,
+    /// Si esta tab es una vista de diff/file del git panel (no editable).
+    ///
+    /// `None` = tab normal de archivo (buffer editable).
+    /// `Some(...)` = tab virtual de diff con contenido pre-computado y read-only.
+    pub diff_view: Option<DiffViewContent>,
 }
 
 impl EditorState {
@@ -71,6 +94,7 @@ impl EditorState {
             search: None,
             highlight_cache: HighlightCache::new(),
             highlight_deferred: false,
+            diff_view: None,
         }
     }
 
@@ -91,6 +115,7 @@ impl EditorState {
             // Diferir highlight al siguiente frame — el archivo acaba de abrirse.
             // Así el frame del open es instantáneo y el highlight corre después.
             highlight_deferred: true,
+            diff_view: None,
         })
     }
 
@@ -709,6 +734,184 @@ impl EditorState {
     /// Verifica si hay múltiples cursores activos.
     pub fn has_multicursors(&self) -> bool {
         self.cursors.has_multiple()
+    }
+
+    // ─── Select All ────────────────────────────────────────────────────────────
+
+    /// Selecciona todo el contenido del buffer (Ctrl+A).
+    ///
+    /// Limpia los cursores secundarios y deja un único cursor primario con
+    /// `anchor` en (0,0) y `head` al final del buffer. El head queda en la
+    /// posición final para que un movimiento posterior con Shift+flecha
+    /// extienda desde ahí (comportamiento estándar de editores).
+    pub fn select_all(&mut self) {
+        self.cursors.clear_secondary();
+        let last_line = self.buffer.line_count().saturating_sub(1);
+        let last_col = self.buffer.line_len(last_line);
+        let start = Position { line: 0, col: 0 };
+        let end = Position {
+            line: last_line,
+            col: last_col,
+        };
+        let primary = self.cursors.primary_mut();
+        primary.position = end;
+        primary.selection = Some(Selection::new(start, end));
+        primary.sync_desired_col();
+    }
+
+    // ─── Clipboard helpers ──────────────────────────────────────────────────────
+
+    /// Borra la selección del cursor primario, si la hay.
+    ///
+    /// Reutiliza `delete_selection_at` internamente. No hace nada si no hay
+    /// selección activa. Usado por Cut y Paste (cuando el paste reemplaza
+    /// el rango seleccionado).
+    pub fn delete_primary_selection(&mut self) {
+        let idx = self.cursors.primary_index;
+        let has_sel = self.cursors.cursors[idx]
+            .selection
+            .is_some_and(|s| !s.is_empty());
+        if !has_sel {
+            return;
+        }
+        self.delete_selection_at(idx);
+        let edited_line = self.cursors.primary().position.line;
+        self.highlight_cache.invalidate_from(edited_line);
+        self.viewport
+            .ensure_cursor_visible(&self.cursors.primary().position);
+    }
+
+    /// Inserta una string en la posición del cursor primario.
+    ///
+    /// Reutiliza `insert_char` y `insert_newline` para que el undo/redo y
+    /// la sincronización de cursores secundarios sigan funcionando. Es
+    /// más simple que duplicar la lógica del buffer; el costo de N llamadas
+    /// es aceptable para paste (operación rara y siempre fuera del render).
+    pub fn insert_str(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.insert_newline();
+            } else if ch != '\r' {
+                // Ignorar '\r' suelto (CRLF entrante) — solo procesamos LF
+                self.insert_char(ch);
+            }
+        }
+    }
+
+    // ─── File Search (Ctrl+F) ───────────────────────────────────────────────────
+
+    /// Abre el search bar del archivo actual.
+    ///
+    /// Si hay texto seleccionado, lo usa como query inicial y ejecuta la
+    /// búsqueda inmediatamente. Si no, abre el search bar vacío.
+    pub fn open_file_search(&mut self) {
+        // CLONE: necesario — el primary tiene &self pero después llamamos &mut self.
+        // selected_text retorna String owned, no es ineficiente acá (operación rara,
+        // sólo al abrir el search bar — fuera de hot path).
+        let initial_query = self
+            .cursors
+            .primary()
+            .selection
+            .filter(|s| !s.is_empty())
+            .map(|sel| sel.selected_text(&self.buffer))
+            .unwrap_or_default();
+        let case_sensitive = false;
+        let mut s = search::BufferSearch::new(&initial_query, case_sensitive);
+        if !initial_query.is_empty() {
+            s.search(&self.buffer);
+            // Saltar al primer match si lo hay
+            if let Some(m) = s.matches.first().copied() {
+                self.move_primary_to_match(m);
+            }
+        }
+        self.search = Some(s);
+    }
+
+    /// Inserta un carácter en el query del file search y re-ejecuta la búsqueda.
+    pub fn file_search_insert(&mut self, ch: char) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        s.query.push(ch);
+        s.search(&self.buffer);
+        if let Some(m) = s.matches.first().copied() {
+            self.move_primary_to_match(m);
+        }
+    }
+
+    /// Borra el último carácter del query del file search.
+    pub fn file_search_delete(&mut self) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        s.query.pop();
+        s.search(&self.buffer);
+        if let Some(m) = s.matches.first().copied() {
+            self.move_primary_to_match(m);
+        }
+    }
+
+    /// Salta al siguiente match del file search.
+    pub fn file_search_next(&mut self) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        if s.matches.is_empty() {
+            return;
+        }
+        s.next_match();
+        if let Some(idx) = s.current_match
+            && let Some(m) = s.matches.get(idx).copied()
+        {
+            self.move_primary_to_match(m);
+        }
+    }
+
+    /// Salta al match anterior del file search.
+    pub fn file_search_prev(&mut self) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        if s.matches.is_empty() {
+            return;
+        }
+        s.prev_match();
+        if let Some(idx) = s.current_match
+            && let Some(m) = s.matches.get(idx).copied()
+        {
+            self.move_primary_to_match(m);
+        }
+    }
+
+    /// Cierra el file search y limpia el estado.
+    pub fn file_search_close(&mut self) {
+        self.search = None;
+    }
+
+    /// Toggle case-sensitive del file search y re-ejecuta.
+    pub fn file_search_toggle_case(&mut self) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        s.case_sensitive = !s.case_sensitive;
+        s.search(&self.buffer);
+        if let Some(m) = s.matches.first().copied() {
+            self.move_primary_to_match(m);
+        }
+    }
+
+    /// Mueve el cursor primario al inicio de un match y asegura visibilidad.
+    fn move_primary_to_match(&mut self, m: search::SearchMatch) {
+        self.cursors.clear_secondary();
+        let primary = self.cursors.primary_mut();
+        primary.position = Position {
+            line: m.line,
+            col: m.start_col,
+        };
+        primary.sync_desired_col();
+        primary.clear_selection();
+        let pos = self.cursors.primary().position;
+        self.viewport.ensure_cursor_visible(&pos);
     }
 }
 

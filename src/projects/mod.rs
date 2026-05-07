@@ -6,6 +6,9 @@
 //! `%APPDATA%\ide-tui\projects.json` (Windows).
 //! Sin allocaciones en hot paths — solo IO en load/save explícitos.
 
+pub mod project;
+pub mod render;
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc;
