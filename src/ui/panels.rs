@@ -569,9 +569,13 @@ pub fn render_editor_area(
     let active_line_bg = Color::Rgb(16, 20, 28);
     let text_active_style = Style::default().fg(theme.fg_primary).bg(active_line_bg);
     let selection_style = Style::default().fg(theme.fg_primary).bg(theme.selection);
+    // Cursor secundario: bloque sólido cyan con texto oscuro encima.
+    // Usamos colores explícitos (NO REVERSED) para evitar que el resultado
+    // dependa del color subyacente — en zonas con tokens cyan el REVERSED
+    // hacía invisible el cursor.
     let secondary_cursor_style = Style::default()
-        .fg(theme.fg_accent)
-        .add_modifier(Modifier::REVERSED);
+        .fg(Color::Rgb(10, 14, 20))       // #0a0e14 — texto oscuro (= bg_primary)
+        .bg(theme.fg_accent);              // #00d4ff — cyan eléctrico (= cursor color)
     // Estilos de diagnóstico (subrayado con color de severidad)
     let diag_error_style = Style::default()
         .fg(theme.fg_error)
@@ -936,6 +940,22 @@ pub fn render_editor_area(
                 }
             }
 
+            // ── Cursor secundario en línea vacía ──
+            //
+            // Si la línea no tiene texto (display_text.is_empty()) y hay un
+            // cursor secundario en esta línea del buffer, agregar un bloque
+            // visible. El branch principal de arriba (línea con texto) ya
+            // delega esto a render_line_with_selections; este bloque cubre el
+            // caso donde la línea es completamente vacía y nunca llamó a
+            // render_line_with_selections.
+            if display_text.is_empty()
+                && secondary_cursor_positions
+                    .iter()
+                    .any(|p| p.line == buf_line_idx)
+            {
+                spans.push(Span::styled(" ", secondary_cursor_style));
+            }
+
             lines.push(Line::from(spans));
         } else {
             // ── Líneas vacías después del buffer ──
@@ -1004,7 +1024,21 @@ fn render_line_with_selections<'a>(
     search_match_active_style: Style,
 ) -> Vec<Span<'a>> {
     let text_len = text.len();
+
+    // Bug #2 fix (caso línea vacía): si text está vacío pero hay un cursor
+    // secundario en esta línea, debemos pintar un espacio reversed para
+    // que el cursor sea visible. De otro modo el cursor desaparece en líneas
+    // vacías. Nota: col_offset puede ser > 0 cuando hay indent guides, pero el
+    // cursor secundario en una línea vacía siempre está en col == 0 del buffer —
+    // comparamos solo por line_idx para cubrir ambos casos.
     if text_len == 0 {
+        let has_cursor_on_empty_line = secondary_cursors
+            .iter()
+            .any(|p| p.line == line_idx);
+        if has_cursor_on_empty_line {
+            // CLONE: necesario — Span requiere ownership del char espacio
+            return vec![Span::styled(" ".to_string(), cursor_style)];
+        }
         return vec![];
     }
 
@@ -1033,12 +1067,24 @@ fn render_line_with_selections<'a>(
         }
     }
 
-    // Columnas con cursores secundarios (ajustadas a espacio local)
+    // Columnas con cursores secundarios (ajustadas a espacio local).
+    //
+    // Bug #2 fix: el filtro usa `<=` (no `<`) para incluir cursores en EOL
+    // (col == col_offset + text_len). El bucle char-by-char no produce un span
+    // para esa posición porque no hay char ahí, así que abajo agregamos un
+    // span extra con un espacio reversed al final si has_eol_cursor.
     let cursor_cols: Vec<usize> = secondary_cursors
         .iter()
-        .filter(|p| p.line == line_idx && p.col >= col_offset && p.col < col_offset + text_len)
+        .filter(|p| p.line == line_idx && p.col >= col_offset && p.col <= col_offset + text_len)
         .map(|p| p.col - col_offset)
         .collect();
+
+    // Indicador: ¿hay un cursor secundario exactamente en EOL?
+    // Si lo hay, agregaremos un span con un espacio reversed al final del
+    // resultado para que sea visible.
+    let has_eol_cursor = secondary_cursors
+        .iter()
+        .any(|p| p.line == line_idx && p.col == col_offset + text_len);
 
     // Columna de bracket match en esta línea (ajustada a espacio local)
     let local_bracket_col: Option<(usize, Style)> = bracket_at
@@ -1077,7 +1123,10 @@ fn render_line_with_selections<'a>(
 
     // ── Fast path: highlight tokens sin overlays ──
     // Renderizar directamente los tokens coloreados sin char-by-char iteration.
-    if !has_overlays {
+    // Excluimos el fast path si hay un cursor EOL secundario — necesitamos
+    // agregar el span extra de espacio reversed y eso requiere retornar un Vec
+    // mutable, no el fast path inmutable.
+    if !has_overlays && !has_eol_cursor {
         if let Some(tokens) = highlight_tokens {
             return render_highlight_tokens_fast(
                 tokens,
@@ -1172,6 +1221,17 @@ fn render_line_with_selections<'a>(
             // CLONE: necesario — segment es slice del buffer
             result.push(Span::styled(segment.to_string(), current_style));
         }
+    }
+
+    // Bug #2 fix: si hay un cursor secundario exactamente en EOL, agregar un
+    // span con un espacio reversed para que sea visible. El bucle char-by-char
+    // no produce un span para esa posición porque no hay char en EOL — el
+    // texto termina antes. Sin este span extra, el cursor en EOL queda invisible
+    // tanto en líneas más cortas que el primary como en líneas con el cursor
+    // pegado al final (col == text_len).
+    if has_eol_cursor {
+        // CLONE: necesario — Span requiere ownership del char espacio
+        result.push(Span::styled(" ".to_string(), cursor_style));
     }
 
     result

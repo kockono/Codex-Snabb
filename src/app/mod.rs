@@ -18,7 +18,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::SetCursorStyle,
-    event::{self, DisableMouseCapture, EnableMouseCapture},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
@@ -43,6 +47,7 @@ use crate::ui::palette::PaletteState;
 use crate::explorer::ExplorerState;
 use crate::workspace::QuickOpenState;
 use crate::workspace::quick_open::GoToLineState;
+use crate::workspace::quit_modal::QuitModalState;
 use crate::workspace::rename::RenameState;
 use crate::workspace::save_as::SaveAsState;
 
@@ -125,6 +130,8 @@ pub struct AppState {
     pub save_as: SaveAsState,
     /// Modal "Rename" para renombrar archivos/directorios desde el context menu.
     pub rename: RenameState,
+    /// Modal de confirmación de quit (Ctrl+Q con buffers dirty).
+    pub quit_modal: QuitModalState,
     /// Context menu flotante del explorer (aparece al hacer right-click).
     pub context_menu: ContextMenuState,
     /// Datos pre-computados para la status bar (se actualizan en cada frame).
@@ -189,6 +196,7 @@ impl AppState {
             folder_picker: crate::explorer::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
             rename: RenameState::new(),
+            quit_modal: QuitModalState::new(),
             context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file: String::from("[no file]"),
@@ -247,6 +255,7 @@ impl AppState {
             folder_picker: crate::explorer::folder_picker::FolderPickerState::new(),
             save_as: SaveAsState::new(),
             rename: RenameState::new(),
+            quit_modal: QuitModalState::new(),
             context_menu: ContextMenuState::new(),
             status_line: String::from("1:1"),
             status_file,
@@ -322,6 +331,95 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.running = false;
             vec![Effect::Quit]
         }
+
+        // ── Quit flow (Ctrl+Q + modal de confirmación) ──
+        Action::QuitRequested => {
+            // Contar buffers dirty (excluyendo tabs de diff virtual)
+            let dirty_count = state
+                .tabs
+                .editors()
+                .iter()
+                .filter(|e| e.diff_view.is_none() && e.buffer.is_dirty())
+                .count();
+            if dirty_count == 0 {
+                state.running = false;
+                vec![Effect::Quit]
+            } else {
+                state.quit_modal.show();
+                tracing::debug!(dirty = dirty_count, "quit modal abierto");
+                vec![]
+            }
+        }
+        Action::QuitConfirmDiscard => {
+            state.quit_modal.hide();
+            state.running = false;
+            tracing::info!("quit confirmado: descartando cambios");
+            vec![Effect::Quit]
+        }
+        Action::QuitCancel => {
+            state.quit_modal.hide();
+            tracing::debug!("quit cancelado por el usuario");
+            vec![]
+        }
+        Action::QuitModalCycleNext => {
+            state.quit_modal.cycle_button_next();
+            vec![]
+        }
+        Action::QuitModalCyclePrev => {
+            state.quit_modal.cycle_button_prev();
+            vec![]
+        }
+        Action::QuitConfirmSaveAll => {
+            // 1. Guardar buffers titled dirty sincrónicamente.
+            // 2. Recolectar índices de tabs untitled dirty para el sub-flujo de Save As.
+            let mut pending_untitled: Vec<usize> = Vec::new();
+            for (idx, editor) in state.tabs.editors_mut().iter_mut().enumerate() {
+                // Saltear tabs de diff virtual
+                if editor.diff_view.is_some() {
+                    continue;
+                }
+                if !editor.buffer.is_dirty() {
+                    continue;
+                }
+                if editor.buffer.file_path().is_some() {
+                    if let Err(e) = editor.buffer.save() {
+                        tracing::error!(error = %e, "error guardando buffer titled en quit");
+                        // Continuamos el flujo igual — VS Code se comporta así.
+                    }
+                } else {
+                    pending_untitled.push(idx);
+                }
+            }
+
+            if pending_untitled.is_empty() {
+                // Todo guardado o nada pendiente: salir.
+                state.quit_modal.hide();
+                state.running = false;
+                state.update_status_cache();
+                tracing::info!("quit confirmado: todos los buffers guardados");
+                return vec![Effect::Quit];
+            }
+
+            // Hay untitled: arrancar sub-flujo. Activar la primera tab untitled y
+            // abrir el modal Save As. El reducer de SaveAsConfirm/SaveAsCancel
+            // consultará `quit_modal.in_save_as_flow()` para continuar.
+            state.quit_modal.pending_untitled = pending_untitled;
+            let first_tab_idx = state
+                .quit_modal
+                .advance_untitled()
+                .expect("pending_untitled was non-empty above");
+            state.tabs.set_active(first_tab_idx);
+            let root = state.explorer.as_ref().map(|e| e.root.as_path());
+            state.save_as.open(root);
+            state.update_status_cache();
+            tracing::debug!(
+                first = first_tab_idx,
+                untitled = state.quit_modal.pending_untitled.len(),
+                "quit save-all: sub-flujo de Save As iniciado"
+            );
+            vec![]
+        }
+
         Action::FocusExplorer => {
             // Asegurar que la sidebar esté visible antes de enfocar
             state.sidebar_visible = true;
@@ -520,20 +618,30 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             state.update_status_cache();
             vec![]
         }
-        Action::ClearMultiCursor => {
-            if state.tabs.active_mut().has_multicursors() {
-                // Con multicursores activos, Esc limpia los secundarios
-                state.tabs.active_mut().clear_multicursors();
-                vec![]
-            } else if state.tabs.active_mut().cursors.primary().has_selection() {
-                // Con selección activa, Esc limpia la selección
-                state.tabs.active_mut().cursors.primary_mut().clear_selection();
-                vec![]
-            } else {
-                // Sin multicursor ni selección, Esc = Quit
-                state.running = false;
-                vec![Effect::Quit]
+        Action::EscapeHierarchy => {
+            // Jerarquía: multicursor → selección → foco al editor → no-op.
+            // Nunca cierra la app (eso es responsabilidad de QuitRequested).
+            let editor = state.tabs.active_mut();
+            if editor.has_multicursors() {
+                editor.clear_multicursors();
+            } else if editor.cursors.primary().has_selection() {
+                editor.cursors.primary_mut().clear_selection();
+            } else if state.focused_panel != PanelId::Editor {
+                state.focused_panel = PanelId::Editor;
             }
+            // else: no-op — la app NO se cierra con Esc
+            vec![]
+        }
+        Action::ClearMultiCursor => {
+            // Variante legacy preservada para dispatch desde paneles que aún
+            // la emiten. Limpia multicursor si lo hay; sin fallback de quit.
+            let editor = state.tabs.active_mut();
+            if editor.has_multicursors() {
+                editor.clear_multicursors();
+            } else if editor.cursors.primary().has_selection() {
+                editor.cursors.primary_mut().clear_selection();
+            }
+            vec![]
         }
         Action::MoveToLineStart => {
             state.tabs.active_mut().move_to_line_start();
@@ -552,6 +660,58 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         }
         Action::MoveToBufferEnd => {
             state.tabs.active_mut().move_to_buffer_end();
+            state.update_status_cache();
+            vec![]
+        }
+
+        // ── Vertical multi-cursor (Ctrl+Alt+Up/Down) ──
+        Action::AddCursorAbove => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().add_cursor_above();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::AddCursorBelow => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().add_cursor_below();
+            state.update_status_cache();
+            vec![]
+        }
+
+        // ── Boundary selection (Shift+Home/End, Ctrl+Shift+Home/End) ──
+        Action::MoveToLineStartSelecting => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().move_to_line_start_selecting();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToLineEndSelecting => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().move_to_line_end_selecting();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToBufferStartSelecting => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().move_to_buffer_start_selecting();
+            state.update_status_cache();
+            vec![]
+        }
+        Action::MoveToBufferEndSelecting => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().move_to_buffer_end_selecting();
             state.update_status_cache();
             vec![]
         }
@@ -1739,9 +1899,16 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         Action::SaveAsCancel => {
             state.save_as.close();
             tracing::debug!("save as: cancelado por usuario");
+            // Si veníamos de un sub-flujo de quit, abortar el quit completo.
+            if state.quit_modal.in_save_as_flow() {
+                state.quit_modal.hide();
+                tracing::debug!("quit save-all: cancelado durante Save As — abortando quit");
+            }
             vec![]
         }
         Action::SaveAsConfirm => {
+            // Track si estábamos en sub-flujo de quit ANTES de que confirm() cierre el modal.
+            let was_in_quit_flow = state.quit_modal.in_save_as_flow();
             if let Some(path) = state.save_as.confirm() {
                 match state.tabs.active_mut().buffer.save_as(&path) {
                     Ok(()) => {
@@ -1755,6 +1922,22 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     Err(e) => {
                         tracing::error!(error = %e, "error en save_as");
                     }
+                }
+            }
+            // Si veníamos de un sub-flujo de quit, avanzar al siguiente untitled o salir.
+            if was_in_quit_flow {
+                if let Some(next_tab_idx) = state.quit_modal.advance_untitled() {
+                    state.tabs.set_active(next_tab_idx);
+                    let root = state.explorer.as_ref().map(|e| e.root.as_path());
+                    state.save_as.open(root);
+                    state.update_status_cache();
+                    tracing::debug!(next = next_tab_idx, "quit save-all: siguiente untitled");
+                } else {
+                    // No quedan más untitled: salir de la app.
+                    state.quit_modal.hide();
+                    state.running = false;
+                    tracing::info!("quit save-all: todos los untitled guardados — saliendo");
+                    return vec![Effect::Quit];
                 }
             }
             vec![]
@@ -2133,6 +2316,144 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
         Action::Noop
         | Action::OpenFile(_) => vec![],
 
+        // ── Word movement ──
+        Action::MoveCursorWord(dir) => {
+            state.tabs.active_mut().move_cursor_word(*dir, false);
+            state.update_status_cache();
+            state.lsp.hover_content = None;
+            vec![]
+        }
+        Action::MoveCursorWordSelecting(dir) => {
+            state.tabs.active_mut().move_cursor_word(*dir, true);
+            state.update_status_cache();
+            vec![]
+        }
+
+        // ── Toggle line comment (Ctrl+/) ──
+        Action::ToggleLineComment => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().toggle_line_comment();
+            state.update_status_cache();
+            notify_lsp_change(state);
+            vec![]
+        }
+
+        // ── Move line up/down (Alt+Up/Down) ──
+        Action::MoveLine(dir) => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().move_line(*dir);
+            state.update_status_cache();
+            notify_lsp_change(state);
+            vec![]
+        }
+
+        // ── Duplicate line up/down (Shift+Alt+Up/Down) ──
+        Action::DuplicateLine(dir) => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().duplicate_line(*dir);
+            state.update_status_cache();
+            notify_lsp_change(state);
+            vec![]
+        }
+
+        // ── Editor-context Tab: indent selection or fall through to FocusNext ──
+        Action::EditorTab => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            // Si CUALQUIER cursor tiene selección no-vacía → indentar.
+            // Sino → comportarse como FocusNext (navegación).
+            let any_selection = state
+                .tabs
+                .active()
+                .cursors
+                .cursors
+                .iter()
+                .any(|c| c.selection.is_some_and(|s| !s.is_empty()));
+            if any_selection {
+                state.tabs.active_mut().indent_selection();
+                state.update_status_cache();
+                notify_lsp_change(state);
+            } else {
+                state.focused_panel = focus_next_panel(state);
+                tracing::debug!(panel = ?state.focused_panel, "EditorTab → focus_next");
+            }
+            vec![]
+        }
+
+        // ── Editor-context Shift+Tab: unindent selection or FocusPrev ──
+        Action::EditorBackTab => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            let any_selection = state
+                .tabs
+                .active()
+                .cursors
+                .cursors
+                .iter()
+                .any(|c| c.selection.is_some_and(|s| !s.is_empty()));
+            if any_selection {
+                state.tabs.active_mut().unindent_selection();
+                state.update_status_cache();
+                notify_lsp_change(state);
+            } else {
+                state.focused_panel = focus_prev_panel(state);
+                tracing::debug!(panel = ?state.focused_panel, "EditorBackTab → focus_prev");
+            }
+            vec![]
+        }
+
+        // ── Select line (Ctrl+L) ──
+        Action::SelectLine => {
+            if state.tabs.active_is_diff() {
+                return vec![];
+            }
+            state.tabs.active_mut().select_line();
+            state.update_status_cache();
+            vec![]
+        }
+
+        // ── Git push / pull ──
+        Action::GitPush => {
+            let root = get_workspace_root(state);
+            match crate::source_control_git::commands::push(&root) {
+                Ok(()) => {
+                    state.git.last_error = None;
+                    state.git.refresh(&root);
+                    tracing::info!("git push completado");
+                }
+                Err(e) => {
+                    let msg = format!("git push: {e}");
+                    tracing::warn!(error = %e, "git push falló");
+                    state.git.last_error = Some(msg);
+                }
+            }
+            vec![]
+        }
+        Action::GitPull => {
+            let root = get_workspace_root(state);
+            match crate::source_control_git::commands::pull(&root) {
+                Ok(()) => {
+                    state.git.last_error = None;
+                    state.git.refresh(&root);
+                    tracing::info!("git pull completado");
+                }
+                Err(e) => {
+                    let msg = format!("git pull: {e}");
+                    tracing::warn!(error = %e, "git pull falló");
+                    state.git.last_error = Some(msg);
+                }
+            }
+            vec![]
+        }
+
         // ── Terminal multi-pane ──
         Action::TerminalSendBytes(bytes) => {
             if let Err(e) = state.terminal.send_bytes_to_active(bytes) {
@@ -2312,6 +2633,21 @@ pub async fn run(file: Option<PathBuf>) -> Result<()> {
         SetCursorStyle::SteadyBar, // cursor estilo VS Code (línea vertical)
     )
     .context("no se pudo entrar a alternate screen con mouse capture")?;
+
+    // Keyboard enhancement protocol (Kitty protocol): permite recibir
+    // Alt+Up/Down, Alt+flechas, y otras combinaciones que las secuencias
+    // ANSI clásicas no pueden expresar. Solo se activa si el terminal
+    // soporta la feature — se ignora silenciosamente si no.
+    let keyboard_enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+        );
+    }
 
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)
@@ -2523,6 +2859,8 @@ async fn event_loop(
                         .explorer
                         .as_ref()
                         .is_some_and(|e| e.new_folder_input.is_some()),
+                    state.quit_modal.visible,
+                    state.quit_modal.focused_button,
                 )
             }
             Some(Event::Tick) => Action::Noop,
@@ -2819,6 +3157,9 @@ fn poll_event(timeout: Duration) -> Result<Option<Event>> {
 fn cleanup_terminal() -> Result<()> {
     terminal::disable_raw_mode()
         .context("no se pudo desactivar raw mode")?;
+    // Pop keyboard enhancement si fue activado. Es seguro llamarlo siempre:
+    // si el terminal no lo soportaba simplemente no hace nada.
+    let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     crossterm::execute!(
         std::io::stdout(),
         SetCursorStyle::DefaultUserShape, // restaurar cursor del usuario
@@ -2829,4 +3170,228 @@ fn cleanup_terminal() -> Result<()> {
     Ok(())
 }
 
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::cursor::Position;
+    use crate::editor::selection::Selection;
+
+    /// Helper: crea un AppState mínimo para tests del reducer.
+    fn make_state() -> AppState {
+        AppState::new(AppConfig::default()).expect("failed to build AppState for test")
+    }
+
+    // ── EscapeHierarchy ──
+
+    #[test]
+    fn escape_hierarchy_clears_multicursors_when_present() {
+        let mut s = make_state();
+        // Plantar un buffer con varias líneas para poder agregar cursor abajo.
+        let editor = s.tabs.active_mut();
+        editor.insert_str("a\nb\nc\n");
+        // Reposicionar cursor primario al inicio para que add_cursor_below
+        // funcione (necesita una línea debajo).
+        let primary = editor.cursors.primary_mut();
+        primary.position = Position { line: 0, col: 0 };
+        primary.sync_desired_col();
+        // Agregar un cursor secundario
+        editor.add_cursor_below();
+        assert!(s.tabs.active().has_multicursors(), "setup precondition");
+
+        let effects = reduce(&mut s, &Action::EscapeHierarchy);
+        assert!(effects.is_empty(), "no effects expected");
+        assert!(!s.tabs.active().has_multicursors(), "secondaries cleared");
+        assert!(s.running, "must NOT quit on Esc");
+    }
+
+    #[test]
+    fn escape_hierarchy_clears_selection_when_no_multicursor() {
+        let mut s = make_state();
+        let editor = s.tabs.active_mut();
+        editor.insert_str("hello world");
+        // Crear una selección manual sobre el cursor primario
+        let primary = editor.cursors.primary_mut();
+        primary.selection = Some(Selection {
+            anchor: Position { line: 0, col: 0 },
+            head: Position { line: 0, col: 5 },
+        });
+        assert!(
+            s.tabs.active().cursors.primary().has_selection(),
+            "setup precondition"
+        );
+
+        let effects = reduce(&mut s, &Action::EscapeHierarchy);
+        assert!(effects.is_empty());
+        assert!(
+            !s.tabs.active().cursors.primary().has_selection(),
+            "selection cleared"
+        );
+        assert!(s.running, "must NOT quit on Esc");
+    }
+
+    #[test]
+    fn escape_hierarchy_focuses_editor_when_focus_elsewhere() {
+        let mut s = make_state();
+        s.focused_panel = PanelId::Terminal;
+        // Sin multicursores ni selección
+        let effects = reduce(&mut s, &Action::EscapeHierarchy);
+        assert!(effects.is_empty());
+        assert_eq!(s.focused_panel, PanelId::Editor);
+        assert!(s.running);
+    }
+
+    #[test]
+    fn escape_hierarchy_is_noop_when_editor_focused_with_no_state() {
+        let mut s = make_state();
+        // Editor enfocado, sin multicursor, sin selección
+        assert_eq!(s.focused_panel, PanelId::Editor);
+        let was_running = s.running;
+        let effects = reduce(&mut s, &Action::EscapeHierarchy);
+        assert!(effects.is_empty(), "no-op produces no effects");
+        assert_eq!(s.running, was_running, "must NOT quit on Esc no-op");
+        assert!(s.running, "running should remain true");
+    }
+
+    // ── QuitRequested ──
+
+    #[test]
+    fn quit_requested_with_zero_dirty_quits_immediately() {
+        let mut s = make_state();
+        // Buffer recién creado: no dirty
+        assert!(!s.tabs.active().buffer.is_dirty());
+        let effects = reduce(&mut s, &Action::QuitRequested);
+        assert!(!s.running, "running cleared");
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(!s.quit_modal.visible, "modal NOT shown when nothing dirty");
+    }
+
+    #[test]
+    fn quit_requested_with_dirty_buffer_shows_modal() {
+        let mut s = make_state();
+        // Marcar buffer activo como dirty (insertar algo)
+        s.tabs.active_mut().insert_str("dirty content");
+        assert!(s.tabs.active().buffer.is_dirty(), "setup precondition");
+
+        let effects = reduce(&mut s, &Action::QuitRequested);
+        assert!(s.running, "must NOT quit while modal asks");
+        assert!(effects.is_empty(), "no Effect::Quit yet");
+        assert!(s.quit_modal.visible, "modal shown");
+        assert_eq!(s.quit_modal.focused_button, 0);
+    }
+
+    // ── QuitConfirmDiscard / QuitCancel / QuitModalCycleNext / QuitModalCyclePrev ──
+
+    #[test]
+    fn quit_confirm_discard_quits_and_hides_modal() {
+        let mut s = make_state();
+        s.quit_modal.show();
+        let effects = reduce(&mut s, &Action::QuitConfirmDiscard);
+        assert!(!s.running);
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(!s.quit_modal.visible);
+    }
+
+    #[test]
+    fn quit_cancel_hides_modal_keeps_running() {
+        let mut s = make_state();
+        s.quit_modal.show();
+        let effects = reduce(&mut s, &Action::QuitCancel);
+        assert!(s.running);
+        assert!(effects.is_empty());
+        assert!(!s.quit_modal.visible);
+    }
+
+    #[test]
+    fn quit_modal_cycle_next_advances_focus() {
+        let mut s = make_state();
+        s.quit_modal.show();
+        assert_eq!(s.quit_modal.focused_button, 0);
+        reduce(&mut s, &Action::QuitModalCycleNext);
+        assert_eq!(s.quit_modal.focused_button, 1);
+        reduce(&mut s, &Action::QuitModalCycleNext);
+        assert_eq!(s.quit_modal.focused_button, 2);
+        reduce(&mut s, &Action::QuitModalCycleNext);
+        assert_eq!(s.quit_modal.focused_button, 0, "wraps");
+    }
+
+    #[test]
+    fn quit_modal_cycle_prev_reverses_focus() {
+        let mut s = make_state();
+        s.quit_modal.show();
+        reduce(&mut s, &Action::QuitModalCyclePrev);
+        assert_eq!(s.quit_modal.focused_button, 2, "wraps to last");
+        reduce(&mut s, &Action::QuitModalCyclePrev);
+        assert_eq!(s.quit_modal.focused_button, 1);
+    }
+
+    // ── QuitConfirmSaveAll ──
+
+    #[test]
+    fn quit_confirm_save_all_with_only_untitled_opens_save_as() {
+        let mut s = make_state();
+        // Buffer activo es untitled (sin path) y dirty.
+        s.tabs.active_mut().insert_str("untitled content");
+        assert!(s.tabs.active().buffer.is_dirty());
+        assert!(s.tabs.active().buffer.file_path().is_none());
+
+        s.quit_modal.show();
+        let effects = reduce(&mut s, &Action::QuitConfirmSaveAll);
+        // No debería salir todavía — espera al Save As.
+        assert!(s.running, "still running, waiting for Save As");
+        assert!(effects.is_empty());
+        // El modal de quit sigue activo conceptualmente (sub-flow), Save As también.
+        assert!(s.quit_modal.visible);
+        assert!(s.save_as.visible, "Save As modal opened for first untitled");
+        assert!(s.quit_modal.in_save_as_flow(), "in save-as flow");
+        assert_eq!(s.quit_modal.pending_untitled.len(), 1);
+        assert_eq!(s.quit_modal.current_untitled, Some(0));
+    }
+
+    #[test]
+    fn quit_confirm_save_all_with_no_untitled_quits_after_save() {
+        // No podemos crear archivos en el FS dentro de un test; en su lugar,
+        // verificamos el caso "0 dirty" que comparte la rama de salida inmediata.
+        let mut s = make_state();
+        s.quit_modal.show();
+        // Sin buffers dirty → directamente quit + hide modal.
+        let effects = reduce(&mut s, &Action::QuitConfirmSaveAll);
+        assert!(!s.running);
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(!s.quit_modal.visible);
+    }
+
+    // ── SaveAs hooks (cancel y confirm en sub-flujo) ──
+
+    #[test]
+    fn save_as_cancel_in_quit_flow_hides_quit_modal() {
+        let mut s = make_state();
+        // Setear estado que simule sub-flujo activo
+        s.quit_modal.show();
+        s.quit_modal.pending_untitled = vec![0];
+        s.quit_modal.current_untitled = Some(0);
+        s.save_as.open(None);
+        assert!(s.quit_modal.in_save_as_flow());
+
+        let effects = reduce(&mut s, &Action::SaveAsCancel);
+        assert!(effects.is_empty());
+        assert!(!s.save_as.visible, "save_as cerrado");
+        assert!(!s.quit_modal.visible, "quit modal cerrado por cancel");
+        assert!(s.running, "app sigue corriendo");
+    }
+
+    #[test]
+    fn save_as_cancel_outside_quit_flow_keeps_running_silently() {
+        let mut s = make_state();
+        s.save_as.open(None);
+        // quit_modal NO está activo
+        assert!(!s.quit_modal.in_save_as_flow());
+        let effects = reduce(&mut s, &Action::SaveAsCancel);
+        assert!(effects.is_empty());
+        assert!(!s.save_as.visible);
+        assert!(s.running);
+        assert!(!s.quit_modal.visible);
+    }
+}
 

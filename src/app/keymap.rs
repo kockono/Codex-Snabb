@@ -51,6 +51,8 @@ pub(super) fn keymap(
     editor_file_search_active: bool,
     explorer_new_file_active: bool,
     explorer_new_folder_active: bool,
+    quit_modal_visible: bool,
+    quit_modal_focused_button: usize,
 ) -> Action {
     // ── Eventos de mouse ── se procesan ANTES del match de teclado
     if let CrosstermEvent::Mouse(mouse) = event {
@@ -88,6 +90,31 @@ pub(super) fn keymap(
     };
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
+    }
+
+    // ── Quit modal visible: captura TODO el input del modal de quit ──
+    // Va ANTES de save_as_visible: cuando el modal de quit está abierto,
+    // el sub-flujo de Save As aún no comenzó. Cuando el sub-flujo arranca,
+    // el modal de quit ya no consume las teclas (Save As toma el control).
+    if quit_modal_visible {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => Action::QuitCancel,
+            (KeyCode::Tab, KeyModifiers::NONE) => Action::QuitModalCycleNext,
+            (KeyCode::BackTab, _) => Action::QuitModalCyclePrev,
+            (KeyCode::Enter, _) => match quit_modal_focused_button {
+                0 => Action::QuitConfirmSaveAll,
+                1 => Action::QuitConfirmDiscard,
+                _ => Action::QuitCancel,
+            },
+            // Atajos directos por letra (estilo VS Code: S = Save, D = Don't Save)
+            (KeyCode::Char('s' | 'S'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::QuitConfirmSaveAll
+            }
+            (KeyCode::Char('d' | 'D'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                Action::QuitConfirmDiscard
+            }
+            _ => Action::Noop,
+        };
     }
 
     // ── Context menu visible: prioridad máxima (antes de todos los overlays) ──
@@ -359,6 +386,11 @@ pub(super) fn keymap(
             (KeyCode::Char('d'), KeyModifiers::NONE) => Action::GitToggleDiff,
             (KeyCode::Char('c'), KeyModifiers::NONE) => Action::GitStartCommit,
             (KeyCode::Char('r'), KeyModifiers::NONE) => Action::GitRefresh,
+            // Sync: 'p' = push, 'P' (Shift+p) = pull, 'f' = fetch.
+            // crossterm reporta Shift+p como Char('P') con flag SHIFT.
+            (KeyCode::Char('p'), KeyModifiers::NONE) => Action::GitPush,
+            (KeyCode::Char('P'), mods) if mods.contains(KeyModifiers::SHIFT) => Action::GitPull,
+            (KeyCode::Char('f'), KeyModifiers::NONE) => Action::GitFetch,
             _ => Action::Noop,
         };
     }
@@ -371,8 +403,11 @@ pub(super) fn keymap(
 
     // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
     match (key.code, key.modifiers) {
-        // Esc: si hay multicursor activo, limpiar; sino, quit
-        (KeyCode::Esc, _) => return Action::ClearMultiCursor,
+        // Esc: jerarquía multicursor → selección → foco al editor → no-op.
+        // NUNCA cierra la app — para eso está Ctrl+Q.
+        (KeyCode::Esc, _) => return Action::EscapeHierarchy,
+        // Ctrl+Q: solicitar quit (con confirmación si hay buffers dirty).
+        (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Action::QuitRequested,
         // Ctrl+Tab → siguiente pestaña
         (KeyCode::Tab, KeyModifiers::CONTROL) => return Action::NextTab,
         // Ctrl+Shift+Tab → pestaña anterior
@@ -383,8 +418,24 @@ pub(super) fn keymap(
         }
         // Ctrl+W → cerrar pestaña activa
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => return Action::CloseTab,
-        (KeyCode::Tab, KeyModifiers::NONE) => return Action::FocusNext,
-        (KeyCode::BackTab, KeyModifiers::SHIFT) => return Action::FocusPrev,
+        // Tab/Shift+Tab: navegación global EXCEPTO cuando el foco está en el
+        // editor (no diff). En ese caso, dejar que el bloque del editor procese
+        // estas teclas para indentación contextual (EditorTab/EditorBackTab).
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            // Si NO estamos en editor-no-diff, comportarse como navegación global.
+            // De Morgan: !(A && !B) == !A || B. Más simple: cuando NO es editor
+            // O CUANDO es editor pero es diff, navegar.
+            if focused_panel != PanelId::Editor || editor_active_is_diff {
+                return Action::FocusNext;
+            }
+            // fall-through al bloque del editor (indentación contextual).
+        }
+        (KeyCode::BackTab, mods) if mods == KeyModifiers::SHIFT => {
+            if focused_panel != PanelId::Editor || editor_active_is_diff {
+                return Action::FocusPrev;
+            }
+            // fall-through al bloque del editor (un-indentación contextual).
+        }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => return Action::ToggleSidebar,
         // Ctrl+Shift+E → foco directo al Explorer (estilo VS Code)
         (KeyCode::Char('E'), mods)
@@ -540,6 +591,94 @@ pub(super) fn keymap(
             // Ctrl+K → hover (info de tipo)
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => Action::LspHover,
 
+            // Movimiento por palabra (Ctrl+←/→ y Ctrl+Shift+←/→)
+            // Importante: estos guards van ANTES de los movimientos plain/Shift
+            // para que las combinaciones con Ctrl no caigan en los matches de
+            // Shift puro (Ctrl+Shift+Left tiene CONTROL+SHIFT, no solo SHIFT).
+            (KeyCode::Left, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::MoveCursorWordSelecting(Direction::Left)
+            }
+            (KeyCode::Right, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::MoveCursorWordSelecting(Direction::Right)
+            }
+            (KeyCode::Left, mods) if mods.contains(KeyModifiers::CONTROL) => {
+                Action::MoveCursorWord(Direction::Left)
+            }
+            (KeyCode::Right, mods) if mods.contains(KeyModifiers::CONTROL) => {
+                Action::MoveCursorWord(Direction::Right)
+            }
+
+            // Multicursor vertical con Ctrl+Alt+Up/Down (DEBE ir ANTES de Alt+Up/Down
+            // — Ctrl+Alt es más específico que Alt solo).
+            (KeyCode::Up, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::ALT) =>
+            {
+                Action::AddCursorAbove
+            }
+            (KeyCode::Down, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::ALT) =>
+            {
+                Action::AddCursorBelow
+            }
+
+            // Duplicar línea con Shift+Alt+Up/Down. DEBE ir ANTES de Alt+Up/Down
+            // — si no, el match de Alt sin Shift se llevaría estas combinaciones.
+            (KeyCode::Up, mods)
+                if mods.contains(KeyModifiers::ALT) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::DuplicateLine(Direction::Up)
+            }
+            (KeyCode::Down, mods)
+                if mods.contains(KeyModifiers::ALT) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::DuplicateLine(Direction::Down)
+            }
+
+            // Mover línea con Alt+Up/Down (debe ir ANTES de los movimientos plain
+            // para que los modifiers Alt no caigan en NONE).
+            (KeyCode::Up, mods) if mods.contains(KeyModifiers::ALT) => {
+                Action::MoveLine(Direction::Up)
+            }
+            (KeyCode::Down, mods) if mods.contains(KeyModifiers::ALT) => {
+                Action::MoveLine(Direction::Down)
+            }
+
+            // Toggle line comment (Ctrl+/). Ctrl+/ se reporta como Char('/') con CONTROL.
+            (KeyCode::Char('/'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleLineComment
+            }
+
+            // Boundary selection — Ctrl+Shift+Home/End (file boundaries) ANTES de
+            // Shift+Home/End (line boundaries) y Ctrl+Home/End — más específico primero.
+            (KeyCode::Home, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::MoveToBufferStartSelecting
+            }
+            (KeyCode::End, mods)
+                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::MoveToBufferEndSelecting
+            }
+            (KeyCode::Home, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveToLineStartSelecting
+            }
+            (KeyCode::End, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                Action::MoveToLineEndSelecting
+            }
+            // Ctrl+Home/End → buffer start/end (no selecting). Va DESPUÉS de las
+            // variantes Ctrl+Shift+Home/End para que las más específicas matcheen primero.
+            (KeyCode::Home, mods) if mods.contains(KeyModifiers::CONTROL) => {
+                Action::MoveToBufferStart
+            }
+            (KeyCode::End, mods) if mods.contains(KeyModifiers::CONTROL) => {
+                Action::MoveToBufferEnd
+            }
+
             // Movimiento de cursor
             (KeyCode::Up, KeyModifiers::NONE) => Action::MoveCursor(Direction::Up),
             (KeyCode::Down, KeyModifiers::NONE) => Action::MoveCursor(Direction::Down),
@@ -564,6 +703,16 @@ pub(super) fn keymap(
 
             // Ctrl+D → seleccionar siguiente ocurrencia
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => Action::SelectNextOccurrence,
+
+            // Ctrl+L → seleccionar línea completa
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => Action::SelectLine,
+
+            // Tab/Shift+Tab dentro del editor → indentación contextual o
+            // navegación de foco (decide el reducer según haya selección o no).
+            // Estas arms sólo se alcanzan porque el bloque global hizo
+            // fall-through cuando el editor está enfocado.
+            (KeyCode::Tab, KeyModifiers::NONE) => Action::EditorTab,
+            (KeyCode::BackTab, mods) if mods == KeyModifiers::SHIFT => Action::EditorBackTab,
 
             // Edición
             (KeyCode::Backspace, KeyModifiers::NONE) => Action::DeleteChar,
@@ -709,6 +858,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::SaveFile);
     }
@@ -740,6 +891,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::OpenQuickOpen);
     }
@@ -774,6 +927,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::OpenGlobalSearch);
     }
@@ -805,6 +960,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::SearchClose);
     }
@@ -836,6 +993,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::ExplorerDown);
     }
@@ -867,6 +1026,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::PaletteConfirm);
     }
@@ -898,6 +1059,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::OpenGoToLine);
     }
@@ -931,6 +1094,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::QuickOpenInsertChar(':'));
     }
@@ -962,6 +1127,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::GoToLineInsertChar('5'));
     }
@@ -993,6 +1160,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::GoToLineConfirm);
     }
@@ -1024,6 +1193,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::GoToLineClose);
     }
@@ -1055,6 +1226,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::SaveAsCancel);
     }
@@ -1086,6 +1259,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::SaveAsConfirm);
     }
@@ -1117,6 +1292,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::SaveAsChar('a'));
     }
@@ -1148,6 +1325,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::RenameCancel);
     }
@@ -1179,8 +1358,471 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::RenameConfirm);
+    }
+
+    /// Helper común: arma una invocación del keymap con todos los flags en false.
+    fn keymap_default(
+        event: &CrosstermEvent,
+        focused: PanelId,
+        git: &GitState,
+        commands: &CommandRegistry,
+    ) -> Action {
+        keymap(
+            event, focused, false, false, false, false, false, git, false, false, false,
+            commands, false, false, 0, false, false, false, false, false, false, false, false, 0,
+        )
+    }
+
+    // ── Word movement (Ctrl+Left/Right) ──
+
+    #[test]
+    fn ctrl_left_in_editor_returns_move_cursor_word_left() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Left, KeyModifiers::CONTROL);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveCursorWord(Direction::Left));
+    }
+
+    #[test]
+    fn ctrl_right_in_editor_returns_move_cursor_word_right() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Right, KeyModifiers::CONTROL);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveCursorWord(Direction::Right));
+    }
+
+    #[test]
+    fn ctrl_shift_left_in_editor_returns_word_selecting_left() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveCursorWordSelecting(Direction::Left));
+    }
+
+    #[test]
+    fn ctrl_shift_right_in_editor_returns_word_selecting_right() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveCursorWordSelecting(Direction::Right));
+    }
+
+    // ── Toggle comment ──
+
+    #[test]
+    fn ctrl_slash_in_editor_returns_toggle_line_comment() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('/'), KeyModifiers::CONTROL);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::ToggleLineComment);
+    }
+
+    // ── Move line (Alt+Up/Down) ──
+
+    #[test]
+    fn alt_up_in_editor_returns_move_line_up() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Up, KeyModifiers::ALT);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveLine(Direction::Up));
+    }
+
+    #[test]
+    fn alt_down_in_editor_returns_move_line_down() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Down, KeyModifiers::ALT);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveLine(Direction::Down));
+    }
+
+    // ── Vertical multi-cursor (Ctrl+Alt+Up/Down) ──
+
+    #[test]
+    fn ctrl_alt_up_in_editor_returns_add_cursor_above() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::Up,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::AddCursorAbove);
+    }
+
+    #[test]
+    fn ctrl_alt_down_in_editor_returns_add_cursor_below() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::Down,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::AddCursorBelow);
+    }
+
+    // ── Boundary selection (Shift+Home/End, Ctrl+Shift+Home/End) ──
+
+    #[test]
+    fn shift_home_in_editor_returns_move_to_line_start_selecting() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Home, KeyModifiers::SHIFT);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveToLineStartSelecting);
+    }
+
+    #[test]
+    fn shift_end_in_editor_returns_move_to_line_end_selecting() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::End, KeyModifiers::SHIFT);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveToLineEndSelecting);
+    }
+
+    #[test]
+    fn ctrl_shift_home_in_editor_returns_move_to_buffer_start_selecting() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::Home,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveToBufferStartSelecting);
+    }
+
+    #[test]
+    fn ctrl_shift_end_in_editor_returns_move_to_buffer_end_selecting() {
+        let commands = test_commands();
+        let event = key_event(
+            KeyCode::End,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::MoveToBufferEndSelecting);
+    }
+
+    // ── Git sync (p / P / f) ──
+
+    fn git_panel_state() -> GitState {
+        let mut g = GitState::new();
+        g.visible = true;
+        g
+    }
+
+    #[test]
+    fn p_in_git_panel_returns_git_push() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('p'), KeyModifiers::NONE);
+        let action = keymap_default(&event, PanelId::Git, &git_panel_state(), &commands);
+        assert_eq!(action, Action::GitPush);
+    }
+
+    #[test]
+    fn shift_p_in_git_panel_returns_git_pull() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('P'), KeyModifiers::SHIFT);
+        let action = keymap_default(&event, PanelId::Git, &git_panel_state(), &commands);
+        assert_eq!(action, Action::GitPull);
+    }
+
+    #[test]
+    fn f_in_git_panel_returns_git_fetch() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('f'), KeyModifiers::NONE);
+        let action = keymap_default(&event, PanelId::Git, &git_panel_state(), &commands);
+        assert_eq!(action, Action::GitFetch);
+    }
+
+    // ── Quit flow (Ctrl+Q + quit modal block) ──
+
+    #[test]
+    fn ctrl_q_in_editor_returns_quit_requested() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::QuitRequested);
+    }
+
+    #[test]
+    fn esc_in_quit_modal_returns_quit_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false, // save_as_visible
+            false, // context_menu_visible
+            false, // rename_visible
+            false, // editor_active_is_diff
+            false, // editor_file_search_active
+            false, // explorer_new_file_active
+            false, // explorer_new_folder_active
+            true,  // quit_modal_visible
+            0,     // quit_modal_focused_button
+        );
+        assert_eq!(action, Action::QuitCancel);
+    }
+
+    #[test]
+    fn tab_in_quit_modal_returns_cycle_next() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Tab, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            0,
+        );
+        assert_eq!(action, Action::QuitModalCycleNext);
+    }
+
+    #[test]
+    fn back_tab_in_quit_modal_returns_cycle_prev() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            1,
+        );
+        assert_eq!(action, Action::QuitModalCyclePrev);
+    }
+
+    #[test]
+    fn enter_in_quit_modal_button_zero_returns_save_all() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            0,    // botón Save All
+        );
+        assert_eq!(action, Action::QuitConfirmSaveAll);
+    }
+
+    #[test]
+    fn enter_in_quit_modal_button_one_returns_discard() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            1,    // botón Don't Save
+        );
+        assert_eq!(action, Action::QuitConfirmDiscard);
+    }
+
+    #[test]
+    fn enter_in_quit_modal_button_two_returns_cancel() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            2,    // botón Cancel
+        );
+        assert_eq!(action, Action::QuitCancel);
+    }
+
+    #[test]
+    fn s_letter_in_quit_modal_returns_save_all_shortcut() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('s'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            2,    // foco en Cancel pero S debe disparar Save All igual
+        );
+        assert_eq!(action, Action::QuitConfirmSaveAll);
+    }
+
+    #[test]
+    fn d_letter_in_quit_modal_returns_discard_shortcut() {
+        let commands = test_commands();
+        let event = key_event(KeyCode::Char('d'), KeyModifiers::NONE);
+        let action = keymap(
+            &event,
+            PanelId::Editor,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &GitState::new(),
+            false,
+            false,
+            false,
+            &commands,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // quit_modal_visible
+            0,
+        );
+        assert_eq!(action, Action::QuitConfirmDiscard);
+    }
+
+    #[test]
+    fn esc_global_returns_escape_hierarchy_not_quit() {
+        // Regression: antes Esc retornaba ClearMultiCursor con fallback a Quit.
+        // Ahora SIEMPRE retorna EscapeHierarchy — el quit es vía Ctrl+Q.
+        let commands = test_commands();
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let action = keymap_default(&event, PanelId::Editor, &GitState::new(), &commands);
+        assert_eq!(action, Action::EscapeHierarchy);
     }
 
     #[test]
@@ -1210,6 +1852,8 @@ mod tests {
             false, // editor_file_search_active
             false, // explorer_new_file_active
             false, // explorer_new_folder_active
+            false, // quit_modal_visible
+            0,     // quit_modal_focused_button
         );
         assert_eq!(action, Action::RenameChar('x'));
     }

@@ -84,7 +84,7 @@ pub fn render_git_panel(
     }
 
     // Layout VS Code style:
-    // branch(1) + input(1) + button(1) + files(fill)
+    // branch(1) + input(1) + button(1) + files(fill) [+ error_footer(1)]
     // Mínimo requerido: 4 líneas para que todo sea visible.
     let min_height: u16 = 4;
     if inner.height < min_height {
@@ -92,20 +92,61 @@ pub fn render_git_panel(
         return;
     }
 
+    // Reservar 1 línea de footer para `last_error` cuando esté presente y
+    // haya altura suficiente. La línea va al final, debajo de la lista.
+    let has_error = state.last_error.is_some();
+    let show_error_footer = has_error && inner.height >= 5;
+
+    let constraints: &[Constraint] = if show_error_footer {
+        &[
+            Constraint::Length(1), // branch
+            Constraint::Length(1), // commit input
+            Constraint::Length(1), // botón
+            Constraint::Fill(1),   // archivos
+            Constraint::Length(1), // error footer
+        ]
+    } else {
+        &[
+            Constraint::Length(1), // branch
+            Constraint::Length(1), // commit input
+            Constraint::Length(1), // botón
+            Constraint::Fill(1),   // archivos
+        ]
+    };
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // branch
-            Constraint::Length(1), // commit input (siempre visible)
-            Constraint::Length(1), // botón [ ✓ Commit ]
-            Constraint::Fill(1),   // archivos
-        ])
+        .constraints(constraints)
         .split(inner);
 
     render_branch_line(f, layout[0], state, theme);
     render_commit_input_row(f, layout[1], state, theme, cursor_visible);
     render_commit_button_row(f, layout[2], theme);
     render_file_list(f, layout[3], state, theme);
+
+    if show_error_footer
+        && let Some(ref err) = state.last_error
+    {
+        render_error_footer(f, layout[4], err, theme);
+    }
+}
+
+/// Renderiza la línea de error en el footer del panel.
+///
+/// Se trunca al ancho disponible para evitar overflow visual. El truncate
+/// usa `crate::ui::truncate_str` que ya existe y respeta multi-byte.
+fn render_error_footer(f: &mut Frame, area: Rect, err: &str, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let display = crate::ui::truncate_str(err, area.width as usize);
+    // CLONE: necesario — Span<'static> requiere ownership en este punto del render.
+    let line = Line::from(Span::styled(
+        display.to_string(),
+        Style::default().fg(theme.fg_error).bg(theme.bg_active),
+    ));
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg_active));
+    f.render_widget(p, area);
 }
 
 /// Renderiza la línea del branch actual.

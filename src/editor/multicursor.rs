@@ -142,6 +142,126 @@ impl CursorInstance {
             self.clear_selection();
         }
     }
+
+    /// Mueve el cursor al inicio de la palabra anterior (Ctrl+Left).
+    ///
+    /// Reglas (estilo VS Code/IntelliJ):
+    /// - Si `col > 0`, retrocede saltando whitespace y luego retrocede mientras
+    ///   los bytes sean word-chars (alfanum + `_`). Para clusters de
+    ///   non-word-non-space (ej `;}`), retrocede hasta cambiar de clase.
+    /// - Si ya está en `col == 0`, salta al final de la línea anterior.
+    pub fn move_word_left(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
+
+        // Caso degenerado: inicio de línea → ir al final de la anterior
+        if self.position.col == 0 {
+            if self.position.line > 0 {
+                self.position.line -= 1;
+                self.position.col = buffer.line_len(self.position.line);
+            }
+            self.desired_col = self.position.col;
+            if selecting {
+                self.extend_selection();
+            }
+            return;
+        }
+
+        let line = match buffer.line(self.position.line) {
+            Some(l) => l,
+            None => {
+                // Defensivo: línea inexistente — no mover.
+                if selecting {
+                    self.extend_selection();
+                }
+                return;
+            }
+        };
+        let bytes = line.as_bytes();
+        let mut col = self.position.col.min(bytes.len());
+
+        // 1) Saltar whitespace que esté a la izquierda
+        while col > 0 && bytes[col - 1].is_ascii_whitespace() {
+            col -= 1;
+        }
+
+        // 2) Saltar el cluster de la misma clase (word vs non-word).
+        //    La "clase" se determina por el byte inmediatamente a la izquierda.
+        if col > 0 {
+            let in_word = super::is_word_char(bytes[col - 1]);
+            while col > 0
+                && !bytes[col - 1].is_ascii_whitespace()
+                && super::is_word_char(bytes[col - 1]) == in_word
+            {
+                col -= 1;
+            }
+        }
+
+        self.position.col = col;
+        self.desired_col = col;
+        if selecting {
+            self.extend_selection();
+        }
+    }
+
+    /// Mueve el cursor al final de la palabra siguiente (Ctrl+Right).
+    ///
+    /// Reglas:
+    /// - Avanza saltando el cluster actual (mismo "clase": word vs non-word, sin
+    ///   contar whitespace).
+    /// - Salta whitespace que siga.
+    /// - Si está al final de la línea, salta al inicio de la siguiente.
+    pub fn move_word_right(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
+
+        let line = match buffer.line(self.position.line) {
+            Some(l) => l,
+            None => {
+                if selecting {
+                    self.extend_selection();
+                }
+                return;
+            }
+        };
+        let bytes = line.as_bytes();
+        let line_len = bytes.len();
+
+        // Caso degenerado: final de línea → ir al inicio de la siguiente
+        if self.position.col >= line_len {
+            if self.position.line + 1 < buffer.line_count() {
+                self.position.line += 1;
+                self.position.col = 0;
+            }
+            self.desired_col = self.position.col;
+            if selecting {
+                self.extend_selection();
+            }
+            return;
+        }
+
+        let mut col = self.position.col;
+
+        // 1) Saltar el cluster de la misma clase (si no estamos en whitespace)
+        if col < line_len && !bytes[col].is_ascii_whitespace() {
+            let in_word = super::is_word_char(bytes[col]);
+            while col < line_len
+                && !bytes[col].is_ascii_whitespace()
+                && super::is_word_char(bytes[col]) == in_word
+            {
+                col += 1;
+            }
+        }
+
+        // 2) Saltar whitespace que siga
+        while col < line_len && bytes[col].is_ascii_whitespace() {
+            col += 1;
+        }
+
+        self.position.col = col;
+        self.desired_col = col;
+        if selecting {
+            self.extend_selection();
+        }
+    }
 }
 
 /// Estado de múltiples cursores.
@@ -242,5 +362,107 @@ impl MultiCursorState {
 impl Default for MultiCursorState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor_at(line: usize, col: usize) -> CursorInstance {
+        CursorInstance::new(Position { line, col })
+    }
+
+    // ── move_word_right ──
+
+    #[test]
+    fn move_word_right_jumps_to_end_of_word() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false);
+        // "hello" → 5, then skip space → 6
+        assert_eq!(c.position, Position { line: 0, col: 6 });
+    }
+
+    #[test]
+    fn move_word_right_at_end_jumps_to_next_line() {
+        let buf = TextBuffer::from_text("foo\nbar");
+        let mut c = cursor_at(0, 3);
+        c.move_word_right(&buf, false);
+        assert_eq!(c.position, Position { line: 1, col: 0 });
+    }
+
+    #[test]
+    fn move_word_right_in_whitespace_skips_to_next_word() {
+        let buf = TextBuffer::from_text("    foo");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false);
+        // Whitespace skip puts cursor at 4 (start of foo)
+        assert_eq!(c.position, Position { line: 0, col: 4 });
+    }
+
+    #[test]
+    fn move_word_right_through_punctuation() {
+        let buf = TextBuffer::from_text("a;b");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false); // word "a" → 1
+        assert_eq!(c.position.col, 1);
+        c.move_word_right(&buf, false); // ";" punct cluster → 2
+        assert_eq!(c.position.col, 2);
+    }
+
+    // ── move_word_left ──
+
+    #[test]
+    fn move_word_left_jumps_to_start_of_word() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 11);
+        c.move_word_left(&buf, false);
+        // From end of "world", goes to start of "world" → 6
+        assert_eq!(c.position, Position { line: 0, col: 6 });
+    }
+
+    #[test]
+    fn move_word_left_at_start_jumps_to_prev_line_end() {
+        let buf = TextBuffer::from_text("foo\nbar");
+        let mut c = cursor_at(1, 0);
+        c.move_word_left(&buf, false);
+        assert_eq!(c.position, Position { line: 0, col: 3 });
+    }
+
+    #[test]
+    fn move_word_left_skips_trailing_whitespace() {
+        let buf = TextBuffer::from_text("foo    ");
+        let mut c = cursor_at(0, 7);
+        c.move_word_left(&buf, false);
+        // skip 4 spaces, then move over "foo" to col 0
+        assert_eq!(c.position, Position { line: 0, col: 0 });
+    }
+
+    #[test]
+    fn move_word_left_at_buffer_start_is_noop() {
+        let buf = TextBuffer::from_text("foo");
+        let mut c = cursor_at(0, 0);
+        c.move_word_left(&buf, false);
+        assert_eq!(c.position, Position { line: 0, col: 0 });
+    }
+
+    // ── selection mode ──
+
+    #[test]
+    fn move_word_right_selecting_creates_selection() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, true);
+        assert!(c.has_selection());
+    }
+
+    #[test]
+    fn move_word_left_non_selecting_clears_selection() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 5);
+        c.start_selection();
+        c.move_word_left(&buf, false);
+        assert!(!c.has_selection());
     }
 }

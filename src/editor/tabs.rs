@@ -259,13 +259,27 @@ impl TabState {
         infos
     }
 
-    /// Iterador mutable sobre todos los editores.
+    /// Slice inmutable de todos los editores abiertos.
     ///
-    /// Se usa para operaciones que afectan a todas las tabs, como
-    /// invalidar caches de highlighting cuando el engine termina de cargar.
-    #[expect(dead_code, reason = "API pública para operaciones masivas sobre tabs")]
-    pub fn all_editors_mut(&mut self) -> &mut [EditorState] {
+    /// Se usa para operaciones de lectura masiva (contar dirty, buscar
+    /// untitled) sin necesidad de tomar `&mut self`.
+    pub fn editors(&self) -> &[EditorState] {
+        &self.editors
+    }
+
+    /// Slice mutable de todos los editores abiertos.
+    ///
+    /// Se usa para operaciones que afectan a todas las tabs, como guardar
+    /// múltiples buffers o invalidar caches de highlighting.
+    pub fn editors_mut(&mut self) -> &mut [EditorState] {
         &mut self.editors
+    }
+
+    /// Cambia la tab activa por índice. Alias semántico de `switch_to`.
+    ///
+    /// Si el índice está fuera de rango, no hace nada.
+    pub fn set_active(&mut self, idx: usize) {
+        self.switch_to(idx);
     }
 
     /// Índice de la tab activa.
@@ -277,5 +291,67 @@ impl TabState {
 impl Default for TabState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editors_returns_slice_of_all_editors() {
+        let mut tabs = TabState::new();
+        // Por defecto hay 1 editor vacío
+        assert_eq!(tabs.editors().len(), 1);
+
+        // Agregar un editor (vía open_diff_tab que no toca disco)
+        tabs.open_diff_tab(String::from("diff content"), None, false);
+        assert_eq!(tabs.editors().len(), 2);
+    }
+
+    #[test]
+    fn editors_mut_allows_iteration_with_mutation() {
+        let mut tabs = TabState::new();
+        // Usar paths distintos para evitar la dedup de open_diff_tab.
+        tabs.open_diff_tab(String::from("diff1"), Some(PathBuf::from("a.rs")), false);
+        tabs.open_diff_tab(String::from("diff2"), Some(PathBuf::from("b.rs")), false);
+        // 1 editor vacío + 2 diff tabs = 3
+        let editors = tabs.editors_mut();
+        assert_eq!(editors.len(), 3);
+        // Mutar: cambiar scroll_offset del último diff
+        if let Some(ref mut dv) = editors[2].diff_view {
+            dv.scroll_offset = 42;
+        }
+        // Verificar que la mutación persiste
+        let dv2 = tabs.editors()[2]
+            .diff_view
+            .as_ref()
+            .expect("diff view exists");
+        assert_eq!(dv2.scroll_offset, 42);
+    }
+
+    #[test]
+    fn set_active_changes_active_index_in_range() {
+        let mut tabs = TabState::new();
+        tabs.open_diff_tab(String::from("d1"), Some(PathBuf::from("a.rs")), false);
+        tabs.open_diff_tab(String::from("d2"), Some(PathBuf::from("b.rs")), false);
+        // Por construcción, el último open_diff_tab queda activo
+        assert_eq!(tabs.active_index(), 2);
+        tabs.set_active(0);
+        assert_eq!(tabs.active_index(), 0);
+        tabs.set_active(1);
+        assert_eq!(tabs.active_index(), 1);
+    }
+
+    #[test]
+    fn set_active_ignores_out_of_range_index() {
+        let mut tabs = TabState::new();
+        tabs.open_diff_tab(String::from("d1"), Some(PathBuf::from("a.rs")), false);
+        // 2 editores → índices válidos 0..=1
+        tabs.set_active(0);
+        let prev = tabs.active_index();
+        tabs.set_active(99); // fuera de rango
+        // No debe cambiar
+        assert_eq!(tabs.active_index(), prev);
     }
 }

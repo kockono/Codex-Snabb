@@ -17,6 +17,7 @@ pub mod panels;
 // projects_panel movido a projects/render.rs
 pub use crate::projects::render as projects_panel;
 pub mod quick_open;
+pub mod quit_modal;
 pub mod rename_modal;
 pub mod save_as_modal;
 // search_panel movido a search/render.rs
@@ -233,6 +234,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             && !state.folder_picker.visible
             && !state.save_as.visible
             && !state.rename.visible
+            && !state.quit_modal.visible
         {
             // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
             let inner_x = layout.editor_area.x + 1;
@@ -328,6 +330,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.folder_picker.visible
         && !state.save_as.visible
         && !state.rename.visible
+        && !state.quit_modal.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -395,6 +398,18 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name, state.cursor_visible);
     } else if state.palette.visible {
         palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
+    }
+
+    // ── Quit modal (después de rename_modal, antes del context menu) ──
+    // Cuenta de buffers dirty pre-computada acá — el render no aloca.
+    if state.quit_modal.visible {
+        let dirty_count = state
+            .tabs
+            .editors()
+            .iter()
+            .filter(|e| e.diff_view.is_none() && e.buffer.is_dirty())
+            .count();
+        quit_modal::render_quit_modal(f, area, theme, &state.quit_modal, dirty_count);
     }
 
     // ── Context menu (z-order máximo — tapa todo) ──

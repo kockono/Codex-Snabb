@@ -25,6 +25,17 @@ pub enum EditOperation {
     InsertNewline { pos: Position },
     /// Newline eliminado (dos líneas unidas). Para undo: re-dividir.
     DeleteNewline { pos: Position, col: usize },
+    /// Dos líneas intercambiadas (Alt+Up/Down). Para undo: volver a swap.
+    SwapLines { a: usize, b: usize },
+    /// Línea reemplazada (toggle comment). Para undo: restaurar `old`.
+    ReplaceLine {
+        line_idx: usize,
+        old: String,
+        new: String,
+    },
+    /// Línea insertada en el índice. Para undo: borrar esa línea.
+    /// Para redo: re-insertar el contenido (clone necesario para re-aplicar).
+    InsertLine { line: usize, content: String },
 }
 
 /// Stack dual de undo/redo con capacidad limitada.
@@ -97,5 +108,58 @@ impl UndoStack {
 impl Default for UndoStack {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_line_push_undo_redo_round_trip() {
+        let mut stack = UndoStack::new();
+        let op = EditOperation::InsertLine {
+            line: 2,
+            // CLONE: test setup needs owned string
+            content: String::from("hola"),
+        };
+        stack.push(op.clone());
+
+        // undo retorna la operación y la mueve a redo
+        let undone = stack.undo().expect("undo should return op");
+        assert!(matches!(
+            undone,
+            EditOperation::InsertLine { line: 2, .. }
+        ));
+        if let EditOperation::InsertLine { content, .. } = &undone {
+            assert_eq!(content, "hola");
+        }
+
+        // tras undo, no hay más undo
+        assert!(stack.undo().is_none());
+
+        // redo retorna la misma operación
+        let redone = stack.redo().expect("redo should return op");
+        assert!(matches!(
+            redone,
+            EditOperation::InsertLine { line: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn insert_line_distinct_from_replace_line() {
+        // Triangulación: InsertLine y ReplaceLine son variantes distintas
+        // y no se confunden en pattern matching.
+        let insert = EditOperation::InsertLine {
+            line: 0,
+            content: String::from("a"),
+        };
+        let replace = EditOperation::ReplaceLine {
+            line_idx: 0,
+            old: String::from("a"),
+            new: String::from("b"),
+        };
+        assert!(!matches!(insert, EditOperation::ReplaceLine { .. }));
+        assert!(!matches!(replace, EditOperation::InsertLine { .. }));
     }
 }

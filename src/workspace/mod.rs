@@ -5,6 +5,7 @@
 //! próximo refactor que los reubique en sus dominios definitivos.
 
 pub mod quick_open;
+pub mod quit_modal;
 pub mod rename;
 pub mod save_as;
 

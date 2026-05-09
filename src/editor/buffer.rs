@@ -189,7 +189,6 @@ impl TextBuffer {
     ///
     /// Si solo queda una línea, la vacía en vez de eliminarla
     /// (mantiene invariante de al menos 1 línea).
-    #[expect(dead_code, reason = "se usará para operaciones avanzadas de edición")]
     pub fn delete_line(&mut self, line: usize) {
         if line >= self.lines.len() {
             return;
@@ -246,6 +245,51 @@ impl TextBuffer {
         self.dirty = true;
     }
 
+    /// Intercambia dos líneas del buffer.
+    ///
+    /// Operación O(1): usa `Vec::swap` que solo intercambia los punteros
+    /// internos del Vec, sin allocar ni mover bytes. Si `a == b`, o si
+    /// alguno de los índices está fuera de rango, no hace nada y no
+    /// marca el buffer como dirty.
+    pub fn swap_lines(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        if a >= self.lines.len() || b >= self.lines.len() {
+            return;
+        }
+        self.lines.swap(a, b);
+        self.dirty = true;
+    }
+
+    /// Reemplaza el contenido completo de una línea.
+    ///
+    /// `new` toma ownership del nuevo contenido — esto evita una alocación
+    /// extra cuando el caller ya tiene la nueva línea owned (típico tras
+    /// `toggle_comment`). Si `idx` está fuera de rango, no hace nada y
+    /// no marca el buffer como dirty.
+    pub fn replace_line(&mut self, idx: usize, new: String) {
+        if idx >= self.lines.len() {
+            return;
+        }
+        self.lines[idx] = new;
+        self.dirty = true;
+    }
+
+    /// Inserta `content` como nueva línea en el índice `idx`, desplazando
+    /// las siguientes una posición hacia abajo.
+    ///
+    /// Si `idx` excede `line_count()`, la línea se anexa al final
+    /// (clamp a `line_count()`). `content` toma ownership — sin alocaciones
+    /// extra cuando el caller ya tiene el `String` owned. Marca `dirty = true`.
+    ///
+    /// O(n) por el `Vec::insert` — aceptable para lógica del editor (no render).
+    pub fn insert_line(&mut self, idx: usize, content: String) {
+        let target = idx.min(self.lines.len());
+        self.lines.insert(target, content);
+        self.dirty = true;
+    }
+
     /// Inserta un carácter para undo/redo sin re-marcar dirty
     /// (ya se marcó en la operación original).
     ///
@@ -275,5 +319,141 @@ impl TextBuffer {
 impl Default for TextBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── swap_lines ──
+
+    #[test]
+    fn swap_lines_swaps_adjacent_lines() {
+        let mut buf = TextBuffer::from_text("a\nb\nc");
+        buf.swap_lines(0, 1);
+        assert_eq!(buf.line(0), Some("b"));
+        assert_eq!(buf.line(1), Some("a"));
+        assert_eq!(buf.line(2), Some("c"));
+    }
+
+    #[test]
+    fn swap_lines_marks_dirty() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        assert!(!buf.is_dirty());
+        buf.swap_lines(0, 1);
+        assert!(buf.is_dirty());
+    }
+
+    #[test]
+    fn swap_lines_same_index_is_noop() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        buf.swap_lines(0, 0);
+        assert_eq!(buf.line(0), Some("a"));
+        assert_eq!(buf.line(1), Some("b"));
+        // Same-index swap should not flip dirty either
+        assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn swap_lines_out_of_range_is_noop() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        buf.swap_lines(0, 99);
+        assert_eq!(buf.line(0), Some("a"));
+        assert_eq!(buf.line(1), Some("b"));
+        assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn swap_lines_far_apart() {
+        let mut buf = TextBuffer::from_text("a\nb\nc\nd");
+        buf.swap_lines(0, 3);
+        assert_eq!(buf.line(0), Some("d"));
+        assert_eq!(buf.line(1), Some("b"));
+        assert_eq!(buf.line(2), Some("c"));
+        assert_eq!(buf.line(3), Some("a"));
+    }
+
+    // ── replace_line ──
+
+    #[test]
+    fn replace_line_replaces_content() {
+        let mut buf = TextBuffer::from_text("foo\nbar");
+        buf.replace_line(0, String::from("hello"));
+        assert_eq!(buf.line(0), Some("hello"));
+        assert_eq!(buf.line(1), Some("bar"));
+    }
+
+    #[test]
+    fn replace_line_marks_dirty() {
+        let mut buf = TextBuffer::from_text("foo");
+        assert!(!buf.is_dirty());
+        buf.replace_line(0, String::from("bar"));
+        assert!(buf.is_dirty());
+    }
+
+    #[test]
+    fn replace_line_out_of_range_is_noop() {
+        let mut buf = TextBuffer::from_text("foo");
+        buf.replace_line(99, String::from("bar"));
+        assert_eq!(buf.line(0), Some("foo"));
+        assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn replace_line_with_empty_string() {
+        let mut buf = TextBuffer::from_text("foo\nbar");
+        buf.replace_line(0, String::new());
+        assert_eq!(buf.line(0), Some(""));
+        assert_eq!(buf.line(1), Some("bar"));
+    }
+
+    // ── insert_line ──
+
+    #[test]
+    fn insert_line_at_start_shifts_existing_lines() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        buf.insert_line(0, String::from("zero"));
+        assert_eq!(buf.line(0), Some("zero"));
+        assert_eq!(buf.line(1), Some("a"));
+        assert_eq!(buf.line(2), Some("b"));
+        assert_eq!(buf.line_count(), 3);
+    }
+
+    #[test]
+    fn insert_line_in_middle() {
+        let mut buf = TextBuffer::from_text("a\nb\nc");
+        buf.insert_line(1, String::from("middle"));
+        assert_eq!(buf.line(0), Some("a"));
+        assert_eq!(buf.line(1), Some("middle"));
+        assert_eq!(buf.line(2), Some("b"));
+        assert_eq!(buf.line(3), Some("c"));
+    }
+
+    #[test]
+    fn insert_line_at_end_appends() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        let line_count = buf.line_count();
+        buf.insert_line(line_count, String::from("end"));
+        assert_eq!(buf.line(0), Some("a"));
+        assert_eq!(buf.line(1), Some("b"));
+        assert_eq!(buf.line(2), Some("end"));
+    }
+
+    #[test]
+    fn insert_line_beyond_range_clamps_to_end() {
+        let mut buf = TextBuffer::from_text("a\nb");
+        buf.insert_line(999, String::from("x"));
+        // Triangulation: idx out of range MUST not panic — clamp to end.
+        assert_eq!(buf.line_count(), 3);
+        assert_eq!(buf.line(2), Some("x"));
+    }
+
+    #[test]
+    fn insert_line_marks_dirty() {
+        let mut buf = TextBuffer::from_text("a");
+        assert!(!buf.is_dirty());
+        buf.insert_line(0, String::from("new"));
+        assert!(buf.is_dirty());
     }
 }

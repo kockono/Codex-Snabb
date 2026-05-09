@@ -50,6 +50,9 @@ pub struct GitState {
     /// Si el contenido en `diff_content` es el archivo completo (true)
     /// o un diff real (false). Afecta el título del panel.
     pub showing_file_content: bool,
+    /// Último error de operación de red (push/pull/fetch). Se renderiza en
+    /// el footer del panel hasta que una operación exitosa lo limpie.
+    pub last_error: Option<String>,
 }
 
 impl GitState {
@@ -70,6 +73,7 @@ impl GitState {
             commit_mode: false,
             show_diff: false,
             showing_file_content: false,
+            last_error: None,
         }
     }
 

@@ -26,7 +26,13 @@ use crossterm::event::KeyEvent;
 /// Se van habilitando a medida que se implementan los subsistemas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Salir de la aplicación limpiamente.
+    /// Salir de la aplicación limpiamente sin chequear buffers dirty.
+    /// DEPRECADO: el flujo recomendado es `QuitRequested` → modal de confirmación.
+    /// Se conserva el handler en el reducer por si una integración externa lo emite.
+    #[expect(
+        dead_code,
+        reason = "kept as low-level escape hatch; UI usa QuitRequested + modal"
+    )]
     Quit,
     /// No-op: acción vacía que no produce cambios de estado.
     Noop,
@@ -55,27 +61,71 @@ pub enum Action {
     /// Mover cursor al final de la línea actual (End).
     MoveToLineEnd,
     /// Mover cursor al inicio absoluto del buffer (Ctrl+Home).
-    #[expect(
-        dead_code,
-        reason = "se habilitará cuando se agregue keybinding Ctrl+Home"
-    )]
     MoveToBufferStart,
     /// Mover cursor al final absoluto del buffer (Ctrl+End).
-    #[expect(
-        dead_code,
-        reason = "se habilitará cuando se agregue keybinding Ctrl+End"
-    )]
     MoveToBufferEnd,
     /// Deshacer la última operación de edición (Ctrl+Z).
     Undo,
     /// Rehacer la última operación deshecha (Ctrl+Y).
     Redo,
 
+    /// Mover cursor por palabra (Ctrl+Left/Right).
+    MoveCursorWord(Direction),
+    /// Mover cursor por palabra extendiendo la selección (Ctrl+Shift+Left/Right).
+    MoveCursorWordSelecting(Direction),
+    /// Toggle line comment (Ctrl+/) según extensión del archivo.
+    ToggleLineComment,
+    /// Mover la línea del cursor primario hacia arriba o abajo (Alt+Up/Down).
+    MoveLine(Direction),
+    /// Duplicar la(s) línea(s) del cursor hacia arriba o abajo (Shift+Alt+Up/Down).
+    DuplicateLine(Direction),
+    /// Tab dentro del editor: indentar selección si existe, sino navegar foco.
+    EditorTab,
+    /// Shift+Tab dentro del editor: des-indentar selección si existe, sino foco previo.
+    EditorBackTab,
+    /// Seleccionar la línea completa del cursor primario (Ctrl+L).
+    SelectLine,
+
     // ── Multicursor / Selección ──
+    /// Agregar un cursor en la línea inmediatamente superior al primario (Ctrl+Alt+Up).
+    AddCursorAbove,
+    /// Agregar un cursor en la línea inmediatamente inferior al primario (Ctrl+Alt+Down).
+    AddCursorBelow,
+    /// Extender selección al inicio de la línea para todos los cursores (Shift+Home).
+    MoveToLineStartSelecting,
+    /// Extender selección al final de la línea para todos los cursores (Shift+End).
+    MoveToLineEndSelecting,
+    /// Extender selección al inicio absoluto del buffer (Ctrl+Shift+Home).
+    MoveToBufferStartSelecting,
+    /// Extender selección al final absoluto del buffer (Ctrl+Shift+End).
+    MoveToBufferEndSelecting,
     /// Seleccionar la siguiente ocurrencia del texto seleccionado (Ctrl+D).
     SelectNextOccurrence,
     /// Limpiar cursores secundarios (Esc con multicursor activo).
+    /// DEPRECADO: reemplazado por `EscapeHierarchy`. Se conserva en el enum
+    /// para compatibilidad con dispatch de paneles que aún lo emiten.
+    #[expect(
+        dead_code,
+        reason = "kept for transition; replaced by EscapeHierarchy"
+    )]
     ClearMultiCursor,
+    /// Esc jerárquico: limpia multicursor → selección → foco al editor → no-op.
+    /// Reemplaza el comportamiento previo de `ClearMultiCursor` que cerraba la app.
+    EscapeHierarchy,
+    /// Solicitar quit de la aplicación (Ctrl+Q). Si hay buffers dirty,
+    /// muestra el modal de confirmación; si no, sale inmediatamente.
+    QuitRequested,
+    /// Confirmar "Save All" en el modal de quit. Guarda buffers titled y
+    /// arranca el flujo de Save As para los untitled.
+    QuitConfirmSaveAll,
+    /// Confirmar "Don't Save" en el modal de quit. Sale descartando cambios.
+    QuitConfirmDiscard,
+    /// Cancelar el modal de quit (Esc / botón Cancel). Mantiene la app abierta.
+    QuitCancel,
+    /// Mover foco al siguiente botón del modal de quit (Tab).
+    QuitModalCycleNext,
+    /// Mover foco al botón anterior del modal de quit (Shift+Tab).
+    QuitModalCyclePrev,
     /// Mover cursor extendiendo la selección (Shift + flechas).
     MoveCursorSelecting(Direction),
     /// Seleccionar todo el contenido del buffer (Ctrl+A).
@@ -376,6 +426,10 @@ pub enum Action {
     GitCommitDeleteChar,
     /// Ejecutar git fetch para sincronizar con el remoto.
     GitFetch,
+    /// Ejecutar git push para enviar commits al remoto.
+    GitPush,
+    /// Ejecutar git pull para traer cambios del remoto.
+    GitPull,
 
     // ── LSP ──
     /// Arrancar el language server para el archivo actual.

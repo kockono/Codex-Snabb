@@ -245,12 +245,16 @@ impl CommandRegistry {
         });
 
         // ── App ──
+        // Quit explícito mapeado a Ctrl+Q. Dispara `QuitRequested`, que muestra
+        // el modal de confirmación si hay buffers dirty o sale inmediatamente.
+        // Esc NO cierra la app — Esc es jerárquico (multicursor → selección →
+        // foco al editor → no-op). Ver `Action::EscapeHierarchy`.
         self.register(CommandEntry {
             id: "app.quit",
             label: "Quit Application",
             category: "App",
-            keybinding: Some("Esc"),
-            action: Action::Quit,
+            keybinding: Some("Ctrl+Q"),
+            action: Action::QuitRequested,
         });
     }
 
@@ -372,6 +376,11 @@ impl CommandRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn entry_for(&self, id: &'static str) -> Option<&CommandEntry> {
+        self.commands.iter().find(|c| c.id == id)
+    }
+
     /// Verifica si un `KeyEvent` matchea algún keybinding custom.
     ///
     /// Recorre todos los comandos con overrides y defaults, buscando
@@ -389,5 +398,23 @@ impl CommandRegistry {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_quit_resolves_to_quit_requested_with_ctrl_q() {
+        let mut registry = CommandRegistry::new();
+        registry.register_defaults();
+        let entry = registry
+            .entry_for("app.quit")
+            .expect("app.quit must be registered");
+        assert_eq!(entry.action, Action::QuitRequested);
+        assert_eq!(entry.keybinding, Some("Ctrl+Q"));
+        // Y el efectivo (sin overrides) debe ser el mismo Ctrl+Q
+        assert_eq!(registry.effective_keybind("app.quit"), "Ctrl+Q");
     }
 }
