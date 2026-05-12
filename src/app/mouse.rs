@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::helpers::get_workspace_root;
 use super::{process_effects, reduce, AppState};
 use crate::core::settings::SidebarSection;
-use crate::core::{Action, PanelId};
+use crate::core::{is_image_file, Action, Effect, PanelId};
 use crate::ui::layout::IdeLayout;
 
 // ─── Types and constants ───────────────────────────────────────────────────────
@@ -50,6 +50,20 @@ pub(super) fn editor_gutter_width(line_count: usize) -> u16 {
     let digits = crate::ui::panels::digit_count(line_count).max(4);
     let separator = 2; // "│ "
     (digits + separator) as u16
+}
+
+/// Verifica si un punto absoluto `(col, row)` cae dentro del rect del botón
+/// terminal toggle de la status bar. Pure function — no muta estado.
+///
+/// Usa `terminal_button_rect` para calcular el rect, luego hit-tests punto-en-rect.
+pub(super) fn hit_test_terminal_button(
+    status_bar_area: Rect,
+    data: &crate::ui::panels::StatusBarData<'_>,
+    col: u16,
+    row: u16,
+) -> bool {
+    let r = crate::ui::panels::terminal_button_rect(status_bar_area, data);
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 /// Determina en qué panel cayó una posición (col, row) absoluta.
@@ -162,6 +176,26 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
     {
         let sb = layout.status_bar;
         if row >= sb.y && row < sb.y + sb.height {
+            // ── Terminal toggle button (right-flushed, antes del UTF-8) ──
+            // El botón se calcula con los mismos datos que el render: cursor_pos,
+            // scroll_pct y encoding determinan su posición. git_status/mode no influyen
+            // (están en el lado izquierdo), así que pasamos placeholders.
+            let sb_data = crate::ui::panels::StatusBarData {
+                mode: " NORMAL ", // irrelevante para hit-test del botón
+                git_status: "",   // irrelevante para hit-test del botón
+                encoding: "UTF-8",
+                cursor_pos: &state.status_line,
+                scroll_pct: &state.status_pct,
+                terminal_visible: state.bottom_panel_visible,
+            };
+            if hit_test_terminal_button(sb, &sb_data, col, row) {
+                // Dispatch ToggleTerminal — usa el mismo path que el keybind Ctrl+\
+                let effects = reduce(state, &Action::ToggleTerminal);
+                process_effects(&effects, &CancellationToken::new(), state);
+                tracing::debug!("toggle terminal via mouse click en status bar button");
+                return;
+            }
+
             // La status bar tiene: " MODE " + " " + git_status + "  " + file_name...
             // git_status es: "⎇ main ↑2 ↓1 ⟳" — con fetch icon ⟳ al final
             // El mode ("NORMAL" o "LSP") ocupa ~8 chars (espacio + texto + espacio + separador)
@@ -240,7 +274,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
             if row_in_bar == settings_row {
                 // Click en Settings (último icono)
                 let effects = reduce(state, &Action::SettingsOpen);
-                process_effects(&effects, &CancellationToken::new());
+                process_effects(&effects, &CancellationToken::new(), state);
             } else {
                 // Click en iconos de sección (0, 1, 2)
                 let section = match row_in_bar {
@@ -252,7 +286,7 @@ pub(super) fn reduce_mouse_click(state: &mut AppState, col: u16, row: u16) {
                 };
                 if let Some(section) = section {
                     let effects = reduce(state, &Action::ActivityBarSelect(section));
-                    process_effects(&effects, &CancellationToken::new());
+                    process_effects(&effects, &CancellationToken::new(), state);
                 }
             }
         }
@@ -337,8 +371,19 @@ fn reduce_mouse_click_explorer(state: &mut AppState, layout: &IdeLayout, row: u1
         if let Err(e) = explorer.toggle_selected() {
             tracing::error!(error = %e, "error en toggle de explorer por mouse");
         }
+    } else if is_image_file(&entry_path) {
+        // Abrir imagen en tab — decodificación async
+        let tab_index = state.tabs.open_image_tab(&entry_path);
+        let effects = vec![Effect::DecodeImage {
+            path: entry_path.clone(), // CLONE: necesario para mover al worker async
+            tab_index,
+        }];
+        process_effects(&effects, &CancellationToken::new(), state);
+        state.focused_panel = PanelId::Editor;
+        state.update_status_cache();
+        tracing::info!(path = %entry_path.display(), "imagen abierta por mouse click");
     } else {
-        // Abrir archivo en una tab del editor
+        // Abrir archivo de texto en una tab del editor
         match state.tabs.open_file(&entry_path) {
             Ok(()) => {
                 state
@@ -555,7 +600,7 @@ fn reduce_mouse_click_git_with_col(
             // BTN_LEN = 4 (" [-]"), [-] ocupa los últimos 3 chars.
             if rel_col != u16::MAX && rel_col >= inner_width.saturating_sub(3) {
                 let effects = reduce(state, &Action::GitUnstageAll);
-                process_effects(&effects, &CancellationToken::new());
+                process_effects(&effects, &CancellationToken::new(), state);
                 tracing::debug!("git panel: unstage all via [-] header click");
             }
         }
@@ -564,7 +609,7 @@ fn reduce_mouse_click_git_with_col(
             // BTN_LEN = 4 (" [+]"), [+] ocupa los últimos 3.
             if rel_col != u16::MAX && rel_col >= inner_width.saturating_sub(3) {
                 let effects = reduce(state, &Action::GitStageAll);
-                process_effects(&effects, &CancellationToken::new());
+                process_effects(&effects, &CancellationToken::new(), state);
                 tracing::debug!("git panel: stage all via [+] header click");
             }
         }
@@ -591,7 +636,7 @@ fn reduce_mouse_click_git_with_col(
                     // Zona [↺]: últimos 3 chars
                     if rel_col >= inner_width.saturating_sub(3) {
                         let effects = reduce(state, &Action::GitDiscardFile(file_idx));
-                        process_effects(&effects, &CancellationToken::new());
+                        process_effects(&effects, &CancellationToken::new(), state);
                         return;
                     }
                     // Zona [+]: chars (w-7)..(w-4)
@@ -599,14 +644,14 @@ fn reduce_mouse_click_git_with_col(
                     let btn_end = inner_width.saturating_sub(4);
                     if rel_col >= btn_start && rel_col < btn_end {
                         let effects = reduce(state, &Action::GitStageFile(file_idx));
-                        process_effects(&effects, &CancellationToken::new());
+                        process_effects(&effects, &CancellationToken::new(), state);
                         return;
                     }
                 } else {
                     // Zona [+]/[-]: últimos 3 chars
                     if rel_col >= inner_width.saturating_sub(3) {
                         let effects = reduce(state, &Action::GitStageFile(file_idx));
-                        process_effects(&effects, &CancellationToken::new());
+                        process_effects(&effects, &CancellationToken::new(), state);
                         return;
                     }
                 }
@@ -616,7 +661,7 @@ fn reduce_mouse_click_git_with_col(
             // Equivalente a presionar 'd' — usa el mismo reducer GitToggleDiff.
             state.git.selected_index = file_idx;
             let effects = reduce(state, &Action::GitToggleDiff);
-            process_effects(&effects, &CancellationToken::new());
+            process_effects(&effects, &CancellationToken::new(), state);
             tracing::debug!(file_idx, "git panel: archivo seleccionado + diff tab abierta");
         }
     }
@@ -820,7 +865,7 @@ fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u1
         0 => {
             // Click en [+] Nuevo proyecto → abrir diálogo nativo del SO
             let effects = super::reduce(state, &crate::core::Action::ProjectsAddNew);
-            super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+            super::process_effects(&effects, &tokio_util::sync::CancellationToken::new(), state);
             tracing::debug!("projects: diálogo nativo iniciado via mouse click");
         }
         1 => { /* separador — ignorar */ }
@@ -848,7 +893,7 @@ fn reduce_mouse_click_projects(state: &mut AppState, layout: &IdeLayout, col: u1
             } else if state.projects.selected == idx {
                 // Segundo click en el mismo proyecto → abrir
                 let effects = super::reduce(state, &crate::core::Action::ProjectsOpen);
-                super::process_effects(&effects, &tokio_util::sync::CancellationToken::new());
+                super::process_effects(&effects, &tokio_util::sync::CancellationToken::new(), state);
             } else {
                 // Primer click → solo seleccionar
                 state.projects.selected = idx;
@@ -1149,5 +1194,62 @@ mod tests {
         // Title bar row = 0, not a panel
         let result = hit_test_panel(&layout, 50, 0);
         assert_eq!(result, None);
+    }
+
+    // ─── Terminal button hit-test ──────────────────────────────────────────────
+
+    fn make_sb_data<'a>(cursor_pos: &'a str, scroll_pct: &'a str) -> crate::ui::panels::StatusBarData<'a> {
+        crate::ui::panels::StatusBarData {
+            mode: " NORMAL ",
+            git_status: "main",
+            encoding: "UTF-8",
+            cursor_pos,
+            scroll_pct,
+            terminal_visible: false,
+        }
+    }
+
+    #[test]
+    fn hit_test_terminal_button_inside_returns_true() {
+        let sb = Rect::new(0, 23, 80, 1);
+        let data = make_sb_data("1:1", "0%");
+        // From terminal_button_rect tests: x=59, width=4 → cols 59, 60, 61, 62
+        assert!(hit_test_terminal_button(sb, &data, 59, 23));
+        assert!(hit_test_terminal_button(sb, &data, 60, 23));
+        assert!(hit_test_terminal_button(sb, &data, 61, 23));
+        assert!(hit_test_terminal_button(sb, &data, 62, 23));
+    }
+
+    #[test]
+    fn hit_test_terminal_button_just_outside_returns_false() {
+        let sb = Rect::new(0, 23, 80, 1);
+        let data = make_sb_data("1:1", "0%");
+        // Button at cols 59..63 (x=59, width=4 → 59, 60, 61, 62)
+        assert!(!hit_test_terminal_button(sb, &data, 58, 23)); // one to the left
+        assert!(!hit_test_terminal_button(sb, &data, 63, 23)); // one to the right
+    }
+
+    #[test]
+    fn hit_test_terminal_button_wrong_row_returns_false() {
+        let sb = Rect::new(0, 23, 80, 1);
+        let data = make_sb_data("1:1", "0%");
+        // Same column, wrong row
+        assert!(!hit_test_terminal_button(sb, &data, 60, 22));
+        assert!(!hit_test_terminal_button(sb, &data, 60, 24));
+        assert!(!hit_test_terminal_button(sb, &data, 60, 0));
+    }
+
+    #[test]
+    fn hit_test_terminal_button_shifts_with_data_widths() {
+        let sb = Rect::new(0, 23, 100, 1);
+        let short = make_sb_data("1:1", "0%");
+        let long = make_sb_data("1234:567", "100%");
+        // Click at the short button position should hit short, miss long (button moved left)
+        let short_rect = crate::ui::panels::terminal_button_rect(sb, &short);
+        let long_rect = crate::ui::panels::terminal_button_rect(sb, &long);
+        assert!(short_rect.x > long_rect.x, "longer cursor_pos should shift button left");
+        // A click at short_rect.x should hit short but NOT long (long is further left)
+        assert!(hit_test_terminal_button(sb, &short, short_rect.x, 23));
+        assert!(!hit_test_terminal_button(sb, &long, short_rect.x, 23));
     }
 }
