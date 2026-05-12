@@ -780,7 +780,7 @@ checksum = "ccc0a9c4770bc47b0a933256a496cfb8b6531f753ea9bccb19c6dff0ff7273fc"
 
 [[package]]
 name = "ide-tui"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
