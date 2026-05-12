@@ -7,6 +7,7 @@
 
 pub mod branch_picker;
 pub mod commands;
+pub mod render;
 
 use std::path::Path;
 
@@ -46,6 +47,12 @@ pub struct GitState {
     pub commit_mode: bool,
     /// Si se está mostrando el diff del archivo seleccionado.
     pub show_diff: bool,
+    /// Si el contenido en `diff_content` es el archivo completo (true)
+    /// o un diff real (false). Afecta el título del panel.
+    pub showing_file_content: bool,
+    /// Último error de operación de red (push/pull/fetch). Se renderiza en
+    /// el footer del panel hasta que una operación exitosa lo limpie.
+    pub last_error: Option<String>,
 }
 
 impl GitState {
@@ -65,6 +72,8 @@ impl GitState {
             commit_input: String::with_capacity(128),
             commit_mode: false,
             show_diff: false,
+            showing_file_content: false,
+            last_error: None,
         }
     }
 
@@ -125,6 +134,7 @@ impl GitState {
         self.diff_content = None;
         self.show_diff = false;
         self.diff_scroll = 0;
+        self.showing_file_content = false;
     }
 
     /// Mover selección hacia arriba en la lista de archivos.
@@ -164,6 +174,86 @@ impl GitState {
         Ok(())
     }
 
+    /// Stage o unstage el archivo en la posición `idx` del `Vec<GitFileStatus>`.
+    ///
+    /// Toggle simétrico a `stage_toggle` pero direccionado por índice — se usa
+    /// para click en el botón `[+]`/`[-]` de una row específica del panel.
+    /// Refresca el status después de la operación.
+    pub fn stage_file_at(&mut self, repo_path: &Path, idx: usize) -> anyhow::Result<()> {
+        let file = self
+            .files
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("git: índice {} fuera de rango", idx))?;
+        // CLONE: necesario — liberamos el borrow de self.files antes de llamar refresh(&mut self)
+        let path = file.path.clone();
+        let staged = file.staged;
+
+        if staged {
+            commands::unstage_file(repo_path, &path)?;
+        } else {
+            commands::stage_file(repo_path, &path)?;
+        }
+
+        self.refresh(repo_path);
+        Ok(())
+    }
+
+    /// Descarta o elimina cambios del working tree para el archivo en `idx`.
+    ///
+    /// - Modified/Deleted unstaged → `git restore -- <file>` (vuelve al index)
+    /// - Added/Untracked unstaged  → `git clean -f -- <file>` (elimina del disco)
+    /// - Staged → no hace nada (no hay working-tree changes que descartar)
+    ///
+    /// Refresca el status después de la operación.
+    pub fn discard_file_at(&mut self, repo_path: &Path, idx: usize) -> anyhow::Result<()> {
+        let file = self
+            .files
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("git: índice {} fuera de rango", idx))?;
+        if file.staged {
+            return Ok(()); // staged files no tienen working-tree changes que descartar
+        }
+        // CLONE: necesario — liberamos el borrow de self.files antes de llamar refresh(&mut self)
+        let path = file.path.clone();
+        let status = file.status;
+
+        match status {
+            commands::FileChangeType::Added | commands::FileChangeType::Untracked => {
+                // Archivo nuevo — eliminarlo del disco con git clean
+                commands::delete_untracked_file(repo_path, &path)?;
+            }
+            _ => {
+                // Modified, Deleted, Renamed, Copied — restaurar desde el index
+                commands::discard_file(repo_path, &path)?;
+            }
+        }
+
+        self.refresh(repo_path);
+        Ok(())
+    }
+
+    /// Quita todos los archivos del staging area (`git restore --staged .`).
+    ///
+    /// No descarta cambios del working tree — solo mueve todo de staged a unstaged.
+    /// Refresca el status después.
+    pub fn unstage_all(&mut self, repo_path: &Path) -> anyhow::Result<()> {
+        commands::unstage_all(repo_path)?;
+        self.refresh(repo_path);
+        Ok(())
+    }
+
+    /// Stage de todos los archivos unstaged (equivalente a `git add .`).
+    ///
+    /// Usa `stage_file(repo_path, ".")` que delega en `git add -- .` —
+    /// `run_git` no es pública desde `commands`, pero `stage_file` con
+    /// path `"."` produce el mismo efecto y mantiene el patrón consistente.
+    /// Refresca el status después.
+    pub fn stage_all(&mut self, repo_path: &Path) -> anyhow::Result<()> {
+        commands::stage_file(repo_path, ".")?;
+        self.refresh(repo_path);
+        Ok(())
+    }
+
     /// Carga el diff del archivo seleccionado.
     ///
     /// Determina si usar diff staged o unstaged según el estado del archivo.
@@ -178,22 +268,46 @@ impl GitState {
         let file_path = file.path.clone();
 
         match commands::diff_file(repo_path, &file_path, staged) {
-            Ok(diff) => {
-                if diff.trim().is_empty() {
-                    self.diff_content = Some(String::from("(sin diff — archivo nuevo o binario)"));
-                } else {
-                    self.diff_content = Some(diff);
+            Ok(diff) if !diff.trim().is_empty() => {
+                self.diff_content = Some(diff);
+                self.showing_file_content = false;
+            }
+            // Diff vacío → archivo nuevo o sin cambios — mostrar contenido del archivo
+            Ok(_) => {
+                let full_path = repo_path.join(&file_path);
+                match std::fs::read_to_string(&full_path) {
+                    Ok(content) if !content.is_empty() => {
+                        self.diff_content = Some(content);
+                        self.showing_file_content = true;
+                    }
+                    Ok(_) => {
+                        self.diff_content = Some(String::from("(archivo vacío)"));
+                        self.showing_file_content = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %file_path, "no se pudo leer el archivo");
+                        self.diff_content = Some(String::from("(no se pudo leer el archivo)"));
+                        self.showing_file_content = true;
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %file_path, "no se pudo obtener diff");
                 self.diff_content = Some(String::from("(error al obtener diff)"));
+                self.showing_file_content = false;
             }
         }
         self.diff_scroll = 0;
     }
 
     /// Toggle mostrar/ocultar diff del archivo seleccionado.
+    ///
+    /// LEGACY: el overlay global de diff fue reemplazado por tabs virtuales.
+    /// Se conserva para no romper código que aún lo invoque hasta el cleanup.
+    #[expect(
+        dead_code,
+        reason = "legacy del overlay de diff — reemplazado por tabs virtuales (diff_view)"
+    )]
     pub fn toggle_diff(&mut self, repo_path: &Path) {
         self.show_diff = !self.show_diff;
         if self.show_diff {
@@ -201,6 +315,7 @@ impl GitState {
         } else {
             self.diff_content = None;
             self.diff_scroll = 0;
+            self.showing_file_content = false;
         }
     }
 

@@ -6,14 +6,22 @@
 //! y dibujan. Nada de IO ni cómputo pesado en render.
 
 pub mod branch_picker;
-pub mod git_panel;
+pub mod context_menu;
+// git_panel movido a source_control_git/render.rs
+pub use crate::source_control_git::render as git_panel;
 pub mod go_to_line;
 pub mod icons;
 pub mod layout;
 pub mod palette;
 pub mod panels;
+// projects_panel movido a projects/render.rs
+pub use crate::projects::render as projects_panel;
 pub mod quick_open;
-pub mod search_panel;
+pub mod quit_modal;
+pub mod rename_modal;
+pub mod save_as_modal;
+// search_panel movido a search/render.rs
+pub use crate::search::render as search_panel;
 pub mod settings_panel;
 pub mod theme;
 
@@ -64,9 +72,14 @@ use panels::StatusBarData;
 /// se derivan del estado ANTES de entrar al render — sin allocaciones
 /// dentro del draw.
 ///
-/// La función recibe `&AppState` y `&Theme` por referencia.
+/// La función recibe `&mut AppState` y `&Theme` por referencia.
 /// El theme se crea una vez fuera del event loop.
-pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
+///
+/// `&mut` es necesario porque `render_image_tab` requiere `&mut EditorState`
+/// (el widget `StatefulImage` de ratatui-image muta el protocolo para
+/// re-encodear en cada cambio de área). Para todas las demás ramas el
+/// borrow es efectivamente inmutable.
+pub fn render(f: &mut Frame, state: &mut AppState, theme: &Theme) {
     let area = f.area();
 
     // Usar layout pre-computado del event loop. Fallback a recompute solo
@@ -88,6 +101,8 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         SidebarSection::Search
     } else if state.git.visible {
         SidebarSection::Git
+    } else if state.projects.visible {
+        SidebarSection::Projects
     } else {
         SidebarSection::Explorer
     };
@@ -100,9 +115,12 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     );
 
     // ── Sidebar ──
-    // Prioridad de paneles en sidebar: search > git > explorer
+    // Prioridad de paneles en sidebar: search > git > projects > explorer
     if layout.sidebar_visible {
-        let sidebar_focused = matches!(focused, PanelId::Explorer | PanelId::Git | PanelId::Search);
+        let sidebar_focused = matches!(
+            focused,
+            PanelId::Explorer | PanelId::Git | PanelId::Search | PanelId::Projects
+        );
         if state.search.visible {
             // Búsqueda activa: renderizar panel de búsqueda en la sidebar
             search_panel::render_search_panel(
@@ -114,7 +132,23 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
             );
         } else if state.git.visible {
             // Git activo: renderizar panel de git en la sidebar
-            git_panel::render_git_panel(f, layout.sidebar, &state.git, theme, sidebar_focused);
+            git_panel::render_git_panel(
+                f,
+                layout.sidebar,
+                &state.git,
+                theme,
+                focused == PanelId::Git, // foco específico del git panel, no genérico
+                state.cursor_visible,
+            );
+        } else if state.projects.visible {
+            // Proyectos activo: renderizar panel de proyectos en la sidebar
+            projects_panel::render_projects_panel(
+                f,
+                layout.sidebar,
+                theme,
+                &state.projects,
+                sidebar_focused,
+            );
         } else {
             panels::render_sidebar(
                 f,
@@ -127,83 +161,157 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         }
     }
 
-    // ── Editor area ──
+    // editor_focused se necesita aquí y también en la sección de LSP overlays
+    // (después del if/else), por eso se declara antes del bloque.
     let editor_focused = focused == PanelId::Editor;
-    let editor = state.tabs.active();
-    // Pre-computar info de tabs para la barra de pestañas
-    let tab_infos = state.tabs.tab_info();
-    // Obtener diagnósticos para el archivo actual (si hay LSP activo)
-    let current_diagnostics = editor
-        .buffer
-        .file_path()
-        .map(|p| state.lsp.diagnostics_for(p))
-        .unwrap_or(&[]);
-    // Path del archivo activo y workspace root para breadcrumbs
-    let active_file_path = editor.buffer.file_path();
-    let workspace_root = state.explorer.as_ref().map(|e| e.root.as_path());
-    panels::render_editor_area(
-        f,
-        layout.editor_area,
-        theme,
-        editor_focused,
-        editor,
-        current_diagnostics,
-        &tab_infos,
-        state.bracket_match,
-        active_file_path,
-        workspace_root,
-    );
 
-    // ── Hardware cursor: posicionar la línea vertical del terminal ──
-    // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
-    // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
-    if editor_focused
-        && state.cursor_visible
-        && !state.palette.visible
-        && !state.quick_open.visible
-        && !state.go_to_line.visible
-        && !state.branch_picker.visible
-        && !state.keybindings.visible
-    {
-        // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
-        let inner_x = layout.editor_area.x + 1;
-        // +1 borde superior, +1 tab bar, +1 breadcrumbs = +3 desde editor_area.y
-        let chrome_offset: u16 = 2; // tab bar (1) + breadcrumbs (1)
-        let inner_y = layout.editor_area.y + 1 + chrome_offset;
-        let inner_h = layout.editor_area.height.saturating_sub(2 + chrome_offset) as usize;
+    // ── Editor area: tab normal vs tab virtual (diff o imagen) ──
+    //
+    // Tres ramas posibles:
+    // - imagen (`EditorState::image_view`): render via `render_image_tab` con
+    //   `StatefulImage` widget. Necesita `&mut EditorState` porque el protocol
+    //   se re-encodea en cada cambio de área.
+    // - diff (`EditorState::diff_view`): render via `render_diff_tab` (read-only).
+    // - normal: render del buffer editable con highlighting, gutter, etc.
+    //
+    // El bloque legacy `if state.git.show_diff` se eliminó: el reducer ya no
+    // setea ese flag — los diffs se abren como tabs virtuales.
+    let active_is_image_tab = state.tabs.active_is_image();
+    let active_is_diff_tab = state.tabs.active_is_diff();
 
-        let editor = state.tabs.active();
-        let scroll = editor.viewport.scroll_offset;
-        let cursor_line = editor.cursors.primary().position.line;
-        let cursor_col = editor.cursors.primary().position.col;
-
-        // Verificar que el cursor está dentro del viewport visible
-        if cursor_line >= scroll && cursor_line < scroll + inner_h {
-            let visual_row = (cursor_line - scroll) as u16;
-
-            // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
-            let total_lines = editor.buffer.line_count();
-            let gutter_width = panels::digit_count(total_lines).max(4);
-            let separator_width: u16 = 2;
-            let text_offset = gutter_width as u16 + separator_width;
-
-            let abs_col = inner_x + text_offset + cursor_col as u16;
-            let abs_row = inner_y + visual_row;
-
-            f.set_cursor_position((abs_col, abs_row));
-        }
-    }
-
-    // ── Bottom panel ──
-    if layout.bottom_panel_visible {
-        let bottom_focused = focused == PanelId::Terminal;
-        panels::render_bottom_panel(
+    if active_is_image_tab {
+        // Pre-computar info de tabs ANTES del active_mut() — el borrow checker
+        // no permite tener `&self.tabs` (vía tab_info) y `&mut self.tabs.active`
+        // simultáneamente.
+        let tab_infos = state.tabs.tab_info();
+        let editor = state.tabs.active_mut();
+        panels::render_image_tab(
             f,
-            layout.bottom_panel,
+            layout.editor_area,
             theme,
-            bottom_focused,
-            state.terminal.session.as_ref(),
+            editor_focused,
+            editor,
+            &tab_infos,
         );
+
+        // Bottom panel visible solo si está activado (no se oculta por imagen)
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                &state.terminal,
+            );
+        }
+    } else if active_is_diff_tab {
+        // Pre-computar info de tabs (incluye la tab virtual de diff)
+        let tab_infos = state.tabs.tab_info();
+        let editor = state.tabs.active();
+        panels::render_diff_tab(
+            f,
+            layout.editor_area,
+            theme,
+            editor_focused,
+            editor,
+            &tab_infos,
+        );
+
+        // Bottom panel visible solo si está activado (no se oculta por diff)
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                &state.terminal,
+            );
+        }
+    } else {
+        // ── Editor area: tab normal ──
+        let editor = state.tabs.active();
+        // Pre-computar info de tabs para la barra de pestañas
+        let tab_infos = state.tabs.tab_info();
+        // Obtener diagnósticos para el archivo actual (si hay LSP activo)
+        let current_diagnostics = editor
+            .buffer
+            .file_path()
+            .map(|p| state.lsp.diagnostics_for(p))
+            .unwrap_or(&[]);
+        // Path del archivo activo y workspace root para breadcrumbs
+        let active_file_path = editor.buffer.file_path();
+        let workspace_root = state.explorer.as_ref().map(|e| e.root.as_path());
+        panels::render_editor_area(
+            f,
+            layout.editor_area,
+            theme,
+            editor_focused,
+            editor,
+            current_diagnostics,
+            &tab_infos,
+            state.bracket_match,
+            active_file_path,
+            workspace_root,
+        );
+
+        // ── Hardware cursor: posicionar la línea vertical del terminal ──
+        // Solo cuando el editor tiene foco, no hay overlays activos, y el cursor es visible
+        // (blink). Cuando cursor_visible es false, no se posiciona — la terminal oculta el cursor.
+        if editor_focused
+            && state.cursor_visible
+            && !state.palette.visible
+            && !state.quick_open.visible
+            && !state.go_to_line.visible
+            && !state.branch_picker.visible
+            && !state.keybindings.visible
+            && !state.folder_picker.visible
+            && !state.save_as.visible
+            && !state.rename.visible
+            && !state.quit_modal.visible
+        {
+            // Inner area del editor (descontar bordes del Block + tab bar + breadcrumbs)
+            let inner_x = layout.editor_area.x + 1;
+            // +1 borde superior, +1 tab bar, +1 breadcrumbs = +3 desde editor_area.y
+            let chrome_offset: u16 = 2; // tab bar (1) + breadcrumbs (1)
+            let inner_y = layout.editor_area.y + 1 + chrome_offset;
+            let inner_h = layout.editor_area.height.saturating_sub(2 + chrome_offset) as usize;
+
+            let editor = state.tabs.active();
+            let scroll = editor.viewport.scroll_offset;
+            let cursor_line = editor.cursors.primary().position.line;
+            let cursor_col = editor.cursors.primary().position.col;
+
+            // Verificar que el cursor está dentro del viewport visible
+            if cursor_line >= scroll && cursor_line < scroll + inner_h {
+                let visual_row = (cursor_line - scroll) as u16;
+
+                // Gutter width: dígitos del total de líneas (mín 4) + separador (2)
+                let total_lines = editor.buffer.line_count();
+                let gutter_width = panels::digit_count(total_lines).max(4);
+                let separator_width: u16 = 2;
+                let text_offset = gutter_width as u16 + separator_width;
+
+                let abs_col = inner_x + text_offset + cursor_col as u16;
+                let abs_row = inner_y + visual_row;
+
+                f.set_cursor_position((abs_col, abs_row));
+            }
+        }
+
+        // ── Bottom panel (solo cuando show_diff == false) ──
+        // Cuando el diff está activo, el bottom panel está incluido en diff_area.
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                &state.terminal,
+            );
+        }
     }
 
     // ── Status bar ──
@@ -241,6 +349,8 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         cursor_pos: &state.status_line,
         git_status: &git_status_str,
         encoding: "UTF-8",
+        scroll_pct: &state.status_pct,
+        terminal_visible: state.bottom_panel_visible,
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
 
@@ -253,6 +363,10 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         && !state.go_to_line.visible
         && !state.branch_picker.visible
         && !state.keybindings.visible
+        && !state.folder_picker.visible
+        && !state.save_as.visible
+        && !state.rename.visible
+        && !state.quit_modal.visible
     {
         // Hover tooltip
         if let Some(ref hover) = state.lsp.hover_content {
@@ -272,6 +386,33 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         }
     }
 
+    // ── Folder picker modal (máxima prioridad visual) ──
+    if state.folder_picker.visible {
+        projects_panel::render_folder_picker(f, &layout, theme, &state.folder_picker);
+    }
+
+    // ── Save As modal ──
+    if state.save_as.visible {
+        save_as_modal::render_save_as_modal(
+            f,
+            &layout,
+            &state.save_as,
+            theme,
+            state.cursor_visible,
+        );
+    }
+
+    // ── Rename modal ──
+    if state.rename.visible {
+        rename_modal::render_rename_modal(
+            f,
+            &layout,
+            &state.rename,
+            theme,
+            state.cursor_visible,
+        );
+    }
+
     // ── Overlays ──
     // Prioridad: Go to Line > Settings > Branch picker > Quick open > Palette.
     // Clear + dibujo garantizan que el overlay tape lo que hay debajo.
@@ -286,9 +427,31 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     } else if state.branch_picker.visible {
         branch_picker::render_branch_picker(f, &layout, &state.branch_picker, theme);
     } else if state.quick_open.visible {
-        quick_open::render_quick_open(f, &layout, &state.quick_open, theme);
+        let active_file_name = state.tabs.active().buffer.file_path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("[sin archivo]");
+        quick_open::render_quick_open(f, &layout, &state.quick_open, theme, active_file_name, state.cursor_visible);
     } else if state.palette.visible {
         palette::render_palette(f, &layout, &state.palette, &state.commands, theme);
+    }
+
+    // ── Quit modal (después de rename_modal, antes del context menu) ──
+    // Cuenta de buffers dirty pre-computada acá — el render no aloca.
+    if state.quit_modal.visible {
+        let dirty_count = state
+            .tabs
+            .editors()
+            .iter()
+            .filter(|e| e.diff_view.is_none() && e.buffer.is_dirty())
+            .count();
+        quit_modal::render_quit_modal(f, area, theme, &state.quit_modal, dirty_count);
+    }
+
+    // ── Context menu (z-order máximo — tapa todo) ──
+    // Se renderiza DESPUÉS de todos los overlays para aparecer encima de cualquier cosa.
+    if state.context_menu.visible {
+        context_menu::render_context_menu(f, area, &state.context_menu, theme);
     }
 }
 
@@ -452,7 +615,7 @@ pub fn render_loading(
 /// En cualquier otro caso, default a Explorer.
 fn sidebar_active_panel(focused: PanelId) -> PanelId {
     match focused {
-        PanelId::Explorer | PanelId::Git | PanelId::Search => focused,
+        PanelId::Explorer | PanelId::Git | PanelId::Search | PanelId::Projects => focused,
         _ => PanelId::Explorer,
     }
 }

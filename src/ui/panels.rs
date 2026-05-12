@@ -25,7 +25,7 @@ use crate::editor::tabs::TabInfo;
 use crate::editor::EditorState;
 use crate::lsp;
 use crate::ui::theme::Theme;
-use crate::workspace::explorer::{ExplorerState, FlatEntry};
+use crate::explorer::{ExplorerState, FlatEntry};
 
 // ─── StatusBarData ─────────────────────────────────────────────────────────────
 
@@ -43,6 +43,59 @@ pub struct StatusBarData<'a> {
     pub git_status: &'a str,
     /// Encoding del archivo activo.
     pub encoding: &'a str,
+    /// Porcentaje de scroll en el archivo (ej: "18%"). Pre-formateado fuera del render.
+    pub scroll_pct: &'a str,
+    /// Si el panel inferior (terminal) está visible — controla el estado visual del botón
+    /// terminal toggle (colores invertidos cuando está activo).
+    pub terminal_visible: bool,
+}
+
+/// Ancho fijo del botón terminal toggle: "[>_]" = 4 celdas.
+pub const TERMINAL_BUTTON_WIDTH: u16 = 4;
+/// Espacio (1 celda) que separa el botón terminal de la indicación de encoding.
+const TERMINAL_BUTTON_SEPARATOR: u16 = 1;
+/// Espacio (2 celdas) que separa la indicación de encoding del bloque amber.
+const ENCODING_AMBER_SEPARATOR: u16 = 2;
+/// Espacio (1 celda) inicial del bloque amber.
+const AMBER_LEADING_SPACE: u16 = 1;
+/// Espacio (2 celdas) entre cursor_pos y scroll_pct dentro del bloque amber.
+const AMBER_INNER_SEPARATOR: u16 = 2;
+/// Espacio (1 celda) final del bloque amber.
+const AMBER_TRAILING_SPACE: u16 = 1;
+
+/// Calcula el rect absoluto donde se renderiza el botón terminal toggle dentro
+/// de la status bar. El botón se ubica flush right, ANTES del indicador UTF-8.
+///
+/// Layout right-flushed (de izquierda a derecha):
+///   `["[>_]"][1 sp bg][encoding][2 sp bg][" cursor_pos  scroll_pct "]`
+///
+/// `status_bar_area` es el Rect absoluto de la status bar (típicamente la última fila
+/// del frame). `data` es necesario para calcular los anchos del bloque amber y encoding.
+///
+/// Pure function — no IO, no allocations.
+pub fn terminal_button_rect(status_bar_area: Rect, data: &StatusBarData<'_>) -> Rect {
+    // Ancho del bloque amber: " {cursor_pos}  {scroll_pct} "
+    let amber_block_width = AMBER_LEADING_SPACE
+        + data.cursor_pos.len() as u16
+        + AMBER_INNER_SEPARATOR
+        + data.scroll_pct.len() as u16
+        + AMBER_TRAILING_SPACE;
+
+    let encoding_width = data.encoding.len() as u16;
+
+    // Total que ocupan los elementos a la derecha del botón (incluyendo separadores)
+    let right_of_button_width =
+        TERMINAL_BUTTON_SEPARATOR + encoding_width + ENCODING_AMBER_SEPARATOR + amber_block_width;
+
+    // Ancho total derecha (incluyendo el botón)
+    let total_right_width = TERMINAL_BUTTON_WIDTH + right_of_button_width;
+
+    // Posición x del botón: flush right
+    let button_x = status_bar_area
+        .x
+        .saturating_add(status_bar_area.width.saturating_sub(total_right_width));
+
+    Rect::new(button_x, status_bar_area.y, TERMINAL_BUTTON_WIDTH, 1)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -150,6 +203,10 @@ pub fn render_activity_bar(
             " S ",
             active_section == SidebarSection::Search && !settings_active,
         ),
+        (
+            " P ",
+            active_section == SidebarSection::Projects && !settings_active,
+        ),
     ];
 
     // Construir líneas: iconos en la parte superior, settings en la parte inferior
@@ -205,6 +262,7 @@ pub fn render_sidebar(
         PanelId::Explorer => "EXPLORER",
         PanelId::Git => "SOURCE CONTROL",
         PanelId::Search => "SEARCH",
+        PanelId::Projects => "PROJECTS",
         _ => "EXPLORER",
     };
 
@@ -238,7 +296,70 @@ pub fn render_sidebar(
             &owned_flat
         }
     };
-    let visible_height = inner.height as usize;
+
+    // ── Input modal inline: si hay un input activo, ocupa la primera fila ──
+    // Estilo VS Code: el input aparece como una fila extra en el árbol mientras
+    // el usuario escribe el nombre. Se muestra con un icono indicativo y un
+    // cursor visible al final del texto.
+    let input_active = explorer.new_file_input.is_some() || explorer.new_folder_input.is_some();
+    let (header_height, input_label, input_text, input_icon) = if let Some(ref name) =
+        explorer.new_file_input
+    {
+        // " " para el icono — mismo ancho (2 celdas) que los iconos de archivo
+        (1u16, "New file:", name.as_str(), " ")
+    } else if let Some(ref name) = explorer.new_folder_input {
+        (1u16, "New folder:", name.as_str(), " ")
+    } else {
+        (0u16, "", "", "")
+    };
+
+    if input_active && header_height > 0 && inner.height > 0 {
+        let input_row = Rect::new(inner.x, inner.y, inner.width, 1);
+        let label_style = Style::default()
+            .fg(theme.fg_accent)
+            .bg(theme.bg_active)
+            .add_modifier(Modifier::BOLD);
+        let text_style = Style::default().fg(theme.fg_primary).bg(theme.bg_active);
+        let cursor_style = Style::default()
+            .fg(theme.fg_accent)
+            .bg(theme.bg_active)
+            .add_modifier(Modifier::REVERSED);
+
+        // Spans del input: " <icon> New file: <text>▎"
+        // CLONE: necesario — text es un slice del input owned por el explorer,
+        // Span toma ownership. Se renderiza solo cuando el modal está activo (rare),
+        // no en hot path.
+        let mut spans: Vec<Span<'_>> = Vec::with_capacity(6);
+        spans.push(Span::styled(" ", label_style));
+        spans.push(Span::styled(input_icon, label_style));
+        spans.push(Span::styled(" ", label_style));
+        spans.push(Span::styled(input_label, label_style));
+        spans.push(Span::styled(" ", label_style));
+        spans.push(Span::styled(input_text.to_string(), text_style));
+        // Cursor block al final
+        spans.push(Span::styled(" ", cursor_style));
+
+        let p = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg_active));
+        f.render_widget(p, input_row);
+    }
+
+    // Área restante para el árbol normal
+    let tree_area = if input_active {
+        Rect::new(
+            inner.x,
+            inner.y + header_height,
+            inner.width,
+            inner.height.saturating_sub(header_height),
+        )
+    } else {
+        inner
+    };
+
+    if tree_area.height == 0 {
+        return;
+    }
+
+    let visible_height = tree_area.height as usize;
     let scroll = explorer.scroll_offset;
 
     // Viewport virtual: solo las entries visibles
@@ -251,24 +372,32 @@ pub fn render_sidebar(
             render_explorer_entry(
                 entry,
                 scroll + i == explorer.selected_index,
-                inner.width as usize,
+                focused,
+                tree_area.width as usize,
                 theme,
             )
         })
         .collect();
 
     let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
-    f.render_widget(paragraph, inner);
+    f.render_widget(paragraph, tree_area);
 }
 
 /// Renderiza una entrada del explorer como una `Line` de ratatui.
 ///
 /// Incluye icono por extensión con color semántico antes del nombre.
 /// No aloca `format!()` — construye spans directamente.
-/// El highlight de selección usa `bg_active` del theme.
+///
+/// El highlight de selección es contextual:
+/// - Panel con foco + entry seleccionado → fondo cyan brillante (`fg_accent`)
+///   con texto oscuro — máxima visibilidad para navegación con teclado
+/// - Panel sin foco + entry seleccionado → fondo `bg_active` sutil — memoria
+///   de la última posición sin distraer
+/// - No seleccionado → fondo normal del panel (`bg_secondary`)
 fn render_explorer_entry<'a>(
     entry: &FlatEntry,
     selected: bool,
+    panel_focused: bool,
     max_width: usize,
     theme: &'a Theme,
 ) -> Line<'a> {
@@ -294,13 +423,25 @@ fn render_explorer_entry<'a>(
     let name_max = max_width.saturating_sub(prefix_len);
     let display_name = crate::ui::truncate_str(&entry.name, name_max);
 
-    // Estilo base según tipo y selección
-    let bg = if selected {
-        theme.bg_active
+    // Estilo base según tipo y selección.
+    // Background:
+    // - Focused + selected → cyan (highly visible cursor-like highlight)
+    // - Unfocused + selected → bg_active (subtle memory of position)
+    // - Not selected → bg_secondary (normal panel bg)
+    let bg = if selected && panel_focused {
+        theme.fg_accent // #00d4ff cyan — máxima visibilidad
+    } else if selected {
+        theme.bg_active // #121821 — memoria sutil
     } else {
-        theme.bg_secondary
+        theme.bg_secondary // #0d1117 — fondo normal
     };
-    let fg = if entry.is_dir {
+
+    // Foreground:
+    // - Focused + selected → dark text on cyan bg for max contrast
+    // - Otherwise → directory accent color or primary text
+    let fg = if selected && panel_focused {
+        theme.bg_primary // #0a0e14 dark text on cyan
+    } else if entry.is_dir {
         theme.fg_accent
     } else {
         theme.fg_primary
@@ -369,8 +510,21 @@ pub fn render_editor_area(
         return;
     }
 
-    // ── Tab bar (1) + Breadcrumbs (1) + Content (resto) ──
-    let (tab_bar_area, breadcrumbs_area, content_area) = {
+    // ── Tab bar (1) + Breadcrumbs (1) + Content (resto) [+ Search bar (1)] ──
+    // Si hay un file search activo, se reserva 1 línea al final para el search bar.
+    let search_visible = editor.search.is_some();
+    let (tab_bar_area, breadcrumbs_area, content_area, search_bar_area) = if search_visible {
+        let split = Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // tab bar
+                Constraint::Length(1), // breadcrumbs
+                Constraint::Fill(1),   // editor content
+                Constraint::Length(1), // search bar
+            ])
+            .split(inner);
+        (split[0], split[1], split[2], Some(split[3]))
+    } else {
         let split = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -379,10 +533,18 @@ pub fn render_editor_area(
                 Constraint::Fill(1),   // editor content
             ])
             .split(inner);
-        (split[0], split[1], split[2])
+        (split[0], split[1], split[2], None)
     };
     render_tab_bar(f, tab_bar_area, theme, tab_infos);
     render_breadcrumbs(f, breadcrumbs_area, theme, file_path, workspace_root);
+
+    // Renderizar search bar SIEMPRE que esté activo, incluso si no hay contenido.
+    // Lo hacemos antes del early-return del placeholder.
+    if let Some(area) = search_bar_area
+        && let Some(ref s) = editor.search
+    {
+        render_file_search_bar(f, area, theme, s);
+    }
 
     let inner = content_area;
     if inner.height == 0 || inner.width == 0 {
@@ -452,6 +614,18 @@ pub fn render_editor_area(
         .map(|(_, c)| c.position)
         .collect();
 
+    // ── Pre-computar matches de file search para el viewport ──
+    // (start_col, end_col, is_active_match) por línea — se filtra dentro del loop
+    let search_matches_for_viewport: Option<(&crate::editor::search::BufferSearch, Style, Style)> =
+        editor.search.as_ref().map(|s| {
+            let inactive = Style::default().bg(theme.search_match).fg(Color::Rgb(220, 200, 100));
+            let active = Style::default()
+                .bg(theme.search_match_active)
+                .fg(Color::Rgb(20, 15, 0))
+                .add_modifier(Modifier::BOLD);
+            (s, inactive, active)
+        });
+
     // Estilos pre-computados — sin allocaciones
     let gutter_style = Style::default().fg(theme.line_number).bg(theme.bg_primary);
     let gutter_active_style = Style::default()
@@ -466,9 +640,13 @@ pub fn render_editor_area(
     let active_line_bg = Color::Rgb(16, 20, 28);
     let text_active_style = Style::default().fg(theme.fg_primary).bg(active_line_bg);
     let selection_style = Style::default().fg(theme.fg_primary).bg(theme.selection);
+    // Cursor secundario: bloque sólido cyan con texto oscuro encima.
+    // Usamos colores explícitos (NO REVERSED) para evitar que el resultado
+    // dependa del color subyacente — en zonas con tokens cyan el REVERSED
+    // hacía invisible el cursor.
     let secondary_cursor_style = Style::default()
-        .fg(theme.fg_accent)
-        .add_modifier(Modifier::REVERSED);
+        .fg(Color::Rgb(10, 14, 20))       // #0a0e14 — texto oscuro (= bg_primary)
+        .bg(theme.fg_accent);              // #00d4ff — cyan eléctrico (= cursor color)
     // Estilos de diagnóstico (subrayado con color de severidad)
     let diag_error_style = Style::default()
         .fg(theme.fg_error)
@@ -591,7 +769,17 @@ pub fn render_editor_area(
             let unmatched_bracket_at: Option<usize> = if bracket_match.is_none() {
                 // Verificar si el cursor está en esta línea y sobre un bracket
                 if buf_line_idx == primary_cursor_line {
-                    let ch = line_content.chars().nth(cursor_col);
+                    // cursor_col es BYTE offset; usamos slicing + .next() para
+                    // obtener el char en O(1) sin iterar como hace .nth(N).
+                    // Verificamos boundary para evitar panic si el cursor cayera
+                    // en medio de un multi-byte (no debería, pero defensivo).
+                    let ch = if cursor_col < line_content.len()
+                        && line_content.is_char_boundary(cursor_col)
+                    {
+                        line_content[cursor_col..].chars().next()
+                    } else {
+                        None
+                    };
                     if ch.is_some_and(crate::editor::brackets::is_bracket) {
                         Some(cursor_col)
                     } else {
@@ -606,6 +794,29 @@ pub fn render_editor_area(
 
             let has_guides = !guide_cols.is_empty();
             let has_brackets = bracket_at.is_some() || unmatched_bracket_at.is_some();
+
+            // ── Search match ranges para esta línea ──
+            // (start_col, end_col, is_active_match) — coords absolutas de columna
+            let line_search_ranges: Vec<(usize, usize, bool)> =
+                if let Some((s, _, _)) = search_matches_for_viewport {
+                    s.matches
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.line == buf_line_idx)
+                        .map(|(idx, m)| {
+                            let is_active = s.current_match == Some(idx);
+                            (m.start_col, m.end_col, is_active)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let (search_inactive_style, search_active_style) =
+                if let Some((_, inactive, active)) = search_matches_for_viewport {
+                    (inactive, active)
+                } else {
+                    (Style::default(), Style::default())
+                };
 
             // ── Renderizar texto con selecciones, cursores, diagnósticos, guides y brackets ──
             if !display_text.is_empty() {
@@ -696,6 +907,9 @@ pub fn render_editor_area(
                                 unmatched_bracket_at,
                                 bracket_style,
                                 bracket_unmatched_style,
+                                &line_search_ranges,
+                                search_inactive_style,
+                                search_active_style,
                             );
                             spans.extend(text_spans);
                         }
@@ -732,6 +946,9 @@ pub fn render_editor_area(
                             unmatched_bracket_at,
                             bracket_style,
                             bracket_unmatched_style,
+                            &line_search_ranges,
+                            search_inactive_style,
+                            search_active_style,
                         );
                         spans.extend(text_spans);
                     }
@@ -768,6 +985,9 @@ pub fn render_editor_area(
                         None,
                         bracket_style,
                         bracket_unmatched_style,
+                        &line_search_ranges,
+                        search_inactive_style,
+                        search_active_style,
                     );
                     spans.extend(text_spans);
                 }
@@ -799,6 +1019,22 @@ pub fn render_editor_area(
                     spans.push(Span::styled("\u{2502}", guide_style));
                     col = guide_col + 1;
                 }
+            }
+
+            // ── Cursor secundario en línea vacía ──
+            //
+            // Si la línea no tiene texto (display_text.is_empty()) y hay un
+            // cursor secundario en esta línea del buffer, agregar un bloque
+            // visible. El branch principal de arriba (línea con texto) ya
+            // delega esto a render_line_with_selections; este bloque cubre el
+            // caso donde la línea es completamente vacía y nunca llamó a
+            // render_line_with_selections.
+            if display_text.is_empty()
+                && secondary_cursor_positions
+                    .iter()
+                    .any(|p| p.line == buf_line_idx)
+            {
+                spans.push(Span::styled(" ", secondary_cursor_style));
             }
 
             lines.push(Line::from(spans));
@@ -863,9 +1099,27 @@ fn render_line_with_selections<'a>(
     unmatched_bracket_at: Option<usize>,
     bracket_style: Style,
     bracket_unmatched_style: Style,
+    // Ranges de search matches: (start_col, end_col, is_active). Coords absolutas.
+    search_ranges: &[(usize, usize, bool)],
+    search_match_style: Style,
+    search_match_active_style: Style,
 ) -> Vec<Span<'a>> {
     let text_len = text.len();
+
+    // Bug #2 fix (caso línea vacía): si text está vacío pero hay un cursor
+    // secundario en esta línea, debemos pintar un espacio reversed para
+    // que el cursor sea visible. De otro modo el cursor desaparece en líneas
+    // vacías. Nota: col_offset puede ser > 0 cuando hay indent guides, pero el
+    // cursor secundario en una línea vacía siempre está en col == 0 del buffer —
+    // comparamos solo por line_idx para cubrir ambos casos.
     if text_len == 0 {
+        let has_cursor_on_empty_line = secondary_cursors
+            .iter()
+            .any(|p| p.line == line_idx);
+        if has_cursor_on_empty_line {
+            // CLONE: necesario — Span requiere ownership del char espacio
+            return vec![Span::styled(" ".to_string(), cursor_style)];
+        }
         return vec![];
     }
 
@@ -894,12 +1148,24 @@ fn render_line_with_selections<'a>(
         }
     }
 
-    // Columnas con cursores secundarios (ajustadas a espacio local)
+    // Columnas con cursores secundarios (ajustadas a espacio local).
+    //
+    // Bug #2 fix: el filtro usa `<=` (no `<`) para incluir cursores en EOL
+    // (col == col_offset + text_len). El bucle char-by-char no produce un span
+    // para esa posición porque no hay char ahí, así que abajo agregamos un
+    // span extra con un espacio reversed al final si has_eol_cursor.
     let cursor_cols: Vec<usize> = secondary_cursors
         .iter()
-        .filter(|p| p.line == line_idx && p.col >= col_offset && p.col < col_offset + text_len)
+        .filter(|p| p.line == line_idx && p.col >= col_offset && p.col <= col_offset + text_len)
         .map(|p| p.col - col_offset)
         .collect();
+
+    // Indicador: ¿hay un cursor secundario exactamente en EOL?
+    // Si lo hay, agregaremos un span con un espacio reversed al final del
+    // resultado para que sea visible.
+    let has_eol_cursor = secondary_cursors
+        .iter()
+        .any(|p| p.line == line_idx && p.col == col_offset + text_len);
 
     // Columna de bracket match en esta línea (ajustada a espacio local)
     let local_bracket_col: Option<(usize, Style)> = bracket_at
@@ -920,14 +1186,28 @@ fn render_line_with_selections<'a>(
             })
         });
 
+    // Ajustar search ranges al espacio local del texto (restar col_offset)
+    let local_search_ranges: Vec<(usize, usize, bool)> = search_ranges
+        .iter()
+        .filter_map(|&(start, end, active)| {
+            let local_start = start.saturating_sub(col_offset).min(text_len);
+            let local_end = end.saturating_sub(col_offset).min(text_len);
+            if local_start < local_end { Some((local_start, local_end, active)) } else { None }
+        })
+        .collect();
+
     let has_overlays = !selected_ranges.is_empty()
         || !cursor_cols.is_empty()
         || !diagnostics.is_empty()
-        || local_bracket_col.is_some();
+        || local_bracket_col.is_some()
+        || !local_search_ranges.is_empty();
 
     // ── Fast path: highlight tokens sin overlays ──
     // Renderizar directamente los tokens coloreados sin char-by-char iteration.
-    if !has_overlays {
+    // Excluimos el fast path si hay un cursor EOL secundario — necesitamos
+    // agregar el span extra de espacio reversed y eso requiere retornar un Vec
+    // mutable, no el fast path inmutable.
+    if !has_overlays && !has_eol_cursor {
         if let Some(tokens) = highlight_tokens {
             return render_highlight_tokens_fast(
                 tokens,
@@ -978,6 +1258,9 @@ fn render_line_with_selections<'a>(
         is_cursor_line,
         active_line_bg,
         local_bracket_col,
+        &local_search_ranges,
+        search_match_style,
+        search_match_active_style,
     );
 
     for &byte_offset in char_boundaries.iter().skip(1) {
@@ -996,6 +1279,9 @@ fn render_line_with_selections<'a>(
             is_cursor_line,
             active_line_bg,
             local_bracket_col,
+            &local_search_ranges,
+            search_match_style,
+            search_match_active_style,
         );
 
         if style != current_style {
@@ -1016,6 +1302,17 @@ fn render_line_with_selections<'a>(
             // CLONE: necesario — segment es slice del buffer
             result.push(Span::styled(segment.to_string(), current_style));
         }
+    }
+
+    // Bug #2 fix: si hay un cursor secundario exactamente en EOL, agregar un
+    // span con un espacio reversed para que sea visible. El bucle char-by-char
+    // no produce un span para esa posición porque no hay char en EOL — el
+    // texto termina antes. Sin este span extra, el cursor en EOL queda invisible
+    // tanto en líneas más cortas que el primary como en líneas con el cursor
+    // pegado al final (col == text_len).
+    if has_eol_cursor {
+        // CLONE: necesario — Span requiere ownership del char espacio
+        result.push(Span::styled(" ".to_string(), cursor_style));
     }
 
     result
@@ -1177,6 +1474,9 @@ fn char_style_with_highlight(
     is_cursor_line: bool,
     active_line_bg: Color,
     local_bracket_col: Option<(usize, Style)>,
+    search_ranges: &[(usize, usize, bool)],
+    search_match_style: Style,
+    search_match_active_style: Style,
 ) -> Style {
     // Cursor secundario tiene prioridad visual máxima
     if cursor_cols.contains(&col) {
@@ -1205,11 +1505,18 @@ fn char_style_with_highlight(
         normal_style
     };
 
-    // Selección: override background, mantener foreground (syntax)
+    // Selección: override completo (máxima prioridad visual después de cursor)
     for &(start, end) in selected_ranges {
         if col >= start && col < end {
             style = style.bg(selection_style.bg.unwrap_or(Color::Reset));
             return style;
+        }
+    }
+
+    // Search match: highlight de fondo — activo más brillante, otros más suaves
+    for &(start, end, is_active) in search_ranges {
+        if col >= start && col < end {
+            return if is_active { search_match_active_style } else { search_match_style };
         }
     }
 
@@ -1233,6 +1540,262 @@ fn char_style_with_highlight(
     }
 
     style
+}
+
+// ─── File Search Bar ───────────────────────────────────────────────────────────
+
+/// Renderiza el search bar inline del editor (Ctrl+F).
+///
+/// Layout: ` 🔍 query_text▎     N/M  [Esc]`
+/// - Aparece como una franja de 1 línea al pie del editor area.
+/// - Muestra el query con cursor visible al final.
+/// - Muestra el contador `N/M` (match actual / total).
+/// - Hint de cierre con `[Esc]` al final.
+///
+/// Pre-computa los strings necesarios fuera del `render_widget` con un buffer
+/// reutilizable para el contador. Sin allocaciones repetidas en el hot path
+/// — el contador usa `write!` sobre un `String` capacitado.
+fn render_file_search_bar(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    search: &crate::editor::search::BufferSearch,
+) {
+    use std::fmt::Write;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // Estilos
+    let bg = theme.bg_active;
+    let label_style = Style::default()
+        .fg(theme.fg_accent)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.fg_primary).bg(bg);
+    let cursor_style = Style::default()
+        .fg(theme.fg_accent)
+        .bg(bg)
+        .add_modifier(Modifier::REVERSED);
+    let counter_style = Style::default().fg(theme.fg_secondary).bg(bg);
+    let hint_style = Style::default().fg(theme.fg_secondary).bg(bg);
+
+    // Pre-computar contador "N/M" en buffer local — máx ~16 chars, una alocación.
+    // Esta fila se renderiza solo cuando el search está activo (no es hot path).
+    let mut counter = String::with_capacity(16);
+    let total = search.match_count();
+    if total == 0 {
+        if !search.query.is_empty() {
+            counter.push_str("No results");
+        }
+    } else {
+        let current = search.current_match.map(|i| i + 1).unwrap_or(1);
+        let _ = write!(counter, "{}/{}", current, total);
+    }
+
+    // Indicador de case sensitive
+    let case_indicator = if search.case_sensitive { " Aa " } else { "    " };
+
+    // Construir la línea con spans. El layout es horizontal:
+    //   " [search-icon] query_text [cursor]   [counter]  [case]  [hint] "
+    // CLONE: query y counter se envuelven en Span — los spans necesitan ownership
+    // del String para vivir más allá del render. Solo se ejecuta cuando el search
+    // está visible, fuera del hot path.
+    let spans = vec![
+        Span::styled(" ", label_style),
+        Span::styled("\u{1F50D}", label_style), // 🔍
+        Span::styled(" ", label_style),
+        Span::styled(search.query.clone(), text_style),
+        Span::styled(" ", cursor_style), // cursor block
+        Span::styled("  ", text_style),
+        Span::styled(counter, counter_style),
+        Span::styled("  ", text_style),
+        Span::styled(case_indicator, hint_style),
+        Span::styled(" [Esc] [Enter:next] [\u{21E7}+Enter:prev] [Alt+C:case]", hint_style),
+    ];
+
+    let p = Paragraph::new(Line::from(spans)).style(Style::default().bg(bg));
+    f.render_widget(p, area);
+}
+
+// ─── Diff Tab Render ───────────────────────────────────────────────────────────
+
+/// Renderiza una tab virtual de diff/file en el área del editor.
+///
+/// Layout: tab bar (1) + footer (1) + contenido del diff (resto).
+/// No incluye gutter ni syntax highlighting — el contenido ya viene
+/// pre-formateado y se colorea por línea (diff: +/-/@@) o crudo (file).
+///
+/// Pre-computa todas las líneas fuera de `render_widget`. Sin allocaciones
+/// dentro del draw pass salvo las inevitables de `Span::styled`.
+pub fn render_diff_tab(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    editor: &EditorState,
+    tab_infos: &[TabInfo],
+) {
+    let block =
+        panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Layout: tab bar (1) + content (fill) + footer (1)
+    let split = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // contenido del diff
+            Constraint::Length(1), // footer con atajos
+        ])
+        .split(inner);
+    let tab_bar_area = split[0];
+    let content_area = split[1];
+    let footer_area = split[2];
+
+    render_tab_bar(f, tab_bar_area, theme, tab_infos);
+
+    // Si la tab no es diff (caller equivocado) o no hay diff_view, salir.
+    let Some(ref dv) = editor.diff_view else {
+        return;
+    };
+
+    if content_area.height > 0 && content_area.width > 0 {
+        let content_height = content_area.height as usize;
+        let max_width = content_area.width as usize;
+
+        // Pre-computar líneas fuera de render_widget — char-by-char ya está en
+        // render_diff_line. dv.content.lines() no aloca (yields &str).
+        let lines: Vec<Line<'_>> = dv
+            .content
+            .lines()
+            .skip(dv.scroll_offset)
+            .take(content_height)
+            .map(|line| crate::ui::git_panel::render_diff_line(line, max_width, theme))
+            .collect();
+
+        let p = Paragraph::new(lines).style(Style::default().bg(theme.bg_primary));
+        f.render_widget(p, content_area);
+    }
+
+    // Footer con atajos — texto estático, cero allocaciones
+    if footer_area.height > 0 {
+        let footer_line = Line::from(Span::styled(
+            " [\u{2191}\u{2193}/jk] Scroll   [Ctrl+W] Cerrar tab",
+            Style::default().fg(theme.fg_secondary).bg(theme.bg_active),
+        ));
+        let p = Paragraph::new(footer_line).style(Style::default().bg(theme.bg_active));
+        f.render_widget(p, footer_area);
+    }
+}
+
+// ─── Image Tab ─────────────────────────────────────────────────────────────────
+
+/// Renderiza una tab virtual de imagen (read-only, async-decoded).
+///
+/// Toma `&mut EditorState` porque `StatefulImage` requiere `&mut` sobre el
+/// `StatefulProtocol` (re-encoda en cada resize). Esto NO viola la regla
+/// de "zero allocations en render loop" — la re-encodificación ocurre solo
+/// cuando el area cambia de tamaño, no en cada frame.
+///
+/// Comportamiento:
+/// - `image_view = None`: la decode async todavía no terminó → spinner estático.
+/// - `image_view = Some` con `error = Some`: renderiza el mensaje de error.
+/// - `image_view = Some` con `error = None`: render del protocol via `StatefulImage`.
+///
+/// Estructura visual (paralela a `render_diff_tab`):
+///   - tab bar (1 fila)
+///   - content (fill — imagen / error / loading)
+///   - footer con atajos (1 fila)
+pub fn render_image_tab(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    editor: &mut EditorState,
+    tab_infos: &[TabInfo],
+) {
+    use ratatui_image::StatefulImage;
+
+    let block =
+        panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Layout: tab bar (1) + content (fill) + footer (1) — idéntico a render_diff_tab.
+    let split = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // contenido de la imagen
+            Constraint::Length(1), // footer con atajos
+        ])
+        .split(inner);
+    let tab_bar_area = split[0];
+    let content_area = split[1];
+    let footer_area = split[2];
+
+    render_tab_bar(f, tab_bar_area, theme, tab_infos);
+
+    // ── Contenido ──
+    if content_area.height > 0 && content_area.width > 0 {
+        match editor.image_view.as_mut() {
+            None => {
+                // Decode async todavía en curso — placeholder estático.
+                // Texto literal `'static` → cero allocations.
+                let para = Paragraph::new("Loading image...")
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(theme.fg_secondary)
+                            .bg(theme.bg_primary),
+                    );
+                f.render_widget(para, content_area);
+            }
+            Some(iv) if iv.error.is_some() => {
+                // Mensaje de error inline. `as_str()` evita clonar el String.
+                // `iv.error` siempre es Some aquí por el match guard.
+                let error_msg = iv.error.as_deref().unwrap_or("error desconocido");
+                let para = Paragraph::new(error_msg)
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(theme.fg_warning)
+                            .bg(theme.bg_primary),
+                    );
+                f.render_widget(para, content_area);
+            }
+            Some(iv) => {
+                // Render del protocolo. `StatefulImage::new()` es stateless
+                // (es solo el descriptor del widget). El estado real vive en
+                // `iv.protocol`, que el widget muta para re-encodear en resize.
+                // En ratatui-image v8 `new()` no toma argumentos (la versión
+                // del prompt original era para v11).
+                let image = StatefulImage::new();
+                f.render_stateful_widget(image, content_area, &mut iv.protocol);
+            }
+        }
+    }
+
+    // Footer con atajos — texto estático, cero allocaciones.
+    if footer_area.height > 0 {
+        let footer_line = Line::from(Span::styled(
+            " [Ctrl+W] Cerrar tab   [Ctrl+Tab] Siguiente tab",
+            Style::default().fg(theme.fg_secondary).bg(theme.bg_active),
+        ));
+        let p = Paragraph::new(footer_line).style(Style::default().bg(theme.bg_active));
+        f.render_widget(p, footer_area);
+    }
 }
 
 // ─── Tab Bar ───────────────────────────────────────────────────────────────────
@@ -1463,30 +2026,36 @@ pub(crate) fn digit_count(n: usize) -> usize {
 
 // ─── Bottom Panel ──────────────────────────────────────────────────────────────
 
-/// Renderiza el panel inferior con output real del terminal.
+/// Renderiza el panel inferior con terminal(es) multi-pane.
 ///
-/// Si hay una sesión activa, muestra las líneas visibles del scrollback.
-/// Si no hay sesión, muestra un placeholder con instrucciones.
-/// Borde refleja estado de foco (Double/cyan cuando enfocado).
+/// Itera sobre todos los panes del `TerminalState`:
+/// - Para cada pane, usa `build_lines()` para pre-computar las líneas
+///   con colores ANSI reales (fg, bg, bold, italic, etc.)
+/// - El pane activo tiene borde con estilo highlight (accent color)
+/// - Si no hay panes, muestra un placeholder con instrucciones
+///
+/// `build_lines()` se llama FUERA del render_widget — cero allocaciones
+/// durante el draw pass de ratatui.
 pub fn render_bottom_panel(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
     focused: bool,
-    session: Option<&crate::terminal::session::TerminalSession>,
+    terminal: &crate::terminal::TerminalState,
 ) {
-    let block =
-        panel_block("TERMINAL", focused, theme).style(Style::default().bg(theme.bg_secondary));
+    use crate::terminal::renderer::build_lines;
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    if !terminal.has_session() {
+        // Sin panes — render bloque con placeholder
+        let block =
+            panel_block("TERMINAL", focused, theme).style(Style::default().bg(theme.bg_secondary));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
 
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
 
-    let Some(session) = session else {
-        // Sin sesión — mostrar placeholder con instrucciones
         let placeholder = Paragraph::new(Line::from(Span::styled(
             "  Press Ctrl+` to open terminal",
             Style::default().fg(theme.fg_secondary),
@@ -1494,27 +2063,82 @@ pub fn render_bottom_panel(
         .style(Style::default().bg(theme.bg_secondary));
         f.render_widget(placeholder, inner);
         return;
-    };
+    }
 
-    // Obtener líneas visibles del scrollback
-    let visible = session.visible_lines(inner.height as usize);
-    let max_width = inner.width as usize;
+    // Multi-pane: actualizar layout y renderizar cada pane en su rect.
+    // Cuando hay un solo pane, ocupa el area completa.
+    // Cuando hay múltiples, el tree calcula los rects individuales.
+    let active_id = terminal.active_pane;
 
-    // Construir líneas de ratatui — sin format!() en el loop
-    let lines: Vec<Line<'_>> = visible
-        .iter()
-        .map(|line| {
-            // Truncar línea al ancho del panel sin alocar — char-safe para multi-byte
-            let display = crate::ui::truncate_str(line, max_width);
-            Line::from(Span::styled(
-                display.to_string(), // CLONE: necesario — Span toma ownership, display es slice de session
-                Style::default().fg(theme.fg_primary),
-            ))
-        })
-        .collect();
+    if terminal.panes.len() == 1 {
+        // Fast path: un solo pane — usa el area completa
+        if let Some(pane) = terminal.panes.values().next() {
+            let is_active = Some(pane.id) == active_id;
+            let block = panel_block("TERMINAL", focused && is_active, theme)
+                .style(Style::default().bg(theme.bg_secondary));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
 
-    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
-    f.render_widget(paragraph, inner);
+            if inner.height == 0 || inner.width == 0 {
+                return;
+            }
+
+            // Pre-compute FUERA del render — build_lines extrae colores del grid
+            let lines = build_lines(
+                &pane.session.term,
+                inner.height as usize,
+                inner.width as usize,
+            );
+
+            let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
+            f.render_widget(paragraph, inner);
+        }
+    } else {
+        // Multi-pane: usar rects del tree
+        if let Some(tree) = &terminal.tree {
+            let mut rects: Vec<(crate::terminal::tree::PaneId, Rect)> =
+                Vec::with_capacity(terminal.panes.len());
+            tree.collect_rects(area, &mut rects);
+
+            for (id, rect) in &rects {
+                let Some(pane) = terminal.panes.get(id) else {
+                    continue;
+                };
+
+                let is_active = Some(*id) == active_id;
+
+                // Borde con estilo diferenciado para el pane activo
+                let pane_block = if is_active && focused {
+                    panel_block("TERMINAL", true, theme)
+                        .style(Style::default().bg(theme.bg_secondary))
+                } else {
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(theme.border_unfocused))
+                        .style(Style::default().bg(theme.bg_secondary))
+                };
+
+                let inner = pane_block.inner(*rect);
+                f.render_widget(pane_block, *rect);
+
+                if inner.height == 0 || inner.width == 0 {
+                    continue;
+                }
+
+                // Pre-compute FUERA del render
+                let lines = build_lines(
+                    &pane.session.term,
+                    inner.height as usize,
+                    inner.width as usize,
+                );
+
+                let paragraph =
+                    Paragraph::new(lines).style(Style::default().bg(theme.bg_secondary));
+                f.render_widget(paragraph, inner);
+            }
+        }
+    }
 }
 
 // ─── Status Bar ────────────────────────────────────────────────────────────────
@@ -1542,17 +2166,61 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, theme: &Theme, data: &Status
         ),
     ];
 
+    // Color naranja/amber para el bloque de posición — igual a las imágenes de referencia
+    let amber_bg = ratatui::style::Color::Rgb(229, 165, 10); // #e5a50a
+    let amber_fg = ratatui::style::Color::Rgb(15, 15, 15);   // casi negro — alta legibilidad
+
+    // Botón terminal toggle: estilo discreto gris.
+    // - Inactivo (terminal cerrado): gris oscuro con texto medio (sutil, no llama atención)
+    // - Activo (terminal visible): gris medio con texto blanco (claramente "pressed")
+    let (term_btn_bg, term_btn_fg) = if data.terminal_visible {
+        (
+            ratatui::style::Color::Rgb(75, 85, 99),    // #4b5563 gris medio (active)
+            ratatui::style::Color::Rgb(243, 244, 246), // #f3f4f6 texto blanco/claro
+        )
+    } else {
+        (
+            ratatui::style::Color::Rgb(45, 52, 65),    // #2d3441 gris oscuro (inactive)
+            ratatui::style::Color::Rgb(156, 163, 175), // #9ca3af gris medio (texto)
+        )
+    };
+
     let right_spans = vec![
+        // Botón terminal toggle: "[>_]" — 4 celdas
+        Span::styled("[", Style::default().fg(term_btn_fg).bg(term_btn_bg)),
         Span::styled(
-            data.cursor_pos,
-            Style::default().fg(theme.fg_primary).bg(theme.bg_status),
+            ">_",
+            Style::default()
+                .fg(term_btn_fg)
+                .bg(term_btn_bg)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default().bg(theme.bg_status)),
+        Span::styled("]", Style::default().fg(term_btn_fg).bg(term_btn_bg)),
+        // Separador entre botón y encoding
+        Span::styled(" ", Style::default().bg(theme.bg_status)),
         Span::styled(
             data.encoding,
             Style::default().fg(theme.fg_secondary).bg(theme.bg_status),
         ),
-        Span::styled(" ", Style::default().bg(theme.bg_status)),
+        Span::styled("  ", Style::default().bg(theme.bg_status)),
+        // Bloque naranja: "352:34  18%"
+        Span::styled(" ", Style::default().bg(amber_bg)),
+        Span::styled(
+            data.cursor_pos,
+            Style::default()
+                .fg(amber_fg)
+                .bg(amber_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default().bg(amber_bg)),
+        Span::styled(
+            data.scroll_pct,
+            Style::default()
+                .fg(amber_fg)
+                .bg(amber_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().bg(amber_bg)),
     ];
 
     // Layout horizontal: left flush, right flush
@@ -1781,4 +2449,103 @@ pub fn render_lsp_completions(
         .style(Style::default().bg(theme.bg_secondary));
 
     f.render_widget(paragraph, dropdown_area);
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_data<'a>(cursor_pos: &'a str, scroll_pct: &'a str, encoding: &'a str) -> StatusBarData<'a> {
+        StatusBarData {
+            mode: " NORMAL ",
+            git_status: "main",
+            encoding,
+            cursor_pos,
+            scroll_pct,
+            terminal_visible: false,
+        }
+    }
+
+    #[test]
+    fn terminal_button_rect_dimensions_are_fixed() {
+        let area = Rect::new(0, 23, 80, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        assert_eq!(btn.width, TERMINAL_BUTTON_WIDTH);
+        assert_eq!(btn.width, 4);
+        assert_eq!(btn.height, 1);
+        assert_eq!(btn.y, area.y);
+    }
+
+    #[test]
+    fn terminal_button_rect_positioned_left_of_encoding() {
+        // Layout right-flushed:
+        //   [" >_ " (4)][" " (1)]["UTF-8" (5)]["  " (2)][" 1:1  0% " (9)]
+        // Total right width = 4 + 1 + 5 + 2 + 9 = 21
+        // area.width = 80, so button_x = 0 + 80 - 21 = 59
+        let area = Rect::new(0, 23, 80, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        assert_eq!(btn.x, 59);
+        // Encoding starts at btn.x + button_width + separator = 59 + 4 + 1 = 64
+        // The 5 chars of "UTF-8" should fit before the amber block.
+    }
+
+    #[test]
+    fn terminal_button_rect_within_status_bar_bounds() {
+        let area = Rect::new(0, 23, 100, 1);
+        let data = make_data("352:34", "100%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // Button must be entirely inside the area
+        assert!(btn.x >= area.x);
+        assert!(btn.x + btn.width <= area.x + area.width);
+        assert_eq!(btn.y, area.y);
+    }
+
+    #[test]
+    fn terminal_button_rect_respects_x_offset() {
+        // status bar starts at x=10
+        let area = Rect::new(10, 5, 50, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // Total right width = 21, button_x = 10 + 50 - 21 = 39
+        assert_eq!(btn.x, 39);
+    }
+
+    #[test]
+    fn terminal_button_rect_clamps_when_area_too_small() {
+        // Status bar so narrow it can't fit everything → saturating_sub gives x = area.x
+        let area = Rect::new(0, 0, 5, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // total_right_width (21) > area.width (5) → button_x clamps to area.x
+        assert_eq!(btn.x, 0);
+        // Width is still 4, which extends beyond the area — caller is responsible
+        // for not rendering when the area is degenerate.
+        assert_eq!(btn.width, 4);
+    }
+
+    #[test]
+    fn terminal_button_rect_position_changes_with_longer_cursor_pos() {
+        let area = Rect::new(0, 0, 100, 1);
+        let short = make_data("1:1", "0%", "UTF-8");
+        let long = make_data("1234:567", "100%", "UTF-8");
+        let btn_short = terminal_button_rect(area, &short);
+        let btn_long = terminal_button_rect(area, &long);
+        // Longer cursor_pos shifts the button further left
+        assert!(btn_long.x < btn_short.x);
+    }
+
+    #[test]
+    fn terminal_button_rect_y_matches_area_y() {
+        // Button must be on the same row as the status bar
+        for y in [0u16, 5, 23, 100] {
+            let area = Rect::new(0, y, 80, 1);
+            let data = make_data("1:1", "0%", "UTF-8");
+            let btn = terminal_button_rect(area, &data);
+            assert_eq!(btn.y, y);
+        }
+    }
 }

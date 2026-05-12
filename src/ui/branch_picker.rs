@@ -15,8 +15,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::git::branch_picker::{BranchPicker, MAX_VISIBLE_ITEMS};
-use crate::git::commands::BranchInfo;
+use crate::source_control_git::branch_picker::{BranchPicker, MAX_VISIBLE_ITEMS};
+use crate::source_control_git::commands::BranchInfo;
 use crate::ui::layout::{self, IdeLayout};
 use crate::ui::theme::Theme;
 

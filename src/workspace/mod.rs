@@ -1,13 +1,13 @@
-//! Workspace: explorer de archivos, quick open, project manager, recientes.
+//! Workspace: quick open, rename y save-as.
 //!
-//! Gestiona la navegación del workspace: árbol lazy de archivos,
-//! lista de proyectos recientes, y el índice liviano de paths para
-//! quick open. Todo con refresh controlado y sin indexación agresiva.
+//! Modales auxiliares del workspace que sobreviven al refactor de
+//! `explorer/` y `projects/`. Se mantienen en este crate hasta el
+//! próximo refactor que los reubique en sus dominios definitivos.
 
-pub mod explorer;
-pub mod project;
 pub mod quick_open;
-pub mod tree;
+pub mod quit_modal;
+pub mod rename;
+pub mod save_as;
 
-pub use explorer::ExplorerState;
+// Re-exports de compatibilidad temporal (se moverán en refactor siguiente)
 pub use quick_open::QuickOpenState;

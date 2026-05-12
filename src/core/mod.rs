@@ -8,8 +8,11 @@
 
 pub mod budgets;
 pub mod command;
+pub mod file_types;
 pub mod ids;
 pub mod settings;
+
+pub use file_types::is_image_file;
 
 use std::path::PathBuf;
 
@@ -26,21 +29,25 @@ use crossterm::event::KeyEvent;
 /// Se van habilitando a medida que se implementan los subsistemas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Salir de la aplicación limpiamente.
+    /// Salir de la aplicación limpiamente sin chequear buffers dirty.
+    /// DEPRECADO: el flujo recomendado es `QuitRequested` → modal de confirmación.
+    /// Se conserva el handler en el reducer por si una integración externa lo emite.
+    #[expect(
+        dead_code,
+        reason = "kept as low-level escape hatch; UI usa QuitRequested + modal"
+    )]
     Quit,
     /// No-op: acción vacía que no produce cambios de estado.
     Noop,
 
     // ── Navegación ──
     /// Mover foco al siguiente panel en orden.
+    /// Enfocar el Explorer directamente — abre sidebar si estaba cerrada.
+    FocusExplorer,
     FocusNext,
     /// Mover foco al panel anterior en orden.
     FocusPrev,
     /// Mover foco a un panel específico.
-    #[expect(
-        dead_code,
-        reason = "se usará cuando se implemente navegación directa a paneles"
-    )]
     FocusPanel(PanelId),
 
     // ── Editor ──
@@ -57,29 +64,81 @@ pub enum Action {
     /// Mover cursor al final de la línea actual (End).
     MoveToLineEnd,
     /// Mover cursor al inicio absoluto del buffer (Ctrl+Home).
-    #[expect(
-        dead_code,
-        reason = "se habilitará cuando se agregue keybinding Ctrl+Home"
-    )]
     MoveToBufferStart,
     /// Mover cursor al final absoluto del buffer (Ctrl+End).
-    #[expect(
-        dead_code,
-        reason = "se habilitará cuando se agregue keybinding Ctrl+End"
-    )]
     MoveToBufferEnd,
     /// Deshacer la última operación de edición (Ctrl+Z).
     Undo,
     /// Rehacer la última operación deshecha (Ctrl+Y).
     Redo,
 
+    /// Mover cursor por palabra (Ctrl+Left/Right).
+    MoveCursorWord(Direction),
+    /// Mover cursor por palabra extendiendo la selección (Ctrl+Shift+Left/Right).
+    MoveCursorWordSelecting(Direction),
+    /// Toggle line comment (Ctrl+/) según extensión del archivo.
+    ToggleLineComment,
+    /// Mover la línea del cursor primario hacia arriba o abajo (Alt+Up/Down).
+    MoveLine(Direction),
+    /// Duplicar la(s) línea(s) del cursor hacia arriba o abajo (Shift+Alt+Up/Down).
+    DuplicateLine(Direction),
+    /// Tab dentro del editor: indentar selección si existe, sino navegar foco.
+    EditorTab,
+    /// Shift+Tab dentro del editor: des-indentar selección si existe, sino foco previo.
+    EditorBackTab,
+    /// Seleccionar la línea completa del cursor primario (Ctrl+L).
+    SelectLine,
+
     // ── Multicursor / Selección ──
+    /// Agregar un cursor en la línea inmediatamente superior al primario (Ctrl+Alt+Up).
+    AddCursorAbove,
+    /// Agregar un cursor en la línea inmediatamente inferior al primario (Ctrl+Alt+Down).
+    AddCursorBelow,
+    /// Extender selección al inicio de la línea para todos los cursores (Shift+Home).
+    MoveToLineStartSelecting,
+    /// Extender selección al final de la línea para todos los cursores (Shift+End).
+    MoveToLineEndSelecting,
+    /// Extender selección al inicio absoluto del buffer (Ctrl+Shift+Home).
+    MoveToBufferStartSelecting,
+    /// Extender selección al final absoluto del buffer (Ctrl+Shift+End).
+    MoveToBufferEndSelecting,
     /// Seleccionar la siguiente ocurrencia del texto seleccionado (Ctrl+D).
     SelectNextOccurrence,
     /// Limpiar cursores secundarios (Esc con multicursor activo).
+    /// DEPRECADO: reemplazado por `EscapeHierarchy`. Se conserva en el enum
+    /// para compatibilidad con dispatch de paneles que aún lo emiten.
+    #[expect(
+        dead_code,
+        reason = "kept for transition; replaced by EscapeHierarchy"
+    )]
     ClearMultiCursor,
+    /// Esc jerárquico: limpia multicursor → selección → foco al editor → no-op.
+    /// Reemplaza el comportamiento previo de `ClearMultiCursor` que cerraba la app.
+    EscapeHierarchy,
+    /// Solicitar quit de la aplicación (Ctrl+Q). Si hay buffers dirty,
+    /// muestra el modal de confirmación; si no, sale inmediatamente.
+    QuitRequested,
+    /// Confirmar "Save All" en el modal de quit. Guarda buffers titled y
+    /// arranca el flujo de Save As para los untitled.
+    QuitConfirmSaveAll,
+    /// Confirmar "Don't Save" en el modal de quit. Sale descartando cambios.
+    QuitConfirmDiscard,
+    /// Cancelar el modal de quit (Esc / botón Cancel). Mantiene la app abierta.
+    QuitCancel,
+    /// Mover foco al siguiente botón del modal de quit (Tab).
+    QuitModalCycleNext,
+    /// Mover foco al botón anterior del modal de quit (Shift+Tab).
+    QuitModalCyclePrev,
     /// Mover cursor extendiendo la selección (Shift + flechas).
     MoveCursorSelecting(Direction),
+    /// Seleccionar todo el contenido del buffer (Ctrl+A).
+    SelectAll,
+    /// Copiar la selección activa al portapapeles del sistema (Ctrl+C).
+    CopySelection,
+    /// Cortar la selección activa al portapapeles del sistema (Ctrl+X).
+    CutSelection,
+    /// Pegar el contenido del portapapeles del sistema (Ctrl+V).
+    PasteClipboard,
 
     // ── Archivos ──
     /// Abrir un archivo por path.
@@ -92,6 +151,33 @@ pub enum Action {
     SaveFile,
     /// Cerrar el buffer activo.
     CloseBuffer,
+
+    // ── Save As modal ──
+    /// Abrir el modal "Guardar como" (buffer sin path asociado).
+    #[expect(dead_code, reason = "disponible para keybinding futuro — se dispara via SaveFile en buffers untitled")]
+    SaveAsOpen,
+    /// Escribir un carácter en el input de path del modal Save As.
+    SaveAsChar(char),
+    /// Borrar el último carácter del input de path del modal Save As.
+    SaveAsBackspace,
+    /// Confirmar el path y guardar el buffer.
+    SaveAsConfirm,
+    /// Cancelar el modal Save As sin guardar.
+    SaveAsCancel,
+
+    // ── Rename modal ──
+    /// Abrir el modal de rename para el path dado.
+    /// Disponible para keybinding futuro — se dispara directamente desde ContextMenuItem::Rename.
+    #[expect(dead_code, reason = "disponible para keybinding futuro — context menu llama state.rename.open() directamente")]
+    RenameOpen(PathBuf),
+    /// Escribir un carácter en el input de nombre del modal Rename.
+    RenameChar(char),
+    /// Borrar el último carácter del input de nombre del modal Rename.
+    RenameBackspace,
+    /// Confirmar y ejecutar el rename.
+    RenameConfirm,
+    /// Cancelar el modal Rename sin renombrar.
+    RenameCancel,
 
     // ── Tabs ──
     /// Ir a la pestaña siguiente (Ctrl+Tab).
@@ -144,17 +230,22 @@ pub enum Action {
     SearchReplaceAllInFile,
     /// Toggle fold del file header seleccionado en resultados agrupados.
     SearchToggleFold,
+    /// Toggle expansión/colapso de la fila de filtros (include/exclude).
+    SearchToggleFilters,
     /// Abrir el match seleccionado y navegar al archivo/línea.
     SearchSelectAndOpen,
 
     // ── Terminal ──
     /// Alternar visibilidad del panel de terminal.
     ToggleTerminal,
-    /// Enviar un carácter al terminal.
+    /// Enviar un carácter al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalInput(char),
-    /// Enviar Enter al terminal.
+    /// Enviar Enter al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalEnter,
-    /// Enviar Ctrl+C al terminal.
+    /// Enviar Ctrl+C al terminal (legacy — se mantiene para compat del reducer).
+    #[expect(dead_code, reason = "legacy — keymap ahora usa TerminalSendBytes; reducer mantiene handler")]
     TerminalCtrlC,
     /// Scrollear output del terminal hacia arriba.
     TerminalScrollUp,
@@ -163,6 +254,40 @@ pub enum Action {
     /// Crear nueva sesión de terminal si no existe.
     #[expect(dead_code, reason = "se dispara internamente via ToggleTerminal")]
     TerminalSpawn,
+
+    // ── Terminal multi-pane ──
+    /// Split horizontal del pane activo (side-by-side).
+    TerminalSplitHorizontal,
+    /// Split vertical del pane activo (top/bottom).
+    TerminalSplitVertical,
+    /// Cerrar el pane activo de terminal.
+    TerminalClosePane,
+    /// Mover foco al siguiente pane de terminal.
+    TerminalFocusNext,
+    /// Mover foco al pane anterior de terminal.
+    TerminalFocusPrev,
+    /// Mover foco a un pane específico por ID.
+    #[expect(dead_code, reason = "reducer lo maneja — no hay keybinding directo aún, se usará via mouse click en pane")]
+    TerminalFocusPane(u32),
+    /// Bytes crudos para enviar al PTY del pane activo.
+    /// Reemplaza conceptualmente TerminalInput/Enter/CtrlC.
+    TerminalSendBytes(Vec<u8>),
+
+    // ── File search (Ctrl+F dentro del editor) ──
+    /// Abrir el search bar del archivo actual (Ctrl+F).
+    OpenFileSearch,
+    /// Insertar carácter en el query del file search.
+    FileSearchInsertChar(char),
+    /// Borrar carácter del query del file search (Backspace).
+    FileSearchDeleteChar,
+    /// Saltar al siguiente match del file search (Enter / F3).
+    FileSearchNext,
+    /// Saltar al match anterior del file search (Shift+Enter / Shift+F3).
+    FileSearchPrev,
+    /// Cerrar el file search (Esc).
+    FileSearchClose,
+    /// Toggle case-sensitive del file search (Alt+C).
+    FileSearchToggleCase,
 
     // ── Explorer ──
     /// Mover selección arriba en el explorer.
@@ -175,6 +300,28 @@ pub enum Action {
     ExplorerRefresh,
     /// Colapsar directorio seleccionado en el explorer.
     ExplorerCollapse,
+    /// Iniciar creación de archivo nuevo en el explorer (input modal inline).
+    ExplorerNewFile,
+    /// Iniciar creación de carpeta nueva en el explorer (input modal inline).
+    ExplorerNewFolder,
+    /// Eliminar el archivo o carpeta seleccionado en el explorer.
+    ExplorerDeleteSelected,
+    /// Insertar carácter en el input de nuevo archivo del explorer.
+    ExplorerNewFileInput(char),
+    /// Borrar carácter del input de nuevo archivo del explorer.
+    ExplorerNewFileBackspace,
+    /// Confirmar creación del nuevo archivo.
+    ExplorerNewFileConfirm,
+    /// Cancelar creación del nuevo archivo.
+    ExplorerNewFileCancel,
+    /// Insertar carácter en el input de nueva carpeta del explorer.
+    ExplorerNewFolderInput(char),
+    /// Borrar carácter del input de nueva carpeta del explorer.
+    ExplorerNewFolderBackspace,
+    /// Confirmar creación de la nueva carpeta.
+    ExplorerNewFolderConfirm,
+    /// Cancelar creación de la nueva carpeta.
+    ExplorerNewFolderCancel,
 
     // ── Paneles ──
     /// Alternar visibilidad de la sidebar (Ctrl+B).
@@ -220,6 +367,14 @@ pub enum Action {
         /// Fila actual del drag (0-indexed, coordenada de terminal).
         row: u16,
     },
+    /// Right-click del mouse en posición absoluta de terminal.
+    /// Abre el context menu del panel bajo el cursor.
+    MouseRightClick {
+        /// Columna (0-indexed, coordenada de terminal).
+        col: u16,
+        /// Fila (0-indexed, coordenada de terminal).
+        row: u16,
+    },
 
     // ── Git ──
     /// Abrir el panel de Git / source control.
@@ -234,8 +389,30 @@ pub enum Action {
     GitDown,
     /// Toggle stage/unstage del archivo seleccionado.
     GitStageToggle,
+    /// Stage o unstage un archivo específico por índice (click en `[+]`/`[-]` del row).
+    GitStageFile(usize),
+    /// Descartar cambios del working tree de un archivo específico por índice
+    /// (click en `[×]` del row). Solo aplica a archivos unstaged Modified/Deleted.
+    GitDiscardFile(usize),
+    /// Stage de todos los archivos unstaged a la vez (click en `[+]` del header "Changes").
+    GitStageAll,
+    GitUnstageAll,
     /// Toggle mostrar/ocultar diff del archivo seleccionado.
+    ///
+    /// En el modelo de tabs virtuales de diff, abre (o reusa) una tab de diff
+    /// para el archivo seleccionado. Si la tab activa ya es esa tab de diff
+    /// y hay más de una tab abierta, la cierra (toggle).
     GitToggleDiff,
+    /// Abre el diff del archivo seleccionado como tab virtual.
+    ///
+    /// Idempotente: si ya hay una tab de diff para el archivo, la activa
+    /// y refresca su contenido. Equivalente a `GitToggleDiff` cuando la
+    /// tab activa NO es la del diff de ese archivo.
+    #[expect(
+        dead_code,
+        reason = "se construirá desde el command palette / context menu — alias semántico de GitToggleDiff"
+    )]
+    GitOpenDiffTab,
     /// Scrollear diff hacia arriba.
     GitDiffScrollUp,
     /// Scrollear diff hacia abajo.
@@ -252,6 +429,10 @@ pub enum Action {
     GitCommitDeleteChar,
     /// Ejecutar git fetch para sincronizar con el remoto.
     GitFetch,
+    /// Ejecutar git push para enviar commits al remoto.
+    GitPush,
+    /// Ejecutar git pull para traer cambios del remoto.
+    GitPull,
 
     // ── LSP ──
     /// Arrancar el language server para el archivo actual.
@@ -358,6 +539,71 @@ pub enum Action {
     // ── Activity Bar ──
     /// Click en un icono de la activity bar para cambiar sección de sidebar.
     ActivityBarSelect(crate::core::settings::SidebarSection),
+
+    // ── Projects panel ──
+    /// Abrir diálogo nativo del SO para agregar nuevo proyecto.
+    ProjectsAddNew,
+    /// El diálogo nativo retornó una carpeta seleccionada por el usuario.
+    /// Contiene el path absoluto de la carpeta elegida.
+    ProjectsNativePickerResult(std::path::PathBuf),
+    /// Cancelar folder picker sin agregar proyecto.
+    #[expect(dead_code, reason = "disponible via command registry — FolderPickerCancel se usa directamente")]
+    ProjectsCancelAdd,
+    /// Seleccionar un proyecto de la lista (índice).
+    #[expect(dead_code, reason = "disponible para keybinding directo — se usa via ProjectsOpen")]
+    ProjectsSelect(usize),
+    /// Toggle del candado de un proyecto (índice).
+    ProjectsToggleLock(usize),
+    /// Eliminar proyecto de la lista (índice).
+    ProjectsRemove(usize),
+    /// Navegar arriba en la lista de proyectos.
+    ProjectsMoveUp,
+    /// Navegar abajo en la lista de proyectos.
+    ProjectsMoveDown,
+    /// Activar/abrir el proyecto seleccionado (switch workspace).
+    ProjectsOpen,
+
+    // ── Context menu (menú contextual del explorer) ──
+    /// Abrir context menu en posición (x, y) para el path del explorer seleccionado.
+    /// Se dispara via MouseRightClick — no hay keybinding directo.
+    ContextMenuOpen {
+        /// Columna de terminal donde aparece el menú.
+        x: u16,
+        /// Fila de terminal donde aparece el menú.
+        y: u16,
+    },
+    /// Cerrar el context menu.
+    ContextMenuClose,
+    /// Mover selección arriba en el context menu.
+    ContextMenuUp,
+    /// Mover selección abajo en el context menu.
+    ContextMenuDown,
+    /// Confirmar el item seleccionado en el context menu.
+    ContextMenuConfirm,
+
+    // ── Folder picker (modal de selección de carpeta) ──
+    /// Navegar arriba en el folder picker.
+    FolderPickerUp,
+    /// Navegar abajo en el folder picker.
+    FolderPickerDown,
+    /// Expandir/navegar al directorio seleccionado en el picker.
+    FolderPickerEnter,
+    /// Subir al directorio padre en el picker.
+    FolderPickerParent,
+    /// Confirmar directorio actual como proyecto.
+    FolderPickerConfirm,
+    /// Cancelar el folder picker.
+    FolderPickerCancel,
+    /// Alternar foco entre el input de path y el árbol en el folder picker.
+    FolderPickerToggleFocus,
+    /// Insertar un carácter en el input de path del folder picker.
+    FolderPickerPathInput(char),
+    /// Borrar último carácter del input de path del folder picker.
+    FolderPickerPathBackspace,
+    /// Confirmar el path escrito en el input (navegar al directorio).
+    FolderPickerPathConfirm,
+    /// Limpiar input de path y devolver foco al árbol (sin cerrar picker).
+    FolderPickerPathEscape,
 }
 
 // ─── Event ─────────────────────────────────────────────────────────────────────
@@ -414,6 +660,30 @@ pub enum Event {
     /// Señal de shutdown externo.
     #[expect(dead_code, reason = "se usará cuando se implemente shutdown por señal")]
     Shutdown,
+
+    // ── Image viewer ──
+    /// Imagen decodificada y protocolo pre-codificado listo para mostrar.
+    ///
+    /// Se emite desde el worker async tras `Effect::DecodeImage`. El reducer
+    /// poblará `EditorState::image_view` en la tab `tab_index` con el `content`.
+    ///
+    /// `Box` para no inflar el tamaño del enum `Event` — el `StatefulProtocol`
+    /// puede contener buffers de imagen grandes.
+    ImageLoaded {
+        /// Índice de la tab destino (asignado al abrir el placeholder).
+        tab_index: usize,
+        /// Contenido pre-construido (path + protocolo + error=None).
+        content: Box<crate::editor::image::ImageViewContent>,
+    },
+    /// Error al decodificar una imagen.
+    ImageLoadError {
+        /// Índice de la tab destino donde mostrar el error.
+        tab_index: usize,
+        /// Path original (para mostrar en el placeholder de error).
+        path: std::path::PathBuf,
+        /// Mensaje de error legible para el usuario.
+        error: String,
+    },
 }
 
 // ─── Effect ────────────────────────────────────────────────────────────────────
@@ -458,6 +728,20 @@ pub enum Effect {
         reason = "se usa como retorno explícito de 'sin efecto' cuando se necesite"
     )]
     None,
+    /// Decodificar una imagen async y emitir `Event::ImageLoaded`/`ImageLoadError`.
+    ///
+    /// El handler:
+    /// 1. Asegura que `AppState::image_picker` está inicializado (lazy).
+    /// 2. Clona el `Picker` (es `Clone`) y lanza `spawn_blocking` para decodear.
+    /// 3. Dentro del blocking task, decodea con `image::ImageReader`, downscalea
+    ///    si excede 1920x1080, construye el protocolo y envía el `Event` por
+    ///    el canal async del AppState.
+    DecodeImage {
+        /// Path absoluto del archivo de imagen.
+        path: PathBuf,
+        /// Índice de la tab placeholder donde se mostrará el resultado.
+        tab_index: usize,
+    },
 }
 
 // ─── PanelId ───────────────────────────────────────────────────────────────────
@@ -487,39 +771,11 @@ pub enum PanelId {
     /// Overlay del quick open.
     #[expect(dead_code, reason = "se usará en épica 5 — quick open")]
     QuickOpen,
+    /// Panel de proyectos guardados.
+    Projects,
 }
 
-impl PanelId {
-    /// Paneles navegables en orden de ciclo (Tab / Shift+Tab).
-    ///
-    /// Solo incluye paneles persistentes, no overlays como CommandPalette
-    /// o QuickOpen que son modales y capturan foco mientras están abiertos.
-    const CYCLE_ORDER: &[PanelId] = &[PanelId::Explorer, PanelId::Editor, PanelId::Terminal];
 
-    /// Retorna el siguiente panel en el ciclo de navegación.
-    pub fn next(self) -> Self {
-        let current_idx = Self::CYCLE_ORDER
-            .iter()
-            .position(|&p| p == self)
-            .unwrap_or(0);
-        let next_idx = (current_idx + 1) % Self::CYCLE_ORDER.len();
-        Self::CYCLE_ORDER[next_idx]
-    }
-
-    /// Retorna el panel anterior en el ciclo de navegación.
-    pub fn prev(self) -> Self {
-        let current_idx = Self::CYCLE_ORDER
-            .iter()
-            .position(|&p| p == self)
-            .unwrap_or(0);
-        let prev_idx = if current_idx == 0 {
-            Self::CYCLE_ORDER.len() - 1
-        } else {
-            current_idx - 1
-        };
-        Self::CYCLE_ORDER[prev_idx]
-    }
-}
 
 // ─── Direction ─────────────────────────────────────────────────────────────────
 

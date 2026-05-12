@@ -11,6 +11,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Modo activo del Quick Open.
+///
+/// `FileSearch` es el modo por defecto (buscar archivos). Cuando el usuario
+/// escribe `:` como primer carácter, cambia a `GoToLine` para saltar a una
+/// línea del archivo activo sin abrir un modal separado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuickOpenMode {
+    /// Búsqueda de archivos (modo por defecto).
+    #[default]
+    FileSearch,
+    /// Go-to-line inline: input es un número de línea.
+    GoToLine,
+}
+
 /// Máximo de archivos a indexar para evitar consumo excesivo de RAM.
 const MAX_FILES: usize = 10_000;
 
@@ -65,6 +79,10 @@ pub struct QuickOpenState {
     pub scroll_offset: usize,
     /// Si está escaneando el workspace actualmente.
     pub scanning: bool,
+    /// Modo activo — FileSearch o GoToLine inline.
+    pub mode: QuickOpenMode,
+    /// Total de líneas del archivo activo (para go-to-line hint).
+    pub total_lines: usize,
 }
 
 impl QuickOpenState {
@@ -79,6 +97,8 @@ impl QuickOpenState {
             selected_index: 0,
             scroll_offset: 0,
             scanning: false,
+            mode: QuickOpenMode::FileSearch,
+            total_lines: 0,
         }
     }
 
@@ -89,6 +109,8 @@ impl QuickOpenState {
         self.cursor_pos = 0;
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.mode = QuickOpenMode::FileSearch;
+        self.total_lines = 0;
         // Mostrar todos los archivos inicialmente
         self.filtered = (0..self.file_index.len()).collect();
     }
@@ -101,6 +123,7 @@ impl QuickOpenState {
         self.filtered.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.mode = QuickOpenMode::FileSearch;
     }
 
     /// Escanea el workspace recursivamente para construir el índice de archivos.
@@ -218,14 +241,50 @@ impl QuickOpenState {
     }
 
     /// Inserta un carácter en el input y re-filtra.
+    ///
+    /// Comportamiento por modo:
+    /// - **FileSearch**: si el input está vacío y se escribe `:`, cambia a GoToLine
+    ///   (sin insertar el `:`). Caso contrario, inserción normal + re-filtrado.
+    /// - **GoToLine**: solo acepta dígitos ASCII, máximo 6 chars.
     pub fn insert_char(&mut self, ch: char) {
+        // Si el input está vacío y se escribe ':', cambiar a modo go-to-line
+        if self.input.is_empty() && ch == ':' && self.mode == QuickOpenMode::FileSearch {
+            self.mode = QuickOpenMode::GoToLine;
+            // NO insertar el ':' en el input — es el prefijo visual, no parte del número
+            return;
+        }
+        // En modo go-to-line: solo aceptar dígitos
+        if self.mode == QuickOpenMode::GoToLine {
+            if ch.is_ascii_digit() && self.input.len() < 6 {
+                self.input.push(ch);
+            }
+            return;
+        }
+        // Modo file search: comportamiento normal
         self.input.insert(self.cursor_pos, ch);
         self.cursor_pos += ch.len_utf8();
         self.update_filter();
     }
 
     /// Elimina el carácter antes del cursor y re-filtra.
+    ///
+    /// Comportamiento por modo:
+    /// - **GoToLine**: si el input está vacío (borrar el `:` implícito), vuelve
+    ///   a FileSearch mostrando todos los archivos. Si hay dígitos, borra el último.
+    /// - **FileSearch**: borrado normal con re-filtrado.
     pub fn delete_char(&mut self) {
+        // En modo go-to-line: lógica especial
+        if self.mode == QuickOpenMode::GoToLine {
+            if self.input.is_empty() {
+                // Borrar el ':' implícito → volver a file search
+                self.mode = QuickOpenMode::FileSearch;
+                self.update_filter(); // mostrar todos los archivos
+            } else {
+                self.input.pop();
+            }
+            return;
+        }
+        // Modo file search: comportamiento normal
         if self.cursor_pos > 0 {
             // Encontrar el boundary del char anterior
             let prev_boundary = self.input[..self.cursor_pos]
@@ -237,6 +296,26 @@ impl QuickOpenState {
             self.cursor_pos = prev_boundary;
             self.update_filter();
         }
+    }
+
+    /// Parsea el input como número de línea (1-indexed) en modo GoToLine.
+    ///
+    /// Retorna `None` si el input está vacío, es cero, o el modo no es GoToLine.
+    /// Clampea al rango `[1, total_lines]`.
+    pub fn parsed_line(&self) -> Option<usize> {
+        if self.mode != QuickOpenMode::GoToLine {
+            return None;
+        }
+        let n: usize = self.input.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some(n.min(self.total_lines).max(1))
+    }
+
+    /// Si el modo activo es go-to-line inline.
+    pub fn is_goto_mode(&self) -> bool {
+        self.mode == QuickOpenMode::GoToLine
     }
 
     /// Path del archivo seleccionado actualmente, si existe.

@@ -49,11 +49,16 @@ pub struct GitFileStatus {
 
 /// Ejecuta un comando git en el directorio dado y retorna stdout.
 ///
-/// Retorna `Err` si el comando falla o git no está disponible.
+/// Retorna `Err` si el comando falla o git no está disponible. Forzamos
+/// `GIT_TERMINAL_PROMPT=0` globalmente para que git nunca abra prompts
+/// interactivos (credenciales, host keys, etc.) — en una TUI el prompt
+/// queda colgado sin posibilidad de input. Si faltan credenciales, el
+/// comando falla rápido con un error que se propaga al panel.
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .context("no se pudo ejecutar git — ¿está instalado?")?;
 
@@ -163,6 +168,33 @@ pub fn stage_file(repo_path: &Path, file_path: &str) -> Result<()> {
 /// Ejecuta `git restore --staged -- <file>`.
 pub fn unstage_file(repo_path: &Path, file_path: &str) -> Result<()> {
     run_git(repo_path, &["restore", "--staged", "--", file_path])?;
+    Ok(())
+}
+
+/// Descarta cambios del working tree de un archivo (restore al index).
+///
+/// Ejecuta `git restore -- <file>`. Solo afecta el working tree —
+/// no toca el index. Para archivos unstaged Modified/Deleted, vuelve
+/// el archivo al estado del index. No aplica a archivos staged ni untracked.
+pub fn discard_file(repo_path: &Path, file_path: &str) -> Result<()> {
+    run_git(repo_path, &["restore", "--", file_path])?;
+    Ok(())
+}
+
+/// Elimina un archivo no rastreado del disco (`git clean -f -- <file>`).
+///
+/// Solo aplica a archivos Untracked o Added sin stagear. No toca archivos
+/// ya tracked por git (Modified, Deleted, Renamed).
+pub fn delete_untracked_file(repo_path: &Path, file_path: &str) -> Result<()> {
+    run_git(repo_path, &["clean", "-f", "--", file_path])?;
+    Ok(())
+}
+
+/// Quita todos los archivos del staging area (`git restore --staged .`).
+///
+/// Equivalente a unstage de todo sin descartar cambios del working tree.
+pub fn unstage_all(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["restore", "--staged", "."])?;
     Ok(())
 }
 
@@ -282,6 +314,27 @@ pub fn ahead_behind(repo_path: &Path) -> (u32, u32) {
 /// Retorna Err si git no está disponible o el fetch falla.
 pub fn fetch(repo_path: &Path) -> Result<()> {
     run_git(repo_path, &["fetch", "--quiet"])?;
+    Ok(())
+}
+
+/// Ejecuta `git push --quiet` de forma síncrona.
+///
+/// Mismo patrón que `fetch()` — bloquea hasta que el comando termina.
+/// El caller debe envolverlo en `tokio::task::spawn_blocking` para no
+/// bloquear el event loop. Falla rápido si no hay credenciales gracias
+/// a `GIT_TERMINAL_PROMPT=0` configurado globalmente en `run_git`.
+pub fn push(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["push", "--quiet"])?;
+    Ok(())
+}
+
+/// Ejecuta `git pull --quiet` de forma síncrona.
+///
+/// Mismo patrón que `fetch()` — bloquea hasta que el comando termina.
+/// El caller debe envolverlo en `tokio::task::spawn_blocking` para no
+/// bloquear el event loop.
+pub fn pull(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["pull", "--quiet"])?;
     Ok(())
 }
 

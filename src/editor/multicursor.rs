@@ -104,10 +104,13 @@ impl CursorInstance {
     }
 
     /// Mueve a la izquierda con soporte de selección.
+    ///
+    /// Respeta char boundaries multi-byte UTF-8.
     pub fn move_left(&mut self, buffer: &TextBuffer, selecting: bool) {
         self.handle_selection_mode(selecting);
         if self.position.col > 0 {
-            self.position.col -= 1;
+            let line = buffer.line(self.position.line).unwrap_or("");
+            self.position.col = super::unicode::prev_char_boundary(line, self.position.col);
         } else if self.position.line > 0 {
             self.position.line -= 1;
             self.position.col = buffer.line_len(self.position.line);
@@ -119,11 +122,14 @@ impl CursorInstance {
     }
 
     /// Mueve a la derecha con soporte de selección.
+    ///
+    /// Respeta char boundaries multi-byte UTF-8.
     pub fn move_right(&mut self, buffer: &TextBuffer, selecting: bool) {
         self.handle_selection_mode(selecting);
         let line_len = buffer.line_len(self.position.line);
         if self.position.col < line_len {
-            self.position.col += 1;
+            let line = buffer.line(self.position.line).unwrap_or("");
+            self.position.col += super::unicode::char_len_at(line, self.position.col);
         } else if self.position.line + 1 < buffer.line_count() {
             self.position.line += 1;
             self.position.col = 0;
@@ -140,6 +146,153 @@ impl CursorInstance {
             self.start_selection();
         } else {
             self.clear_selection();
+        }
+    }
+
+    /// Mueve el cursor al inicio de la palabra anterior (Ctrl+Left).
+    ///
+    /// Reglas (estilo VS Code/IntelliJ), implementadas char-aware:
+    /// - Si `col > 0`, retrocede saltando whitespace y luego retrocede mientras
+    ///   los chars sean de la misma clase (word vs non-word). Para clusters de
+    ///   non-word-non-space (ej `;}`), retrocede hasta cambiar de clase.
+    /// - Si ya está en `col == 0`, salta al final de la línea anterior.
+    /// - Soporta multi-byte UTF-8: avanza/retrocede por char boundaries.
+    pub fn move_word_left(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
+
+        // Caso degenerado: inicio de línea → ir al final de la anterior
+        if self.position.col == 0 {
+            if self.position.line > 0 {
+                self.position.line -= 1;
+                self.position.col = buffer.line_len(self.position.line);
+            }
+            self.desired_col = self.position.col;
+            if selecting {
+                self.extend_selection();
+            }
+            return;
+        }
+
+        let line = match buffer.line(self.position.line) {
+            Some(l) => l,
+            None => {
+                if selecting {
+                    self.extend_selection();
+                }
+                return;
+            }
+        };
+
+        let mut col = self.position.col.min(line.len());
+
+        // Helper: char a la izquierda de `col` (None si col == 0).
+        let char_left_of = |c: usize| -> Option<char> {
+            if c == 0 {
+                return None;
+            }
+            let prev = super::unicode::prev_char_boundary(line, c);
+            line[prev..].chars().next()
+        };
+
+        // 1) Saltar whitespace que esté a la izquierda (retrocediendo por chars)
+        while let Some(ch) = char_left_of(col) {
+            if ch.is_whitespace() {
+                col = super::unicode::prev_char_boundary(line, col);
+            } else {
+                break;
+            }
+        }
+
+        // 2) Saltar el cluster de la misma clase (word vs non-word).
+        //    Clase determinada por el char inmediatamente a la izquierda.
+        if let Some(first) = char_left_of(col) {
+            let in_word = super::is_word_char(first);
+            while let Some(ch) = char_left_of(col) {
+                if ch.is_whitespace() || super::is_word_char(ch) != in_word {
+                    break;
+                }
+                col = super::unicode::prev_char_boundary(line, col);
+            }
+        }
+
+        self.position.col = col;
+        self.desired_col = col;
+        if selecting {
+            self.extend_selection();
+        }
+    }
+
+    /// Mueve el cursor al final de la palabra siguiente (Ctrl+Right).
+    ///
+    /// Reglas char-aware:
+    /// - Avanza saltando el cluster actual (mismo clase: word vs non-word, sin
+    ///   contar whitespace).
+    /// - Salta whitespace que siga.
+    /// - Si está al final de la línea, salta al inicio de la siguiente.
+    /// - Soporta multi-byte UTF-8.
+    pub fn move_word_right(&mut self, buffer: &TextBuffer, selecting: bool) {
+        self.handle_selection_mode(selecting);
+
+        let line = match buffer.line(self.position.line) {
+            Some(l) => l,
+            None => {
+                if selecting {
+                    self.extend_selection();
+                }
+                return;
+            }
+        };
+        let line_len = line.len();
+
+        // Caso degenerado: final de línea → ir al inicio de la siguiente
+        if self.position.col >= line_len {
+            if self.position.line + 1 < buffer.line_count() {
+                self.position.line += 1;
+                self.position.col = 0;
+            }
+            self.desired_col = self.position.col;
+            if selecting {
+                self.extend_selection();
+            }
+            return;
+        }
+
+        let mut col = self.position.col;
+
+        // Helper: char en `col` (None si fuera de rango o no boundary).
+        let char_at = |c: usize| -> Option<char> {
+            if c >= line.len() || !line.is_char_boundary(c) {
+                return None;
+            }
+            line[c..].chars().next()
+        };
+
+        // 1) Saltar el cluster de la misma clase (si no estamos en whitespace)
+        if let Some(first) = char_at(col) {
+            if !first.is_whitespace() {
+                let in_word = super::is_word_char(first);
+                while let Some(ch) = char_at(col) {
+                    if ch.is_whitespace() || super::is_word_char(ch) != in_word {
+                        break;
+                    }
+                    col += super::unicode::char_len_at(line, col);
+                }
+            }
+        }
+
+        // 2) Saltar whitespace que siga
+        while let Some(ch) = char_at(col) {
+            if ch.is_whitespace() {
+                col += super::unicode::char_len_at(line, col);
+            } else {
+                break;
+            }
+        }
+
+        self.position.col = col;
+        self.desired_col = col;
+        if selecting {
+            self.extend_selection();
         }
     }
 }
@@ -242,5 +395,210 @@ impl MultiCursorState {
 impl Default for MultiCursorState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor_at(line: usize, col: usize) -> CursorInstance {
+        CursorInstance::new(Position { line, col })
+    }
+
+    // ── move_word_right ──
+
+    #[test]
+    fn move_word_right_jumps_to_end_of_word() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false);
+        // "hello" → 5, then skip space → 6
+        assert_eq!(c.position, Position { line: 0, col: 6 });
+    }
+
+    #[test]
+    fn move_word_right_at_end_jumps_to_next_line() {
+        let buf = TextBuffer::from_text("foo\nbar");
+        let mut c = cursor_at(0, 3);
+        c.move_word_right(&buf, false);
+        assert_eq!(c.position, Position { line: 1, col: 0 });
+    }
+
+    #[test]
+    fn move_word_right_in_whitespace_skips_to_next_word() {
+        let buf = TextBuffer::from_text("    foo");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false);
+        // Whitespace skip puts cursor at 4 (start of foo)
+        assert_eq!(c.position, Position { line: 0, col: 4 });
+    }
+
+    #[test]
+    fn move_word_right_through_punctuation() {
+        let buf = TextBuffer::from_text("a;b");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false); // word "a" → 1
+        assert_eq!(c.position.col, 1);
+        c.move_word_right(&buf, false); // ";" punct cluster → 2
+        assert_eq!(c.position.col, 2);
+    }
+
+    // ── move_word_left ──
+
+    #[test]
+    fn move_word_left_jumps_to_start_of_word() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 11);
+        c.move_word_left(&buf, false);
+        // From end of "world", goes to start of "world" → 6
+        assert_eq!(c.position, Position { line: 0, col: 6 });
+    }
+
+    #[test]
+    fn move_word_left_at_start_jumps_to_prev_line_end() {
+        let buf = TextBuffer::from_text("foo\nbar");
+        let mut c = cursor_at(1, 0);
+        c.move_word_left(&buf, false);
+        assert_eq!(c.position, Position { line: 0, col: 3 });
+    }
+
+    #[test]
+    fn move_word_left_skips_trailing_whitespace() {
+        let buf = TextBuffer::from_text("foo    ");
+        let mut c = cursor_at(0, 7);
+        c.move_word_left(&buf, false);
+        // skip 4 spaces, then move over "foo" to col 0
+        assert_eq!(c.position, Position { line: 0, col: 0 });
+    }
+
+    #[test]
+    fn move_word_left_at_buffer_start_is_noop() {
+        let buf = TextBuffer::from_text("foo");
+        let mut c = cursor_at(0, 0);
+        c.move_word_left(&buf, false);
+        assert_eq!(c.position, Position { line: 0, col: 0 });
+    }
+
+    // ── selection mode ──
+
+    #[test]
+    fn move_word_right_selecting_creates_selection() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, true);
+        assert!(c.has_selection());
+    }
+
+    #[test]
+    fn move_word_left_non_selecting_clears_selection() {
+        let buf = TextBuffer::from_text("hello world");
+        let mut c = cursor_at(0, 5);
+        c.start_selection();
+        c.move_word_left(&buf, false);
+        assert!(!c.has_selection());
+    }
+
+    // ── unicode-aware char movement ──
+
+    #[test]
+    fn move_right_through_two_byte_chars() {
+        // "héllo" — h(1) é(2) l(1) l(1) o(1) = 6 bytes
+        let buf = TextBuffer::from_text("héllo");
+        let mut c = cursor_at(0, 0);
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 1); // h → é
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 3); // é → l (saltó 2 bytes)
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 4);
+    }
+
+    #[test]
+    fn move_left_through_two_byte_chars() {
+        let buf = TextBuffer::from_text("código");
+        let mut c = cursor_at(0, 7); // fin de línea (7 bytes)
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 6); // o → g
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 5);
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 4);
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 3); // i → d
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 1); // d → ó (saltó 2 bytes)
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 0); // ó → c
+    }
+
+    #[test]
+    fn move_right_through_emoji() {
+        // "😀hello" — 😀 = 4 bytes
+        let buf = TextBuffer::from_text("😀hello");
+        let mut c = cursor_at(0, 0);
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 4); // 😀 → h
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 5);
+    }
+
+    #[test]
+    fn move_right_through_cjk() {
+        // "中文" — 中 = 3 bytes, 文 = 3 bytes
+        let buf = TextBuffer::from_text("中文");
+        let mut c = cursor_at(0, 0);
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 3);
+        c.move_right(&buf, false);
+        assert_eq!(c.position.col, 6);
+    }
+
+    #[test]
+    fn move_left_at_emoji_does_not_panic() {
+        let buf = TextBuffer::from_text("😀");
+        let mut c = cursor_at(0, 4);
+        c.move_left(&buf, false);
+        assert_eq!(c.position.col, 0);
+    }
+
+    // ── unicode-aware word movement ──
+
+    #[test]
+    fn move_word_right_through_spanish_text() {
+        // "código fuente" — código bytes: c(1) ó(2) d(1) i(1) g(1) o(1) = 7 bytes.
+        // Pero `is_word_char` (ASCII-only) considera 'ó' como NO word.
+        // Por lo tanto "código" se ve como cluster1="c" + non-word "ó" + cluster2="digo".
+        // Desde col 0 con primer char 'c' (word), el cluster word va de col 0..1,
+        // luego whitespace none → cursor termina en col 1.
+        let buf = TextBuffer::from_text("código fuente");
+        let mut c = cursor_at(0, 0);
+        c.move_word_right(&buf, false);
+        // 'c' es word, 'ó' es non-word → cluster word termina en col 1.
+        assert_eq!(c.position.col, 1);
+    }
+
+    #[test]
+    fn move_word_right_skip_through_unicode_no_panic() {
+        // Verifica el invariante crítico: NO panic con multi-byte chars.
+        let buf = TextBuffer::from_text("año pasó rápido");
+        let mut c = cursor_at(0, 0);
+        for _ in 0..20 {
+            c.move_word_right(&buf, false);
+        }
+        // No debe haber panic; col debe estar en boundary.
+        let line = buf.line(0).unwrap();
+        assert!(line.is_char_boundary(c.position.col));
+    }
+
+    #[test]
+    fn move_word_left_through_spanish_no_panic() {
+        let buf = TextBuffer::from_text("código fuente");
+        let line = buf.line(0).unwrap();
+        let mut c = cursor_at(0, line.len());
+        for _ in 0..20 {
+            c.move_word_left(&buf, false);
+        }
+        assert!(line.is_char_boundary(c.position.col));
     }
 }
