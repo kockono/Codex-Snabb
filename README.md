@@ -1,7 +1,6 @@
 <div align="center">
 
 # Codex-Snabb
-
 > **IDE TUI en Rust — RAM/CPU first.**
 > Performance y predictibilidad como requisitos de diseño, no como afterthought.
 
