@@ -72,9 +72,14 @@ use panels::StatusBarData;
 /// se derivan del estado ANTES de entrar al render — sin allocaciones
 /// dentro del draw.
 ///
-/// La función recibe `&AppState` y `&Theme` por referencia.
+/// La función recibe `&mut AppState` y `&Theme` por referencia.
 /// El theme se crea una vez fuera del event loop.
-pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
+///
+/// `&mut` es necesario porque `render_image_tab` requiere `&mut EditorState`
+/// (el widget `StatefulImage` de ratatui-image muta el protocolo para
+/// re-encodear en cada cambio de área). Para todas las demás ramas el
+/// borrow es efectivamente inmutable.
+pub fn render(f: &mut Frame, state: &mut AppState, theme: &Theme) {
     let area = f.area();
 
     // Usar layout pre-computado del event loop. Fallback a recompute solo
@@ -160,17 +165,47 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
     // (después del if/else), por eso se declara antes del bloque.
     let editor_focused = focused == PanelId::Editor;
 
-    // ── Editor area: tab normal vs tab virtual de diff ──
+    // ── Editor area: tab normal vs tab virtual (diff o imagen) ──
     //
-    // Si la tab activa es una tab virtual de diff (ver `EditorState::diff_view`),
-    // se renderiza con `render_diff_tab` (sin gutter, sin highlighting, scroll
-    // desacoplado). Caso contrario, render normal del editor.
+    // Tres ramas posibles:
+    // - imagen (`EditorState::image_view`): render via `render_image_tab` con
+    //   `StatefulImage` widget. Necesita `&mut EditorState` porque el protocol
+    //   se re-encodea en cada cambio de área.
+    // - diff (`EditorState::diff_view`): render via `render_diff_tab` (read-only).
+    // - normal: render del buffer editable con highlighting, gutter, etc.
     //
     // El bloque legacy `if state.git.show_diff` se eliminó: el reducer ya no
     // setea ese flag — los diffs se abren como tabs virtuales.
+    let active_is_image_tab = state.tabs.active_is_image();
     let active_is_diff_tab = state.tabs.active_is_diff();
 
-    if active_is_diff_tab {
+    if active_is_image_tab {
+        // Pre-computar info de tabs ANTES del active_mut() — el borrow checker
+        // no permite tener `&self.tabs` (vía tab_info) y `&mut self.tabs.active`
+        // simultáneamente.
+        let tab_infos = state.tabs.tab_info();
+        let editor = state.tabs.active_mut();
+        panels::render_image_tab(
+            f,
+            layout.editor_area,
+            theme,
+            editor_focused,
+            editor,
+            &tab_infos,
+        );
+
+        // Bottom panel visible solo si está activado (no se oculta por imagen)
+        if layout.bottom_panel_visible {
+            let bottom_focused = focused == PanelId::Terminal;
+            panels::render_bottom_panel(
+                f,
+                layout.bottom_panel,
+                theme,
+                bottom_focused,
+                &state.terminal,
+            );
+        }
+    } else if active_is_diff_tab {
         // Pre-computar info de tabs (incluye la tab virtual de diff)
         let tab_infos = state.tabs.tab_info();
         let editor = state.tabs.active();
@@ -315,6 +350,7 @@ pub fn render(f: &mut Frame, state: &AppState, theme: &Theme) {
         git_status: &git_status_str,
         encoding: "UTF-8",
         scroll_pct: &state.status_pct,
+        terminal_visible: state.bottom_panel_visible,
     };
     panels::render_status_bar(f, layout.status_bar, theme, &status_data);
 

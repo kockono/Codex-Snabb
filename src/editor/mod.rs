@@ -8,6 +8,7 @@ pub mod brackets;
 pub mod buffer;
 pub mod cursor;
 pub mod highlighting;
+pub mod image;
 pub mod indent;
 pub mod multicursor;
 pub mod search;
@@ -15,6 +16,7 @@ pub mod selection;
 pub mod tabs;
 pub mod ts_highlight;
 pub mod undo;
+pub mod unicode;
 pub mod viewport;
 
 use std::path::{Path, PathBuf};
@@ -81,6 +83,13 @@ pub struct EditorState {
     /// `None` = tab normal de archivo (buffer editable).
     /// `Some(...)` = tab virtual de diff con contenido pre-computado y read-only.
     pub diff_view: Option<DiffViewContent>,
+    /// Si esta tab es una vista de imagen (no editable).
+    ///
+    /// `None` = tab normal o de diff.
+    /// `Some(...)` = tab de imagen con protocolo pre-codificado.
+    /// Durante la fase de decodificación async, este campo es `None` y
+    /// el reducer lo poblará con el resultado del `Effect::DecodeImage`.
+    pub image_view: Option<image::ImageViewContent>,
 }
 
 impl EditorState {
@@ -95,6 +104,7 @@ impl EditorState {
             highlight_cache: HighlightCache::new(),
             highlight_deferred: false,
             diff_view: None,
+            image_view: None,
         }
     }
 
@@ -116,6 +126,7 @@ impl EditorState {
             // Así el frame del open es instantáneo y el highlight corre después.
             highlight_deferred: true,
             diff_view: None,
+            image_view: None,
         })
     }
 
@@ -181,14 +192,16 @@ impl EditorState {
                 self.buffer.insert_char(new_pos, ch);
                 self.undo_stack
                     .push(EditOperation::InsertChar { pos: new_pos, ch });
-                self.cursors.cursors[i].position.col += 1;
+                // Avanzar por el largo UTF-8 del char insertado, NO `+= 1`.
+                self.cursors.cursors[i].position.col += ch.len_utf8();
                 self.cursors.cursors[i].sync_desired_col();
                 continue;
             }
 
             self.buffer.insert_char(pos, ch);
             self.undo_stack.push(EditOperation::InsertChar { pos, ch });
-            self.cursors.cursors[i].position.col += 1;
+            // Avanzar por el largo UTF-8 del char insertado, NO `+= 1`.
+            self.cursors.cursors[i].position.col += ch.len_utf8();
             self.cursors.cursors[i].sync_desired_col();
             self.cursors.cursors[i].clear_selection();
         }
@@ -217,15 +230,19 @@ impl EditorState {
             let pos = self.cursors.cursors[i].position;
 
             if pos.col > 0 {
-                let deleted = self.buffer.delete_char(pos);
-                if let Some(ch) = deleted {
-                    let del_pos = Position {
-                        line: pos.line,
-                        col: pos.col - 1,
-                    };
+                // Backspace char-aware: borrar desde el char boundary anterior
+                // hasta pos.col. delete_range maneja el caso multi-byte correctamente.
+                let line = self.buffer.line(pos.line).unwrap_or("");
+                let prev = unicode::prev_char_boundary(line, pos.col);
+                let del_pos = Position {
+                    line: pos.line,
+                    col: prev,
+                };
+                let removed = self.buffer.delete_range(del_pos, pos);
+                if let Some(ch) = removed.chars().next() {
                     self.undo_stack
                         .push(EditOperation::DeleteChar { pos: del_pos, ch });
-                    self.cursors.cursors[i].position.col = pos.col - 1;
+                    self.cursors.cursors[i].position.col = prev;
                     self.cursors.cursors[i].sync_desired_col();
                 }
             } else if pos.line > 0 {
@@ -284,10 +301,13 @@ impl EditorState {
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
 
-    /// Borra el texto de una selección en un cursor específico.
+    /// Borra el texto de una selección en un cursor específico atómicamente.
     ///
-    /// Elimina carácter por carácter desde el final hasta el inicio
-    /// de la selección. Posiciona el cursor al inicio de la selección.
+    /// Usa `buffer.delete_range` (operación O(1) por línea) en lugar del antiguo
+    /// loop char-por-char que: (a) corrompía multi-byte UTF-8 al iterar bytes
+    /// como chars, (b) generaba N entradas de undo en vez de 1.
+    /// Genera UNA entrada `EditOperation::DeleteRange` en el undo stack.
+    /// Posiciona el cursor al inicio de la selección.
     fn delete_selection_at(&mut self, cursor_idx: usize) {
         let Some(sel) = self.cursors.cursors[cursor_idx].selection else {
             return;
@@ -299,62 +319,13 @@ impl EditorState {
         let start = sel.start();
         let end = sel.end();
 
-        // Borrar el texto seleccionado — línea por línea desde el final
-        if start.line == end.line {
-            // Selección en una línea: borrar chars del rango
-            for col in (start.col..end.col).rev() {
-                let pos = Position {
-                    line: start.line,
-                    col: col + 1,
-                };
-                if let Some(ch) = self.buffer.delete_char(pos) {
-                    self.undo_stack.push(EditOperation::DeleteChar {
-                        pos: Position {
-                            line: start.line,
-                            col,
-                        },
-                        ch,
-                    });
-                }
-            }
-        } else {
-            // Multi-línea: unir líneas y borrar contenido
-            // Estrategia: borrar desde el final hacia el inicio
-            // Primero, parte de la última línea (desde col 0 hasta end.col)
-            // Luego, las líneas intermedias completas
-            // Finalmente, parte de la primera línea (desde start.col hasta fin)
-
-            // Unir todo en un solo paso: posicionar al inicio, borrar char a char
-            // es ineficiente pero correcto para MVP
-            let text_to_delete = sel.selected_text(&self.buffer);
-            let chars_count = text_to_delete.len();
-
-            // Posicionar al final de la selección y hacer backspace N veces
-            // Esto es más sencillo y correcto con las operaciones existentes
-            let mut current = end;
-            for _ in 0..chars_count {
-                if current.col > 0 || current.line > start.line || current.col > start.col {
-                    let deleted = self.buffer.delete_char(current);
-                    if let Some(ch) = deleted {
-                        if ch == '\n' {
-                            // Se unió con la línea anterior
-                            if current.line > 0 {
-                                let prev_len = self.buffer.line_len(current.line - 1);
-                                current = Position {
-                                    line: current.line - 1,
-                                    col: prev_len,
-                                };
-                            }
-                        } else {
-                            current.col = current.col.saturating_sub(1);
-                        }
-                        // Registrar undo (simplificado)
-                        self.undo_stack
-                            .push(EditOperation::DeleteChar { pos: current, ch });
-                    }
-                }
-            }
-        }
+        // CLONE: delete_range retorna String owned — necesario para undo.
+        let deleted = self.buffer.delete_range(start, end);
+        self.undo_stack.push(EditOperation::DeleteRange {
+            start,
+            end,
+            text: deleted,
+        });
 
         self.cursors.cursors[cursor_idx].position = start;
         self.cursors.cursors[cursor_idx].sync_desired_col();
@@ -1047,60 +1018,76 @@ impl EditorState {
 
     /// Encuentra los límites de la palabra en la posición dada.
     ///
-    /// Una "palabra" son caracteres alfanuméricos + `_` contiguos.
-    /// Retorna (start, end) de la palabra, o None si no hay palabra.
+    /// Una "palabra" son caracteres ASCII alfanuméricos + `_` contiguos.
+    /// Retorna (start, end) de la palabra en byte offsets, o None si no hay palabra.
+    ///
+    /// Implementación char-aware via `char_indices()` — segura sobre líneas
+    /// con caracteres multi-byte UTF-8 (no entra a posiciones intermedias de byte).
     fn word_at_position(&self, pos: Position) -> Option<(Position, Position)> {
         let line = self.buffer.line(pos.line)?;
-        let bytes = line.as_bytes();
+        if line.is_empty() {
+            return None;
+        }
 
-        if pos.col >= bytes.len() || !is_word_char(bytes[pos.col]) {
-            // Intentar hacia la izquierda si estamos justo después de una palabra
-            if pos.col > 0 && pos.col <= bytes.len() && is_word_char(bytes[pos.col - 1]) {
-                // Estamos justo después del final de una palabra
-                let mut start = pos.col - 1;
-                while start > 0 && is_word_char(bytes[start - 1]) {
-                    start -= 1;
+        // Helper: clase del char en byte_idx; None si fuera de rango o no boundary.
+        let class_at = |byte_idx: usize| -> Option<bool> {
+            if byte_idx >= line.len() || !line.is_char_boundary(byte_idx) {
+                return None;
+            }
+            line[byte_idx..].chars().next().map(is_word_char)
+        };
+
+        // Caso 1: el char EN pos.col es word_char → expandir en ambas direcciones
+        if class_at(pos.col) == Some(true) {
+            // Buscar inicio: retroceder mientras char anterior es word.
+            let mut start = pos.col;
+            loop {
+                let prev = unicode::prev_char_boundary(line, start);
+                if prev == start { break; }
+                let is_word = line[prev..].chars().next().is_some_and(is_word_char);
+                if !is_word { break; }
+                start = prev;
+            }
+            // Buscar fin: avanzar mientras char actual es word.
+            let mut end = pos.col;
+            while end < line.len() {
+                let ch = line[end..].chars().next();
+                if ch.is_some_and(is_word_char) {
+                    end += unicode::char_len_at(line, end);
+                } else {
+                    break;
+                }
+            }
+            if start == end { return None; }
+            return Some((
+                Position { line: pos.line, col: start },
+                Position { line: pos.line, col: end },
+            ));
+        }
+
+        // Caso 2: el char en pos.col NO es word — probar el char anterior
+        // (cursor justo después del final de una palabra).
+        if pos.col > 0 {
+            let prev = unicode::prev_char_boundary(line, pos.col);
+            let prev_is_word = line[prev..].chars().next().is_some_and(is_word_char);
+            if prev_is_word {
+                // Expandir hacia la izquierda
+                let mut start = prev;
+                loop {
+                    let p = unicode::prev_char_boundary(line, start);
+                    if p == start { break; }
+                    let is_w = line[p..].chars().next().is_some_and(is_word_char);
+                    if !is_w { break; }
+                    start = p;
                 }
                 return Some((
-                    Position {
-                        line: pos.line,
-                        col: start,
-                    },
-                    Position {
-                        line: pos.line,
-                        col: pos.col,
-                    },
+                    Position { line: pos.line, col: start },
+                    Position { line: pos.line, col: pos.col },
                 ));
             }
-            return None;
         }
 
-        // Encontrar inicio de la palabra
-        let mut start = pos.col;
-        while start > 0 && is_word_char(bytes[start - 1]) {
-            start -= 1;
-        }
-
-        // Encontrar fin de la palabra
-        let mut end = pos.col;
-        while end < bytes.len() && is_word_char(bytes[end]) {
-            end += 1;
-        }
-
-        if start == end {
-            return None;
-        }
-
-        Some((
-            Position {
-                line: pos.line,
-                col: start,
-            },
-            Position {
-                line: pos.line,
-                col: end,
-            },
-        ))
+        None
     }
 
     /// Busca la siguiente ocurrencia de `text` en el buffer después de `after`.
@@ -1195,7 +1182,7 @@ impl EditorState {
                 self.buffer.raw_insert_char(pos, ch);
                 primary.position = Position {
                     line: pos.line,
-                    col: pos.col + 1,
+                    col: pos.col + ch.len_utf8(),
                 };
             }
             EditOperation::InsertNewline { pos } => {
@@ -1233,6 +1220,17 @@ impl EditorState {
                     col: 0,
                 };
             }
+            EditOperation::InsertText { start, end, .. } => {
+                // Undo de inserción atómica: borrar el rango insertado.
+                // El String `text` no se necesita acá — solo para redo.
+                let _ = self.buffer.delete_range(start, end);
+                primary.position = start;
+            }
+            EditOperation::DeleteRange { start, ref text, .. } => {
+                // Undo de borrado atómico: re-insertar el texto borrado.
+                let new_end = self.buffer.insert_text(start, text);
+                primary.position = new_end;
+            }
         }
         primary.sync_desired_col();
         primary.clear_selection();
@@ -1256,7 +1254,7 @@ impl EditorState {
                 self.buffer.raw_insert_char(pos, ch);
                 primary.position = Position {
                     line: pos.line,
-                    col: pos.col + 1,
+                    col: pos.col + ch.len_utf8(),
                 };
             }
             EditOperation::DeleteChar { pos, .. } => {
@@ -1296,6 +1294,16 @@ impl EditorState {
                 // CLONE: redo necesita conservar `content` para futuras re-aplicaciones.
                 self.buffer.insert_line(line, content.clone());
                 primary.position = Position { line, col: 0 };
+            }
+            EditOperation::InsertText { start, ref text, .. } => {
+                // Redo de inserción atómica: re-insertar el texto.
+                let new_end = self.buffer.insert_text(start, text);
+                primary.position = new_end;
+            }
+            EditOperation::DeleteRange { start, end, .. } => {
+                // Redo de borrado atómico: re-borrar el rango.
+                let _ = self.buffer.delete_range(start, end);
+                primary.position = start;
             }
         }
         primary.sync_desired_col();
@@ -1403,21 +1411,76 @@ impl EditorState {
             .ensure_cursor_visible(&self.cursors.primary().position);
     }
 
-    /// Inserta una string en la posición del cursor primario.
+    /// Inserta `text` en la posición de cada cursor activo como UNA operación
+    /// atómica por cursor.
     ///
-    /// Reutiliza `insert_char` y `insert_newline` para que el undo/redo y
-    /// la sincronización de cursores secundarios sigan funcionando. Es
-    /// más simple que duplicar la lógica del buffer; el costo de N llamadas
-    /// es aceptable para paste (operación rara y siempre fuera del render).
+    /// Garantías:
+    /// - Exactamente 1 entrada `EditOperation::InsertText` por cursor (no N
+    ///   por carácter — esto evita rebuild caro del undo stack en pastes grandes).
+    /// - Si un cursor tiene selección, primero se borra atómicamente
+    ///   (`EditOperation::DeleteRange`).
+    /// - Soporte multi-byte UTF-8 sin panic — usa `buffer.insert_text`.
+    /// - 1 invalidación del highlight cache total, no N.
+    /// - CRLF entrante (`\r\n`) se normaliza a LF antes de insertar.
     pub fn insert_str(&mut self, text: &str) {
-        for ch in text.chars() {
-            if ch == '\n' {
-                self.insert_newline();
-            } else if ch != '\r' {
-                // Ignorar '\r' suelto (CRLF entrante) — solo procesamos LF
-                self.insert_char(ch);
-            }
+        if text.is_empty() {
+            return;
         }
+
+        // Normalizar CRLF → LF. CLONE: solo si el input contiene '\r' — si no, se evita.
+        // Caso típico de paste desde Windows tiene CRLF; el resto pasa sin alocar.
+        let normalized: std::borrow::Cow<'_, str> = if text.contains('\r') {
+            // CLONE: replace devuelve String owned — necesario para normalizar.
+            std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', ""))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        let text = normalized.as_ref();
+
+        self.cursors.sort_by_position();
+        let mut min_invalidated_line: Option<usize> = None;
+
+        for i in (0..self.cursors.cursors.len()).rev() {
+            // 1) Si hay selección activa, borrar atómicamente como DeleteRange.
+            if let Some(sel) = self.cursors.cursors[i].selection
+                && !sel.is_empty()
+            {
+                let start = sel.start();
+                let end = sel.end();
+                // CLONE: delete_range retorna String owned para guardar en undo.
+                let deleted = self.buffer.delete_range(start, end);
+                self.undo_stack.push(EditOperation::DeleteRange {
+                    start,
+                    end,
+                    text: deleted,
+                });
+                self.cursors.cursors[i].position = start;
+                self.cursors.cursors[i].clear_selection();
+            }
+
+            // 2) Insertar el bloque de texto atómicamente.
+            let pos = self.cursors.cursors[i].position;
+            let end_pos = self.buffer.insert_text(pos, text);
+            self.undo_stack.push(EditOperation::InsertText {
+                start: pos,
+                end: end_pos,
+                // CLONE: text se conserva como owned para soportar redo.
+                text: text.to_string(),
+            });
+            self.cursors.cursors[i].position = end_pos;
+            self.cursors.cursors[i].sync_desired_col();
+            self.cursors.cursors[i].clear_selection();
+
+            min_invalidated_line = Some(min_invalidated_line.map_or(pos.line, |m| m.min(pos.line)));
+        }
+
+        // 3) Invalidar highlight UNA vez, desde la línea más temprana editada.
+        if let Some(line) = min_invalidated_line {
+            self.highlight_cache.invalidate_from(line);
+        }
+        // 4) Ensure viewport visibility UNA vez (cursor primario).
+        let pos = self.cursors.primary().position;
+        self.viewport.ensure_cursor_visible(&pos);
     }
 
     // ─── File Search (Ctrl+F) ───────────────────────────────────────────────────
@@ -1537,11 +1600,17 @@ impl EditorState {
     }
 }
 
-/// Verifica si un byte es parte de una "palabra" (alfanumérico o `_`).
+/// Verifica si un `char` es parte de una "palabra" (alfanumérico ASCII o `_`).
+///
+/// Firma `char` (no `u8`) para soportar iteración via `char_indices()` sobre
+/// strings con caracteres multi-byte UTF-8 sin acceso unsafe a bytes.
+/// Mantiene la semántica original (solo ASCII alfanumérico) — palabras con
+/// acentos como "código" se delimitan en la 'ó' (no es ascii_alphanumeric).
+/// Esa decisión es deliberada y consistente con la conducta existente.
 ///
 /// Visibilidad `pub(super)` — multicursor.rs lo usa para movimiento por palabra.
-pub(super) fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+pub(super) fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 // ─── Pure helpers: comment toggle ─────────────────────────────────────────────
@@ -1715,6 +1784,7 @@ mod editor_state_tests {
             highlight_cache: HighlightCache::new(),
             highlight_deferred: false,
             diff_view: None,
+            image_view: None,
         }
     }
 
@@ -2475,5 +2545,171 @@ mod editor_state_tests {
 
         assert_eq!(ed.buffer.line(0), Some("foo"));
         assert_eq!(ed.buffer.line(1), Some("bar"));
+    }
+
+    // ── Unicode + Atomic Paste integration ──
+
+    /// Cuenta entradas en el undo_stack — para validar atomicidad.
+    /// Usamos una pop+push para no exponer la longitud directa del stack.
+    fn undo_count(ed: &mut EditorState) -> usize {
+        let mut count = 0;
+        let mut popped = Vec::new();
+        while let Some(op) = ed.undo_stack.undo() {
+            popped.push(op);
+            count += 1;
+        }
+        // Restaurar todo via redo
+        for _ in 0..popped.len() {
+            ed.undo_stack.redo();
+        }
+        count
+    }
+
+    #[test]
+    fn paste_unicode_text_no_panic() {
+        let mut ed = editor_with("");
+        ed.insert_str("ñoño\ncódigo");
+        // Verificar que se insertó correctamente
+        assert_eq!(ed.buffer.line(0), Some("ñoño"));
+        assert_eq!(ed.buffer.line(1), Some("código"));
+        // Validar atomicidad: 1 sola entrada InsertText (no N por char).
+        // El editor inicial tiene 1 cursor sin selección → 1 entrada.
+        assert_eq!(undo_count(&mut ed), 1);
+    }
+
+    #[test]
+    fn type_accented_chars_no_panic() {
+        let mut ed = editor_with("");
+        ed.insert_char('ó');
+        // 'ó' = 2 bytes → cursor.col debe ser 2.
+        assert_eq!(ed.cursors.primary().position, Position { line: 0, col: 2 });
+        ed.insert_char('a');
+        // 'a' = 1 byte → cursor.col debe ser 3.
+        assert_eq!(ed.cursors.primary().position, Position { line: 0, col: 3 });
+        assert_eq!(ed.buffer.line(0), Some("óa"));
+    }
+
+    #[test]
+    fn select_unicode_text_and_replace() {
+        // Construir buffer con "héllo", seleccionar todo y reemplazar con "ñ".
+        let mut ed = editor_with("héllo");
+        // h(1) é(2) l(1) l(1) o(1) = 6 bytes
+        let line_len = ed.buffer.line_len(0);
+        assert_eq!(line_len, 6);
+
+        let primary = ed.cursors.primary_mut();
+        primary.position = Position { line: 0, col: line_len };
+        primary.selection = Some(Selection::new(
+            Position { line: 0, col: 0 },
+            Position { line: 0, col: line_len },
+        ));
+
+        ed.insert_str("ñ");
+        assert_eq!(ed.buffer.line(0), Some("ñ"));
+        // ñ = 2 bytes
+        assert_eq!(ed.cursors.primary().position, Position { line: 0, col: 2 });
+    }
+
+    #[test]
+    fn multicursor_with_unicode() {
+        // Texto con multi-byte; agregar dos cursores e insertar 'X' en cada uno.
+        // "héllo" — line 0
+        // Con dos cursores: uno en col 0, otro en col 1 (después de 'h').
+        let mut ed = editor_with("héllo");
+        // Primary en col 0 (default)
+        ed.cursors.add_cursor(Position { line: 0, col: 1 }, None);
+        ed.insert_char('X');
+        // Resultado esperado:
+        //   - cursor 1 inserta X en col 1: "hX..." → no — primero ordena, itera reverso
+        //   - cursor 0 inserta X en col 0: "Xh..."
+        // Después del orden + reverse iteration:
+        //   - itera col=1 primero: "hXéllo" cursor a col=2
+        //   - itera col=0 después: "XhXéllo" cursor a col=1
+        // Ambos cursores quedan en boundaries válidos.
+        let line = ed.buffer.line(0).unwrap();
+        // Validar invariante crítico: ningún cursor cae en medio de multi-byte.
+        for c in &ed.cursors.cursors {
+            assert!(line.is_char_boundary(c.position.col), "cursor col {} not on boundary in {:?}", c.position.col, line);
+        }
+        assert_eq!(line, "XhXéllo");
+    }
+
+    #[test]
+    fn move_word_through_spanish_text_no_panic() {
+        // Test integración: navegar word-by-word por texto con multi-byte
+        // — verifica que no panica y siempre cae en boundaries.
+        let mut ed = editor_with("año pasó rápido");
+        let line_len = ed.buffer.line_len(0);
+        // Mover word right repetidamente.
+        for _ in 0..10 {
+            ed.move_cursor_word(Direction::Right, false);
+        }
+        let line = ed.buffer.line(0).unwrap();
+        let pos = ed.cursors.primary().position;
+        assert!(line.is_char_boundary(pos.col));
+        assert!(pos.col <= line_len);
+    }
+
+    #[test]
+    fn backspace_through_emoji() {
+        // "😀" — 4 bytes. Cursor al final, backspace borra los 4 bytes (1 char).
+        let mut ed = editor_with("😀");
+        let primary = ed.cursors.primary_mut();
+        primary.position = Position { line: 0, col: 4 };
+
+        ed.delete_char();
+        assert_eq!(ed.buffer.line(0), Some(""));
+        assert_eq!(ed.cursors.primary().position, Position { line: 0, col: 0 });
+    }
+
+    #[test]
+    fn undo_redo_unicode_paste() {
+        let mut ed = editor_with("");
+        ed.insert_str("ñoño\ncódigo");
+        assert_eq!(ed.buffer.line(0), Some("ñoño"));
+        assert_eq!(ed.buffer.line(1), Some("código"));
+
+        ed.undo();
+        // Tras undo, buffer vuelve a estado inicial (1 línea vacía).
+        assert_eq!(ed.buffer.line_count(), 1);
+        assert_eq!(ed.buffer.line(0), Some(""));
+
+        ed.redo();
+        // Tras redo, vuelve el contenido pegado.
+        assert_eq!(ed.buffer.line(0), Some("ñoño"));
+        assert_eq!(ed.buffer.line(1), Some("código"));
+    }
+
+    #[test]
+    fn paste_single_line_creates_one_undo_entry() {
+        let mut ed = editor_with("");
+        ed.insert_str("hello world");
+        assert_eq!(ed.buffer.line(0), Some("hello world"));
+        // Sin selección → solo 1 InsertText.
+        assert_eq!(undo_count(&mut ed), 1);
+    }
+
+    #[test]
+    fn paste_over_selection_creates_two_undo_entries() {
+        // Selección activa + paste → 1 DeleteRange + 1 InsertText = 2 entries.
+        let mut ed = editor_with("hello");
+        let primary = ed.cursors.primary_mut();
+        primary.position = Position { line: 0, col: 5 };
+        primary.selection = Some(Selection::new(
+            Position { line: 0, col: 0 },
+            Position { line: 0, col: 5 },
+        ));
+        ed.insert_str("world");
+        assert_eq!(ed.buffer.line(0), Some("world"));
+        assert_eq!(undo_count(&mut ed), 2);
+    }
+
+    #[test]
+    fn crlf_paste_normalizes_to_lf() {
+        let mut ed = editor_with("");
+        ed.insert_str("a\r\nb\r\nc");
+        assert_eq!(ed.buffer.line(0), Some("a"));
+        assert_eq!(ed.buffer.line(1), Some("b"));
+        assert_eq!(ed.buffer.line(2), Some("c"));
     }
 }

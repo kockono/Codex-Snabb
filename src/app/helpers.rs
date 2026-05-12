@@ -183,6 +183,7 @@ mod tests {
             highlight_cache: crate::editor::highlighting::HighlightCache::new(),
             highlight_deferred: false,
             diff_view: None,
+            image_view: None,
         }
     }
 

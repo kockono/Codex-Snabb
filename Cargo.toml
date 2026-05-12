@@ -83,6 +83,16 @@ arboard = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Image viewer — terminal image rendering (Kitty / Sixel / iTerm2 / halfblocks).
+# v8 es la última versión compatible con ratatui 0.29 (v11 requiere ratatui 0.30).
+# Sin default-features para evitar chafa (libchafa system dep).
+# Mantenemos image-defaults para tener jpeg/png/gif/webp/bmp listos.
+ratatui-image = { version = "8", default-features = false, features = ["crossterm", "image-defaults"] }
+
+# `image` se trae transitivamente desde ratatui-image; lo declaramos explícito
+# para tener acceso a `image::ImageReader` y `image::DynamicImage` desde nuestro código.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

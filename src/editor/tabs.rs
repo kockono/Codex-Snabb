@@ -153,6 +153,94 @@ impl TabState {
             .is_some_and(|e| e.diff_view.is_some())
     }
 
+    /// Retorna `true` si la tab activa es una vista de imagen.
+    ///
+    /// Sigue el mismo patrón que `active_is_diff()` para que el reducer
+    /// pueda ignorar acciones de edición sobre tabs de imagen (read-only).
+    ///
+    /// Considera dos casos:
+    /// 1. `image_view = Some(...)`: imagen ya cargada — caso obvio.
+    /// 2. `image_view = None` + buffer vacío + file_path es de imagen: estamos
+    ///    en la ventana de carga async (placeholder creado por `open_image_tab`).
+    ///    Sin este check, la tab respondería a input de teclado durante la carga.
+    pub fn active_is_image(&self) -> bool {
+        let Some(editor) = self.editors.get(self.active_index) else {
+            return false;
+        };
+        if editor.image_view.is_some() {
+            return true;
+        }
+        // Placeholder de carga: buffer vacío, sin diff, y path es imagen.
+        if editor.diff_view.is_none()
+            && editor.buffer.line_count() <= 1
+            && editor.buffer.line_len(0) == 0
+            && let Some(path) = editor.buffer.file_path()
+            && crate::core::is_image_file(path)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Abre una tab placeholder para una imagen mientras se decodifica async.
+    ///
+    /// El buffer queda vacío y `image_view` se setea como `None` — el reducer
+    /// lo poblará cuando reciba `Event::ImageLoaded` (o `Event::ImageLoadError`)
+    /// del worker de decodificación.
+    ///
+    /// Dedup: si ya existe una tab con la misma `path` (texto O imagen), la
+    /// reusa en vez de crear una nueva. Esto evita abrir N copias de la misma
+    /// imagen al click rápido en el explorer.
+    ///
+    /// Retorna el índice de la tab abierta/reusada.
+    pub fn open_image_tab(&mut self, path: &Path) -> usize {
+        // Buscar tab existente con el mismo path. Para tabs de imagen
+        // miramos `image_view.path`; para placeholders mientras carga
+        // miramos `buffer.file_path()`.
+        for (i, editor) in self.editors.iter().enumerate() {
+            // Tab de imagen ya cargada
+            if let Some(ref iv) = editor.image_view
+                && iv.path == path
+            {
+                self.active_index = i;
+                return i;
+            }
+            // Placeholder con file_path seteado (durante carga)
+            if let Some(existing) = editor.buffer.file_path()
+                && existing == path
+                && editor.image_view.is_none()
+                && editor.diff_view.is_none()
+            {
+                // Solo reusar si el buffer está vacío (es un placeholder de imagen)
+                if editor.buffer.line_count() <= 1 && editor.buffer.line_len(0) == 0 {
+                    self.active_index = i;
+                    return i;
+                }
+            }
+        }
+
+        // Crear placeholder: EditorState vacío con el path guardado en el buffer
+        // para que el tab name muestre el nombre del archivo durante la carga.
+        let mut editor = EditorState::new();
+        // Asociar el path al buffer (sin cargar contenido, ya que es una imagen)
+        // CLONE: path se convierte a PathBuf — necesario para almacenar en buffer.
+        editor.buffer.set_file_path(path.to_path_buf());
+        self.editors.push(editor);
+        self.active_index = self.editors.len() - 1;
+        self.active_index
+    }
+
+    /// Setea el `image_view` de la tab `idx` (poblado tras decode async).
+    ///
+    /// No-op si el índice está fuera de rango. Limpia cualquier `diff_view`
+    /// previo (no debería existir en una tab de imagen, pero por consistencia).
+    pub fn set_image_content(&mut self, idx: usize, content: super::image::ImageViewContent) {
+        if let Some(editor) = self.editors.get_mut(idx) {
+            editor.diff_view = None;
+            editor.image_view = Some(content);
+        }
+    }
+
     /// Cierra la tab activa.
     ///
     /// Si hay más de una tab, mueve el foco a la anterior (o siguiente

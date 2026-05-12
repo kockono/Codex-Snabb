@@ -45,6 +45,57 @@ pub struct StatusBarData<'a> {
     pub encoding: &'a str,
     /// Porcentaje de scroll en el archivo (ej: "18%"). Pre-formateado fuera del render.
     pub scroll_pct: &'a str,
+    /// Si el panel inferior (terminal) está visible — controla el estado visual del botón
+    /// terminal toggle (colores invertidos cuando está activo).
+    pub terminal_visible: bool,
+}
+
+/// Ancho fijo del botón terminal toggle: "[>_]" = 4 celdas.
+pub const TERMINAL_BUTTON_WIDTH: u16 = 4;
+/// Espacio (1 celda) que separa el botón terminal de la indicación de encoding.
+const TERMINAL_BUTTON_SEPARATOR: u16 = 1;
+/// Espacio (2 celdas) que separa la indicación de encoding del bloque amber.
+const ENCODING_AMBER_SEPARATOR: u16 = 2;
+/// Espacio (1 celda) inicial del bloque amber.
+const AMBER_LEADING_SPACE: u16 = 1;
+/// Espacio (2 celdas) entre cursor_pos y scroll_pct dentro del bloque amber.
+const AMBER_INNER_SEPARATOR: u16 = 2;
+/// Espacio (1 celda) final del bloque amber.
+const AMBER_TRAILING_SPACE: u16 = 1;
+
+/// Calcula el rect absoluto donde se renderiza el botón terminal toggle dentro
+/// de la status bar. El botón se ubica flush right, ANTES del indicador UTF-8.
+///
+/// Layout right-flushed (de izquierda a derecha):
+///   `["[>_]"][1 sp bg][encoding][2 sp bg][" cursor_pos  scroll_pct "]`
+///
+/// `status_bar_area` es el Rect absoluto de la status bar (típicamente la última fila
+/// del frame). `data` es necesario para calcular los anchos del bloque amber y encoding.
+///
+/// Pure function — no IO, no allocations.
+pub fn terminal_button_rect(status_bar_area: Rect, data: &StatusBarData<'_>) -> Rect {
+    // Ancho del bloque amber: " {cursor_pos}  {scroll_pct} "
+    let amber_block_width = AMBER_LEADING_SPACE
+        + data.cursor_pos.len() as u16
+        + AMBER_INNER_SEPARATOR
+        + data.scroll_pct.len() as u16
+        + AMBER_TRAILING_SPACE;
+
+    let encoding_width = data.encoding.len() as u16;
+
+    // Total que ocupan los elementos a la derecha del botón (incluyendo separadores)
+    let right_of_button_width =
+        TERMINAL_BUTTON_SEPARATOR + encoding_width + ENCODING_AMBER_SEPARATOR + amber_block_width;
+
+    // Ancho total derecha (incluyendo el botón)
+    let total_right_width = TERMINAL_BUTTON_WIDTH + right_of_button_width;
+
+    // Posición x del botón: flush right
+    let button_x = status_bar_area
+        .x
+        .saturating_add(status_bar_area.width.saturating_sub(total_right_width));
+
+    Rect::new(button_x, status_bar_area.y, TERMINAL_BUTTON_WIDTH, 1)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -321,6 +372,7 @@ pub fn render_sidebar(
             render_explorer_entry(
                 entry,
                 scroll + i == explorer.selected_index,
+                focused,
                 tree_area.width as usize,
                 theme,
             )
@@ -335,10 +387,17 @@ pub fn render_sidebar(
 ///
 /// Incluye icono por extensión con color semántico antes del nombre.
 /// No aloca `format!()` — construye spans directamente.
-/// El highlight de selección usa `bg_active` del theme.
+///
+/// El highlight de selección es contextual:
+/// - Panel con foco + entry seleccionado → fondo cyan brillante (`fg_accent`)
+///   con texto oscuro — máxima visibilidad para navegación con teclado
+/// - Panel sin foco + entry seleccionado → fondo `bg_active` sutil — memoria
+///   de la última posición sin distraer
+/// - No seleccionado → fondo normal del panel (`bg_secondary`)
 fn render_explorer_entry<'a>(
     entry: &FlatEntry,
     selected: bool,
+    panel_focused: bool,
     max_width: usize,
     theme: &'a Theme,
 ) -> Line<'a> {
@@ -364,13 +423,25 @@ fn render_explorer_entry<'a>(
     let name_max = max_width.saturating_sub(prefix_len);
     let display_name = crate::ui::truncate_str(&entry.name, name_max);
 
-    // Estilo base según tipo y selección
-    let bg = if selected {
-        theme.bg_active
+    // Estilo base según tipo y selección.
+    // Background:
+    // - Focused + selected → cyan (highly visible cursor-like highlight)
+    // - Unfocused + selected → bg_active (subtle memory of position)
+    // - Not selected → bg_secondary (normal panel bg)
+    let bg = if selected && panel_focused {
+        theme.fg_accent // #00d4ff cyan — máxima visibilidad
+    } else if selected {
+        theme.bg_active // #121821 — memoria sutil
     } else {
-        theme.bg_secondary
+        theme.bg_secondary // #0d1117 — fondo normal
     };
-    let fg = if entry.is_dir {
+
+    // Foreground:
+    // - Focused + selected → dark text on cyan bg for max contrast
+    // - Otherwise → directory accent color or primary text
+    let fg = if selected && panel_focused {
+        theme.bg_primary // #0a0e14 dark text on cyan
+    } else if entry.is_dir {
         theme.fg_accent
     } else {
         theme.fg_primary
@@ -698,7 +769,17 @@ pub fn render_editor_area(
             let unmatched_bracket_at: Option<usize> = if bracket_match.is_none() {
                 // Verificar si el cursor está en esta línea y sobre un bracket
                 if buf_line_idx == primary_cursor_line {
-                    let ch = line_content.chars().nth(cursor_col);
+                    // cursor_col es BYTE offset; usamos slicing + .next() para
+                    // obtener el char en O(1) sin iterar como hace .nth(N).
+                    // Verificamos boundary para evitar panic si el cursor cayera
+                    // en medio de un multi-byte (no debería, pero defensivo).
+                    let ch = if cursor_col < line_content.len()
+                        && line_content.is_char_boundary(cursor_col)
+                    {
+                        line_content[cursor_col..].chars().next()
+                    } else {
+                        None
+                    };
                     if ch.is_some_and(crate::editor::brackets::is_bracket) {
                         Some(cursor_col)
                     } else {
@@ -1614,6 +1695,109 @@ pub fn render_diff_tab(
     }
 }
 
+// ─── Image Tab ─────────────────────────────────────────────────────────────────
+
+/// Renderiza una tab virtual de imagen (read-only, async-decoded).
+///
+/// Toma `&mut EditorState` porque `StatefulImage` requiere `&mut` sobre el
+/// `StatefulProtocol` (re-encoda en cada resize). Esto NO viola la regla
+/// de "zero allocations en render loop" — la re-encodificación ocurre solo
+/// cuando el area cambia de tamaño, no en cada frame.
+///
+/// Comportamiento:
+/// - `image_view = None`: la decode async todavía no terminó → spinner estático.
+/// - `image_view = Some` con `error = Some`: renderiza el mensaje de error.
+/// - `image_view = Some` con `error = None`: render del protocol via `StatefulImage`.
+///
+/// Estructura visual (paralela a `render_diff_tab`):
+///   - tab bar (1 fila)
+///   - content (fill — imagen / error / loading)
+///   - footer con atajos (1 fila)
+pub fn render_image_tab(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+    editor: &mut EditorState,
+    tab_infos: &[TabInfo],
+) {
+    use ratatui_image::StatefulImage;
+
+    let block =
+        panel_block("EDITOR", focused, theme).style(Style::default().bg(theme.bg_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Layout: tab bar (1) + content (fill) + footer (1) — idéntico a render_diff_tab.
+    let split = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tab bar
+            Constraint::Fill(1),   // contenido de la imagen
+            Constraint::Length(1), // footer con atajos
+        ])
+        .split(inner);
+    let tab_bar_area = split[0];
+    let content_area = split[1];
+    let footer_area = split[2];
+
+    render_tab_bar(f, tab_bar_area, theme, tab_infos);
+
+    // ── Contenido ──
+    if content_area.height > 0 && content_area.width > 0 {
+        match editor.image_view.as_mut() {
+            None => {
+                // Decode async todavía en curso — placeholder estático.
+                // Texto literal `'static` → cero allocations.
+                let para = Paragraph::new("Loading image...")
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(theme.fg_secondary)
+                            .bg(theme.bg_primary),
+                    );
+                f.render_widget(para, content_area);
+            }
+            Some(iv) if iv.error.is_some() => {
+                // Mensaje de error inline. `as_str()` evita clonar el String.
+                // `iv.error` siempre es Some aquí por el match guard.
+                let error_msg = iv.error.as_deref().unwrap_or("error desconocido");
+                let para = Paragraph::new(error_msg)
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(theme.fg_warning)
+                            .bg(theme.bg_primary),
+                    );
+                f.render_widget(para, content_area);
+            }
+            Some(iv) => {
+                // Render del protocolo. `StatefulImage::new()` es stateless
+                // (es solo el descriptor del widget). El estado real vive en
+                // `iv.protocol`, que el widget muta para re-encodear en resize.
+                // En ratatui-image v8 `new()` no toma argumentos (la versión
+                // del prompt original era para v11).
+                let image = StatefulImage::new();
+                f.render_stateful_widget(image, content_area, &mut iv.protocol);
+            }
+        }
+    }
+
+    // Footer con atajos — texto estático, cero allocaciones.
+    if footer_area.height > 0 {
+        let footer_line = Line::from(Span::styled(
+            " [Ctrl+W] Cerrar tab   [Ctrl+Tab] Siguiente tab",
+            Style::default().fg(theme.fg_secondary).bg(theme.bg_active),
+        ));
+        let p = Paragraph::new(footer_line).style(Style::default().bg(theme.bg_active));
+        f.render_widget(p, footer_area);
+    }
+}
+
 // ─── Tab Bar ───────────────────────────────────────────────────────────────────
 
 /// Renderiza la barra de tabs del editor.
@@ -1986,7 +2170,34 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, theme: &Theme, data: &Status
     let amber_bg = ratatui::style::Color::Rgb(229, 165, 10); // #e5a50a
     let amber_fg = ratatui::style::Color::Rgb(15, 15, 15);   // casi negro — alta legibilidad
 
+    // Botón terminal toggle: estilo discreto gris.
+    // - Inactivo (terminal cerrado): gris oscuro con texto medio (sutil, no llama atención)
+    // - Activo (terminal visible): gris medio con texto blanco (claramente "pressed")
+    let (term_btn_bg, term_btn_fg) = if data.terminal_visible {
+        (
+            ratatui::style::Color::Rgb(75, 85, 99),    // #4b5563 gris medio (active)
+            ratatui::style::Color::Rgb(243, 244, 246), // #f3f4f6 texto blanco/claro
+        )
+    } else {
+        (
+            ratatui::style::Color::Rgb(45, 52, 65),    // #2d3441 gris oscuro (inactive)
+            ratatui::style::Color::Rgb(156, 163, 175), // #9ca3af gris medio (texto)
+        )
+    };
+
     let right_spans = vec![
+        // Botón terminal toggle: "[>_]" — 4 celdas
+        Span::styled("[", Style::default().fg(term_btn_fg).bg(term_btn_bg)),
+        Span::styled(
+            ">_",
+            Style::default()
+                .fg(term_btn_fg)
+                .bg(term_btn_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]", Style::default().fg(term_btn_fg).bg(term_btn_bg)),
+        // Separador entre botón y encoding
+        Span::styled(" ", Style::default().bg(theme.bg_status)),
         Span::styled(
             data.encoding,
             Style::default().fg(theme.fg_secondary).bg(theme.bg_status),
@@ -2238,4 +2449,103 @@ pub fn render_lsp_completions(
         .style(Style::default().bg(theme.bg_secondary));
 
     f.render_widget(paragraph, dropdown_area);
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_data<'a>(cursor_pos: &'a str, scroll_pct: &'a str, encoding: &'a str) -> StatusBarData<'a> {
+        StatusBarData {
+            mode: " NORMAL ",
+            git_status: "main",
+            encoding,
+            cursor_pos,
+            scroll_pct,
+            terminal_visible: false,
+        }
+    }
+
+    #[test]
+    fn terminal_button_rect_dimensions_are_fixed() {
+        let area = Rect::new(0, 23, 80, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        assert_eq!(btn.width, TERMINAL_BUTTON_WIDTH);
+        assert_eq!(btn.width, 4);
+        assert_eq!(btn.height, 1);
+        assert_eq!(btn.y, area.y);
+    }
+
+    #[test]
+    fn terminal_button_rect_positioned_left_of_encoding() {
+        // Layout right-flushed:
+        //   [" >_ " (4)][" " (1)]["UTF-8" (5)]["  " (2)][" 1:1  0% " (9)]
+        // Total right width = 4 + 1 + 5 + 2 + 9 = 21
+        // area.width = 80, so button_x = 0 + 80 - 21 = 59
+        let area = Rect::new(0, 23, 80, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        assert_eq!(btn.x, 59);
+        // Encoding starts at btn.x + button_width + separator = 59 + 4 + 1 = 64
+        // The 5 chars of "UTF-8" should fit before the amber block.
+    }
+
+    #[test]
+    fn terminal_button_rect_within_status_bar_bounds() {
+        let area = Rect::new(0, 23, 100, 1);
+        let data = make_data("352:34", "100%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // Button must be entirely inside the area
+        assert!(btn.x >= area.x);
+        assert!(btn.x + btn.width <= area.x + area.width);
+        assert_eq!(btn.y, area.y);
+    }
+
+    #[test]
+    fn terminal_button_rect_respects_x_offset() {
+        // status bar starts at x=10
+        let area = Rect::new(10, 5, 50, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // Total right width = 21, button_x = 10 + 50 - 21 = 39
+        assert_eq!(btn.x, 39);
+    }
+
+    #[test]
+    fn terminal_button_rect_clamps_when_area_too_small() {
+        // Status bar so narrow it can't fit everything → saturating_sub gives x = area.x
+        let area = Rect::new(0, 0, 5, 1);
+        let data = make_data("1:1", "0%", "UTF-8");
+        let btn = terminal_button_rect(area, &data);
+        // total_right_width (21) > area.width (5) → button_x clamps to area.x
+        assert_eq!(btn.x, 0);
+        // Width is still 4, which extends beyond the area — caller is responsible
+        // for not rendering when the area is degenerate.
+        assert_eq!(btn.width, 4);
+    }
+
+    #[test]
+    fn terminal_button_rect_position_changes_with_longer_cursor_pos() {
+        let area = Rect::new(0, 0, 100, 1);
+        let short = make_data("1:1", "0%", "UTF-8");
+        let long = make_data("1234:567", "100%", "UTF-8");
+        let btn_short = terminal_button_rect(area, &short);
+        let btn_long = terminal_button_rect(area, &long);
+        // Longer cursor_pos shifts the button further left
+        assert!(btn_long.x < btn_short.x);
+    }
+
+    #[test]
+    fn terminal_button_rect_y_matches_area_y() {
+        // Button must be on the same row as the status bar
+        for y in [0u16, 5, 23, 100] {
+            let area = Rect::new(0, y, 80, 1);
+            let data = make_data("1:1", "0%", "UTF-8");
+            let btn = terminal_button_rect(area, &data);
+            assert_eq!(btn.y, y);
+        }
+    }
 }

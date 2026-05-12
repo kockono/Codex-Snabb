@@ -156,7 +156,26 @@ pub struct AppState {
     /// Contador de ticks para el blink del cursor.
     /// Se resetea a 0 en cada input del usuario.
     pub cursor_blink_counter: u32,
+    /// Picker de `ratatui-image` — detecta protocolo de terminal (Kitty/Sixel/halfblocks)
+    /// y font-size en pixels. Lazy init: queda `None` hasta la primera apertura
+    /// de imagen, momento en el que se ejecuta `Picker::from_query_stdio()`.
+    ///
+    /// `Picker` es `Clone + Send + Sync`, lo cual nos permite clonarlo dentro
+    /// de `spawn_blocking` sin compartir mutabilidad.
+    pub image_picker: Option<ratatui_image::picker::Picker>,
+    /// Sender de eventos async (workers → main loop). El receiver vive en
+    /// `async_event_rx` y se polleea con `try_recv` en cada frame.
+    pub async_event_tx: tokio::sync::mpsc::Sender<Event>,
+    /// Receiver de eventos async (poll non-blocking en el main loop).
+    pub async_event_rx: tokio::sync::mpsc::Receiver<Event>,
 }
+
+/// Capacidad del canal de eventos async (workers → main loop).
+///
+/// Bounded para respetar el principio de backpressure de la arquitectura.
+/// 16 es generoso: el caso típico es 1 imagen cargándose; el límite acomoda
+/// múltiples opens consecutivos sin perder eventos.
+const ASYNC_EVENT_CHANNEL_CAPACITY: usize = 16;
 
 impl AppState {
     /// Crea un nuevo estado con valores por defecto y editor vacío.
@@ -168,6 +187,9 @@ impl AppState {
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
         load_keybindings(&mut commands);
+
+        let (async_event_tx, async_event_rx) =
+            tokio::sync::mpsc::channel::<Event>(ASYNC_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             running: true,
@@ -206,6 +228,9 @@ impl AppState {
             bracket_match: None,
             cursor_visible: true,
             cursor_blink_counter: 0,
+            image_picker: None,
+            async_event_tx,
+            async_event_rx,
         })
     }
 
@@ -227,6 +252,9 @@ impl AppState {
         let mut commands = CommandRegistry::new();
         commands.register_defaults();
         load_keybindings(&mut commands);
+
+        let (async_event_tx, async_event_rx) =
+            tokio::sync::mpsc::channel::<Event>(ASYNC_EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             running: true,
@@ -265,6 +293,9 @@ impl AppState {
             bracket_match: None,
             cursor_visible: true,
             cursor_blink_counter: 0,
+            image_picker: None,
+            async_event_tx,
+            async_event_rx,
         })
     }
 
@@ -764,37 +795,56 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
             vec![]
         }
         Action::ExplorerToggle => {
+            // Resultado de la rama de imagen: si abrimos imagen, retornamos
+            // el Effect::DecodeImage para que el worker async la procese.
+            let mut image_effect: Vec<Effect> = Vec::new();
             if let Some(ref mut explorer) = state.explorer {
                 match explorer.toggle_selected() {
                     Ok(is_file) => {
                         if is_file {
-                            // Abrir archivo en una tab del editor
                             if let Some(path) = explorer.selected_path() {
-                                match state.tabs.open_file(&path) {
-                                    Ok(()) => {
-                                        // init_highlighting se llama solo si el cache
-                                        // no tiene syntax asignada (archivo recién abierto).
-                                        // Si ya tiene syntax (tab existente), no tocar el cache.
-                                        {
-                                            let engine = &state.highlight_engine;
-                                            let editor = state.tabs.active_mut();
-                                            if !editor.highlight_cache.has_syntax() {
-                                                editor.init_highlighting(engine);
+                                // Branch: imagen → placeholder + Effect::DecodeImage async.
+                                if crate::core::is_image_file(&path) {
+                                    let tab_index = state.tabs.open_image_tab(&path);
+                                    state.focused_panel = PanelId::Editor;
+                                    state.update_status_cache();
+                                    tracing::info!(
+                                        path = %path.display(),
+                                        tab_index,
+                                        "imagen abierta desde explorer (decode async)"
+                                    );
+                                    image_effect.push(Effect::DecodeImage {
+                                        path,
+                                        tab_index,
+                                    });
+                                } else {
+                                    // Path normal de archivo de texto
+                                    match state.tabs.open_file(&path) {
+                                        Ok(()) => {
+                                            // init_highlighting se llama solo si el cache
+                                            // no tiene syntax asignada (archivo recién abierto).
+                                            // Si ya tiene syntax (tab existente), no tocar el cache.
+                                            {
+                                                let engine = &state.highlight_engine;
+                                                let editor = state.tabs.active_mut();
+                                                if !editor.highlight_cache.has_syntax() {
+                                                    editor.init_highlighting(engine);
+                                                }
                                             }
-                                        }
-                                        state.focused_panel = PanelId::Editor;
-                                        state.update_status_cache();
-                                        // Notificar LSP del nuevo archivo abierto
-                                        if state.lsp.has_server() {
-                                            let text = buffer_full_text(state.tabs.active());
-                                            if let Err(e) = state.lsp.notify_open(&path, &text) {
-                                                tracing::warn!(error = %e, "error en LSP did_open");
+                                            state.focused_panel = PanelId::Editor;
+                                            state.update_status_cache();
+                                            // Notificar LSP del nuevo archivo abierto
+                                            if state.lsp.has_server() {
+                                                let text = buffer_full_text(state.tabs.active());
+                                                if let Err(e) = state.lsp.notify_open(&path, &text) {
+                                                    tracing::warn!(error = %e, "error en LSP did_open");
+                                                }
                                             }
+                                            tracing::info!(path = %path.display(), "archivo abierto desde explorer");
                                         }
-                                        tracing::info!(path = %path.display(), "archivo abierto desde explorer");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "error al abrir archivo desde explorer");
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "error al abrir archivo desde explorer");
+                                        }
                                     }
                                 }
                             }
@@ -805,7 +855,7 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     }
                 }
             }
-            vec![]
+            image_effect
         }
         Action::ExplorerCollapse => {
             if let Some(ref mut explorer) = state.explorer
@@ -1089,6 +1139,22 @@ fn reduce(state: &mut AppState, action: &Action) -> Vec<Effect> {
                     } else {
                         relative_path
                     };
+
+                    // Branch: imagen → placeholder + Effect::DecodeImage async.
+                    if crate::core::is_image_file(&absolute_path) {
+                        let tab_index = state.tabs.open_image_tab(&absolute_path);
+                        state.focused_panel = PanelId::Editor;
+                        state.update_status_cache();
+                        tracing::info!(
+                            path = %absolute_path.display(),
+                            tab_index,
+                            "imagen abierta desde quick open (decode async)"
+                        );
+                        return vec![Effect::DecodeImage {
+                            path: absolute_path,
+                            tab_index,
+                        }];
+                    }
 
                     match state.tabs.open_file(&absolute_path) {
                         Ok(()) => {
@@ -2592,13 +2658,22 @@ use mouse::{reduce_mouse_click, reduce_mouse_drag, reduce_mouse_middle_click, re
 
 /// Procesa los efectos producidos por el reducer.
 ///
-/// Por ahora solo `Effect::Quit` tiene comportamiento (cancela el token).
-/// A medida que se implementen workers, se despacharán acá.
-fn process_effects(effects: &[Effect], shutdown: &CancellationToken) {
+/// Toma `&mut AppState` porque algunos efectos requieren mutar estado
+/// (ej: lazy init del `image_picker`). El `shutdown` es la cancelación
+/// global de la app; `Effect::DecodeImage` usa un child token para que
+/// las tareas async se cancelen junto con el shutdown.
+fn process_effects(
+    effects: &[Effect],
+    shutdown: &CancellationToken,
+    state: &mut AppState,
+) {
     for effect in effects {
         match effect {
             Effect::Quit => {
                 shutdown.cancel();
+            }
+            Effect::DecodeImage { path, tab_index } => {
+                spawn_decode_image(state, shutdown, path.clone(), *tab_index);
             }
             // Efectos futuros se despacharán a workers acá
             Effect::None
@@ -2611,6 +2686,150 @@ fn process_effects(effects: &[Effect], shutdown: &CancellationToken) {
             }
         }
     }
+}
+
+/// Procesa un evento async recibido del canal de workers.
+///
+/// Los eventos async ya son resultados resueltos (no pasan por keymap):
+/// `ImageLoaded` / `ImageLoadError`. Esta función muta el estado en
+/// consecuencia y refresca el status cache.
+fn handle_async_event(state: &mut AppState, event: Event) {
+    match event {
+        Event::ImageLoaded { tab_index, content } => {
+            // El `Box<ImageViewContent>` se desreferencia con `*` y se mueve.
+            state.tabs.set_image_content(tab_index, *content);
+            state.update_status_cache();
+            tracing::info!(tab_index, "imagen cargada y protocolo listo");
+        }
+        Event::ImageLoadError {
+            tab_index,
+            path,
+            error,
+        } => {
+            let placeholder = crate::editor::image::ImageViewContent::with_error(path, error);
+            state.tabs.set_image_content(tab_index, placeholder);
+            state.update_status_cache();
+            tracing::warn!(tab_index, "imagen falló al cargar — placeholder de error activo");
+        }
+        // Otros eventos async no se generan todavía — ignorar silenciosamente.
+        Event::Input(_)
+        | Event::Tick
+        | Event::FileLoaded { .. }
+        | Event::FileError { .. }
+        | Event::SearchResult
+        | Event::GitStatus
+        | Event::Resize(_, _)
+        | Event::Shutdown => {
+            tracing::debug!(?event, "evento async ignorado — sin handler todavía");
+        }
+    }
+}
+
+/// Despacha el worker async de decodificación de imágenes.
+///
+/// - Lazy-init del `Picker` la primera vez que se abre una imagen.
+/// - Clona el `Picker` (es `Clone`) para enviarlo al `spawn_blocking`.
+/// - Decodea + downscalea + construye el protocolo dentro del blocking pool.
+/// - Envía `Event::ImageLoaded` o `Event::ImageLoadError` por el canal async.
+/// - Respeta `CancellationToken` para shutdown limpio.
+fn spawn_decode_image(
+    state: &mut AppState,
+    shutdown: &CancellationToken,
+    path: PathBuf,
+    tab_index: usize,
+) {
+    // Lazy init del picker — la query stdio puede tardar pero solo ocurre 1 vez.
+    if state.image_picker.is_none() {
+        let picker = match ratatui_image::picker::Picker::from_query_stdio() {
+            Ok(p) => {
+                tracing::info!("image picker: protocol detectado via stdio query");
+                p
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "image picker: fallback a halfblocks (fontsize 8x16)"
+                );
+                ratatui_image::picker::Picker::from_fontsize((8, 16))
+            }
+        };
+        state.image_picker = Some(picker);
+    }
+
+    // CLONE: necesario — el Picker se mueve al spawn_blocking, pero el AppState
+    // mantiene el original para futuras imágenes.
+    let picker_clone = state
+        .image_picker
+        .as_ref()
+        .expect("picker recién inicializado arriba")
+        .clone();
+
+    // CLONE: tx se mueve al async task; el AppState mantiene su copia.
+    let tx = state.async_event_tx.clone();
+    let cancellation = shutdown.child_token();
+    // CLONE: necesario para construir el error path si falla la decodificación.
+    let path_for_error = path.clone();
+
+    // CLONE: necesario para el log en la rama de cancelación, ya que `path`
+    // se mueve dentro del `spawn_blocking` inferior y no se puede capturar
+    // simultáneamente por dos branches del `tokio::select!`.
+    let path_for_log = path.clone();
+
+    tokio::spawn(async move {
+        // Si la app se cancela durante la decodificación, abandonamos sin enviar.
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tracing::debug!(path = %path_for_log.display(), "decode image cancelado por shutdown");
+            }
+            result = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::editor::image::ImageViewContent> {
+                // 1. Abrir + decodear la imagen (CPU-bound; por eso spawn_blocking).
+                let reader = ::image::ImageReader::open(&path)
+                    .with_context(|| format!("no se pudo abrir el archivo: {}", path.display()))?;
+                let img = reader
+                    .decode()
+                    .with_context(|| format!("no se pudo decodificar la imagen: {}", path.display()))?;
+
+                // 2. Downscale si excede 1920×1080 — protege el budget de RAM.
+                //    `image::imageops::FilterType::Lanczos3` es de buena calidad pero
+                //    aceptable en CPU para un downscale de una sola pasada.
+                let img = if img.width() > 1920 || img.height() > 1080 {
+                    img.resize(1920, 1080, ::image::imageops::FilterType::Lanczos3)
+                } else {
+                    img
+                };
+
+                // 3. Construir el protocolo (encoding inicial).
+                let content = crate::editor::image::ImageViewContent::new(
+                    path.clone(), // CLONE: el path se conserva en el content y luego en error path
+                    img,
+                    &picker_clone,
+                );
+                Ok(content)
+            }) => {
+                let event = match result {
+                    Ok(Ok(content)) => Event::ImageLoaded {
+                        tab_index,
+                        content: Box::new(content),
+                    },
+                    Ok(Err(e)) => Event::ImageLoadError {
+                        tab_index,
+                        path: path_for_error,
+                        error: format!("{e:#}"),
+                    },
+                    Err(join_err) => Event::ImageLoadError {
+                        tab_index,
+                        path: path_for_error,
+                        error: format!("worker panic: {join_err}"),
+                    },
+                };
+                // Bounded send: si el canal está lleno (16 pendientes), esto espera.
+                // Si el receiver se dropeó (shutdown), simplemente loggeamos.
+                if let Err(e) = tx.send(event).await {
+                    tracing::warn!(error = %e, "async event channel cerrado");
+                }
+            }
+        }
+    });
 }
 
 // ─── Run ───────────────────────────────────────────────────────────────────────
@@ -2849,7 +3068,9 @@ async fn event_loop(
                     state.save_as.visible,
                     state.context_menu.visible,
                     state.rename.visible,
-                    state.tabs.active_is_diff(),
+                    // Las tabs de imagen comparten el comportamiento read-only
+                    // de las tabs de diff — el keymap las trata igual.
+                    state.tabs.active_is_diff() || state.tabs.active_is_image(),
                     state.tabs.active().search.is_some(),
                     state
                         .explorer
@@ -2891,7 +3112,7 @@ async fn event_loop(
                 // Consultar diálogo nativo de carpeta (no bloquea — try_recv)
                 if let Some(path) = state.projects.poll_native_picker() {
                     let effects = reduce(&mut state, &Action::ProjectsNativePickerResult(path));
-                    process_effects(&effects, shutdown);
+                    process_effects(&effects, shutdown, &mut state);
                 }
             }
             Some(Event::Input(_)) => {
@@ -2923,7 +3144,14 @@ async fn event_loop(
         }
 
         // 6. Procesar efectos
-        process_effects(&effects, shutdown);
+        process_effects(&effects, shutdown, &mut state);
+
+        // 6.1. Poll de eventos async (workers → main loop) — non-blocking.
+        //      Cada evento se procesa con `handle_async_event` que muta el estado
+        //      directamente (no pasa por keymap, ya son eventos resueltos).
+        while let Ok(async_event) = state.async_event_rx.try_recv() {
+            handle_async_event(&mut state, async_event);
+        }
 
         // 6.5. Ajustar scroll del explorer para mantener selección visible.
         //      Se hace antes del render para que el viewport sea correcto.
@@ -3051,7 +3279,7 @@ async fn event_loop(
 
         // 8. Render frame actual
         terminal.draw(|frame| {
-            ui::render(frame, &state, theme);
+            ui::render(frame, &mut state, theme);
         }).context("error en render")?;
 
         // 8.5. Poll de output del terminal (non-blocking).

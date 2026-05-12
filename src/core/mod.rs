@@ -8,8 +8,11 @@
 
 pub mod budgets;
 pub mod command;
+pub mod file_types;
 pub mod ids;
 pub mod settings;
+
+pub use file_types::is_image_file;
 
 use std::path::PathBuf;
 
@@ -657,6 +660,30 @@ pub enum Event {
     /// Señal de shutdown externo.
     #[expect(dead_code, reason = "se usará cuando se implemente shutdown por señal")]
     Shutdown,
+
+    // ── Image viewer ──
+    /// Imagen decodificada y protocolo pre-codificado listo para mostrar.
+    ///
+    /// Se emite desde el worker async tras `Effect::DecodeImage`. El reducer
+    /// poblará `EditorState::image_view` en la tab `tab_index` con el `content`.
+    ///
+    /// `Box` para no inflar el tamaño del enum `Event` — el `StatefulProtocol`
+    /// puede contener buffers de imagen grandes.
+    ImageLoaded {
+        /// Índice de la tab destino (asignado al abrir el placeholder).
+        tab_index: usize,
+        /// Contenido pre-construido (path + protocolo + error=None).
+        content: Box<crate::editor::image::ImageViewContent>,
+    },
+    /// Error al decodificar una imagen.
+    ImageLoadError {
+        /// Índice de la tab destino donde mostrar el error.
+        tab_index: usize,
+        /// Path original (para mostrar en el placeholder de error).
+        path: std::path::PathBuf,
+        /// Mensaje de error legible para el usuario.
+        error: String,
+    },
 }
 
 // ─── Effect ────────────────────────────────────────────────────────────────────
@@ -701,6 +728,20 @@ pub enum Effect {
         reason = "se usa como retorno explícito de 'sin efecto' cuando se necesite"
     )]
     None,
+    /// Decodificar una imagen async y emitir `Event::ImageLoaded`/`ImageLoadError`.
+    ///
+    /// El handler:
+    /// 1. Asegura que `AppState::image_picker` está inicializado (lazy).
+    /// 2. Clona el `Picker` (es `Clone`) y lanza `spawn_blocking` para decodear.
+    /// 3. Dentro del blocking task, decodea con `image::ImageReader`, downscalea
+    ///    si excede 1920x1080, construye el protocolo y envía el `Event` por
+    ///    el canal async del AppState.
+    DecodeImage {
+        /// Path absoluto del archivo de imagen.
+        path: PathBuf,
+        /// Índice de la tab placeholder donde se mostrará el resultado.
+        tab_index: usize,
+    },
 }
 
 // ─── PanelId ───────────────────────────────────────────────────────────────────
