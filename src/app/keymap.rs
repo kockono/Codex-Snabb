@@ -403,6 +403,9 @@ pub(super) fn keymap(
 
     // ── Atajos globales (Ctrl+algo, Esc, Tab) ──
     match (key.code, key.modifiers) {
+        // Esc: si el file search está activo, lo cierra con prioridad sobre
+        // EscapeHierarchy — el search bar captura el Esc antes que el editor.
+        (KeyCode::Esc, _) if editor_file_search_active => return Action::FileSearchClose,
         // Esc: jerarquía multicursor → selección → foco al editor → no-op.
         // NUNCA cierra la app — para eso está Ctrl+Q.
         (KeyCode::Esc, _) => return Action::EscapeHierarchy,
