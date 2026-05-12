@@ -155,7 +155,7 @@ const MENU_WIDTH: u16 = 27;
 ///   8 → Copy Relative Path
 ///   9 → ── separador ──
 ///  10 → Reveal in File Explorer
-const MENU_INNER_HEIGHT: u16 = 11; // 8 items + 3 separadores
+const MENU_INNER_HEIGHT: u16 = 12; // 8 items + 3 separadores + 1 footer de hints
 
 /// Mapeo de fila interna → item index (None = separador).
 ///
@@ -278,5 +278,21 @@ pub fn render_context_menu(
                 );
             }
         }
+    }
+
+    // Footer de hints de navegación — última fila del inner area
+    let footer_y = inner.y + MENU_INNER_HEIGHT - 1;
+    if footer_y < inner.y + inner.height {
+        let footer_rect = Rect::new(inner.x, footer_y, inner.width, 1);
+        let hint_style = Style::default()
+            .fg(theme.fg_secondary)
+            .bg(theme.bg_active);
+        let line = Line::from(vec![
+            Span::styled(" ↑↓ ", hint_style),
+            Span::styled("nav", hint_style),
+            Span::styled("  ↵ ", hint_style),
+            Span::styled("confirm", hint_style),
+        ]);
+        f.render_widget(Paragraph::new(line), footer_rect);
     }
 }
