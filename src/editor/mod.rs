@@ -1597,6 +1597,15 @@ impl EditorState {
         primary.clear_selection();
         let pos = self.cursors.primary().position;
         self.viewport.ensure_cursor_visible(&pos);
+        // Cuando el search bar está activo ocupa la última fila del área del
+        // editor — si el match cayó exactamente en esa fila, el scroll lo tapa.
+        // Compensamos adelantando el offset 1 fila extra en ese caso.
+        if self.search.is_some() && self.viewport.height > 0 {
+            let last_visible = self.viewport.scroll_offset + self.viewport.height - 1;
+            if pos.line == last_visible {
+                self.viewport.scroll_offset += 1;
+            }
+        }
     }
 }
 
