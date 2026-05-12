@@ -36,6 +36,25 @@ pub enum EditOperation {
     /// Línea insertada en el índice. Para undo: borrar esa línea.
     /// Para redo: re-insertar el contenido (clone necesario para re-aplicar).
     InsertLine { line: usize, content: String },
+    /// Bloque de texto insertado atómicamente (paste, multi-char).
+    ///
+    /// `start` es donde empezó la inserción, `end` la posición justo después
+    /// del último byte. `text` es el contenido para redo (y el rango para
+    /// validar undo). Undo = `delete_range(start, end)`. Redo = `insert_text(start, &text)`.
+    InsertText {
+        start: Position,
+        end: Position,
+        text: String,
+    },
+    /// Bloque de texto eliminado atómicamente (selección, paste-replace).
+    ///
+    /// `text` es lo que se borró — necesario para undo. Undo = `insert_text(start, &text)`.
+    /// Redo = `delete_range(start, end)`.
+    DeleteRange {
+        start: Position,
+        end: Position,
+        text: String,
+    },
 }
 
 /// Stack dual de undo/redo con capacidad limitada.
@@ -162,4 +181,72 @@ mod tests {
         assert!(!matches!(insert, EditOperation::ReplaceLine { .. }));
         assert!(!matches!(replace, EditOperation::InsertLine { .. }));
     }
+
+    // ── InsertText / DeleteRange ──
+
+    #[test]
+    fn insert_text_push_undo_redo_round_trip() {
+        let mut stack = UndoStack::new();
+        let op = EditOperation::InsertText {
+            start: Position { line: 0, col: 2 },
+            end: Position { line: 1, col: 3 },
+            // CLONE: test setup needs owned string
+            text: String::from("ñoño\ncódigo"),
+        };
+        stack.push(op);
+
+        let undone = stack.undo().expect("undo should return op");
+        match undone {
+            EditOperation::InsertText { start, end, text } => {
+                assert_eq!(start, Position { line: 0, col: 2 });
+                assert_eq!(end, Position { line: 1, col: 3 });
+                assert_eq!(text, "ñoño\ncódigo");
+            }
+            _ => panic!("expected InsertText"),
+        }
+
+        let redone = stack.redo().expect("redo should return op");
+        assert!(matches!(redone, EditOperation::InsertText { .. }));
+    }
+
+    #[test]
+    fn delete_range_push_undo_redo_round_trip() {
+        let mut stack = UndoStack::new();
+        let op = EditOperation::DeleteRange {
+            start: Position { line: 1, col: 0 },
+            end: Position { line: 2, col: 5 },
+            // CLONE: test setup needs owned string
+            text: String::from("borrado\nmulti"),
+        };
+        stack.push(op);
+
+        let undone = stack.undo().expect("undo should return op");
+        match undone {
+            EditOperation::DeleteRange { start, end, text } => {
+                assert_eq!(start, Position { line: 1, col: 0 });
+                assert_eq!(end, Position { line: 2, col: 5 });
+                assert_eq!(text, "borrado\nmulti");
+            }
+            _ => panic!("expected DeleteRange"),
+        }
+
+        let redone = stack.redo().expect("redo should return op");
+        assert!(matches!(redone, EditOperation::DeleteRange { .. }));
+    }
+
+    #[test]
+    fn insert_text_distinct_from_insert_char() {
+        let block = EditOperation::InsertText {
+            start: Position::zero(),
+            end: Position { line: 0, col: 5 },
+            text: String::from("hello"),
+        };
+        let single = EditOperation::InsertChar {
+            pos: Position::zero(),
+            ch: 'h',
+        };
+        assert!(!matches!(block, EditOperation::InsertChar { .. }));
+        assert!(!matches!(single, EditOperation::InsertText { .. }));
+    }
+
 }

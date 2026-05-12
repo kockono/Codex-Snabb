@@ -149,12 +149,16 @@ impl Cursor {
     /// Mueve el cursor un carácter a la izquierda.
     ///
     /// Si está al inicio de una línea, sube al final de la anterior.
-    /// Actualiza `desired_col`.
+    /// Actualiza `desired_col`. Respeta char boundaries multi-byte UTF-8
+    /// usando `unicode::prev_char_boundary`.
     /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
     pub fn move_left(&mut self, buffer: &TextBuffer, selecting: bool) {
         self.handle_selection_mode(selecting);
         if self.position.col > 0 {
-            self.position.col -= 1;
+            // Retroceder al char boundary anterior (NO `col -= 1` — eso panica
+            // si col cae en medio de un char multi-byte).
+            let line = buffer.line(self.position.line).unwrap_or("");
+            self.position.col = super::unicode::prev_char_boundary(line, self.position.col);
         } else if self.position.line > 0 {
             self.position.line -= 1;
             self.position.col = buffer.line_len(self.position.line);
@@ -168,13 +172,16 @@ impl Cursor {
     /// Mueve el cursor un carácter a la derecha.
     ///
     /// Si está al final de una línea, baja al inicio de la siguiente.
-    /// Actualiza `desired_col`.
+    /// Actualiza `desired_col`. Respeta char boundaries multi-byte UTF-8
+    /// usando `unicode::char_len_at`.
     /// Si `selecting == true`, extiende la selección; si `false`, la limpia.
     pub fn move_right(&mut self, buffer: &TextBuffer, selecting: bool) {
         self.handle_selection_mode(selecting);
         let line_len = buffer.line_len(self.position.line);
         if self.position.col < line_len {
-            self.position.col += 1;
+            // Avanzar por el largo del char actual (NO `col += 1`).
+            let line = buffer.line(self.position.line).unwrap_or("");
+            self.position.col += super::unicode::char_len_at(line, self.position.col);
         } else if self.position.line + 1 < buffer.line_count() {
             self.position.line += 1;
             self.position.col = 0;

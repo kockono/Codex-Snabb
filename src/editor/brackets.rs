@@ -21,10 +21,16 @@ const SEARCH_LIMIT: usize = 10_000;
 
 /// Obtiene el carácter en una posición del buffer.
 ///
-/// Retorna `None` si la posición está fuera de rango.
+/// `pos.col` es BYTE offset (invariante de `Position`). Usamos slicing +
+/// `.next()` — O(1) — en lugar de `chars().nth(pos.col)` que era O(N) y
+/// además interpretaba `pos.col` como índice de char (incorrecto).
+/// Retorna `None` si la posición está fuera de rango o no es char boundary.
 fn char_at(buffer: &TextBuffer, pos: Position) -> Option<char> {
     let line = buffer.line(pos.line)?;
-    line.chars().nth(pos.col)
+    if pos.col >= line.len() || !line.is_char_boundary(pos.col) {
+        return None;
+    }
+    line[pos.col..].chars().next()
 }
 
 /// Busca el bracket de cierre correspondiente hacia adelante.
@@ -39,13 +45,20 @@ fn find_forward(buffer: &TextBuffer, pos: Position, open: char, close: char) -> 
     let mut chars_scanned: usize = 0;
     let total_lines = buffer.line_count();
 
-    // Empezar en la misma línea, después de pos.col
+    // Empezar en la misma línea, justo después del char de pos.col.
+    // pos.col es BYTE offset → start_col también es byte offset.
     let mut line_idx = pos.line;
-    let mut start_col = pos.col + 1;
+    let mut start_col = if let Some(line) = buffer.line(pos.line) {
+        pos.col + super::unicode::char_len_at(line, pos.col)
+    } else {
+        pos.col + 1
+    };
 
     while line_idx < total_lines {
         if let Some(line) = buffer.line(line_idx) {
-            for (col, ch) in line.chars().enumerate() {
+            // char_indices() devuelve (byte_offset, char) — exactamente lo que
+            // necesitamos para que `col` sea consistente con Position.col.
+            for (col, ch) in line.char_indices() {
                 if line_idx == pos.line && col < start_col {
                     continue;
                 }
@@ -247,5 +260,35 @@ mod tests {
         assert!(is_bracket(']'));
         assert!(!is_bracket('a'));
         assert!(!is_bracket(' '));
+    }
+
+    #[test]
+    fn test_brackets_with_multibyte_prefix() {
+        // "(código)" — bytes: ((1) c(1) ó(2) d(1) i(1) g(1) o(1) )(1) = 9 bytes
+        // ( en byte 0, ) en byte 8.
+        let buffer = buf("(código)");
+        let result = find_matching_bracket(&buffer, Position { line: 0, col: 0 });
+        assert_eq!(result, Some(Position { line: 0, col: 8 }));
+        let result = find_matching_bracket(&buffer, Position { line: 0, col: 8 });
+        assert_eq!(result, Some(Position { line: 0, col: 0 }));
+    }
+
+    #[test]
+    fn test_brackets_after_emoji() {
+        // "😀()" — 😀 = 4 bytes, ( en 4, ) en 5
+        let buffer = buf("😀()");
+        let result = find_matching_bracket(&buffer, Position { line: 0, col: 4 });
+        assert_eq!(result, Some(Position { line: 0, col: 5 }));
+    }
+
+    #[test]
+    fn test_char_at_with_multibyte() {
+        let buffer = buf("ñ()");
+        // ñ ocupa bytes 0..2, ( en byte 2, ) en byte 3
+        assert_eq!(char_at(&buffer, Position { line: 0, col: 0 }), Some('ñ'));
+        assert_eq!(char_at(&buffer, Position { line: 0, col: 2 }), Some('('));
+        assert_eq!(char_at(&buffer, Position { line: 0, col: 3 }), Some(')'));
+        // En medio de 'ñ' (col 1) — no es char boundary, retorna None.
+        assert_eq!(char_at(&buffer, Position { line: 0, col: 1 }), None);
     }
 }
